@@ -32,7 +32,6 @@ from ...pulse import (
     RampType,
     Rect,
     Waveform,
-    VirtualZ,
 )
 from ...style import COLORS
 from ...typing import TargetMap
