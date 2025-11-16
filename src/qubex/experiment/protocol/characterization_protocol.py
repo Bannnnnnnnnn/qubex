@@ -439,6 +439,66 @@ class CharacterizationProtocol(Protocol):
         """
         ...
 
+    def _simultaneous_measurement_coherenece(
+        self,
+        targets: Collection[str] | str | None = None,
+        *,
+        time_range: ArrayLike | None = None,
+        detuning: float | None = None,
+        second_rotation_axis: Literal["X", "Y"] = "Y",
+        shots: int = DEFAULT_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+        plot: bool = True,
+        save_image: bool = False,
+    ):
+        """
+        Performs simultaneous T1, T2 echo, and Ramsey experiments.
+
+        Parameters
+        ----------
+        targets : Collection[str] | str, optional
+            Target labels to check the coherence times.
+        time_range : ArrayLike, optional
+            Time range of the experiment in ns. Defaults to np.arange(0, 50_001, 1000).
+        detuning : float, optional
+            Detuning of the control frequency. Defaults to 0.001 GHz.
+        second_rotation_axis : Literal["X", "Y"], optional
+            Axis of the second rotation pulse. Defaults to "Y".
+        shots : int, optional
+            Number of shots. Defaults to CALIBRATION_SHOTS.
+        interval : float, optional
+            Interval between shots. Defaults to DEFAULT_INTERVAL.
+        plot : bool, optional
+            Whether to plot the measured signals. Defaults to True.
+        save_image : bool, optional
+            Whether to save the images. Defaults to False.
+
+        Returns
+        -------
+        dict[str, ExperimentResult]
+            Dictionary containing the results of each experiment.
+            The keys are:
+                - "T1": ExperimentResult[T1Data]
+                - "T2": ExperimentResult[T2Data]
+                - "Ramsey": ExperimentResult[RamseyData]
+            Each ExperimentResult holds a mapping from target label to the
+            corresponding data object.
+
+        Examples
+        --------
+        >>> result = ex._simultaneous_measurement_coherenece(
+        ...     targets=["Q00", "Q01", "Q02"],
+        ...     time_range=np.arange(0, 50_001, 1000),
+        ...     detuning=0.001,
+        ...     shots=2048,
+        ... )
+        >>> t1_result = result["T1"]
+        >>> t2_result = result["T2"]
+        >>> ramsey_result = result["Ramsey"]
+
+        """
+        ... 
+
     def _stark_t1_experiment(
         self,
         targets: Collection[str] | str | None = None,
