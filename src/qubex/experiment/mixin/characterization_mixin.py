@@ -41,6 +41,7 @@ from ..experiment_constants import (
     DEFAULT_RABI_TIME_RANGE,
 )
 from ..experiment_result import (
+    SweepData,
     AmplRabiData,
     ExperimentResult,
     FreqRabiData,
