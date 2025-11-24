@@ -32,6 +32,7 @@ from ...pulse import (
     RampType,
     Rect,
     Waveform,
+    VirtualZ,
 )
 from ...style import COLORS
 from ...typing import TargetMap
@@ -1310,6 +1311,284 @@ class CharacterizationMixin(
             "amplitude_range": stark_amplitude_range,
             "p1": p1_list,
         }
+    
+    def _stark_t1_experiment(
+        self,
+        targets: Collection[str] | str | None = None,
+        *,
+        stark_detuning: float | dict[str, float] | None = None,
+        stark_amplitude: float | dict[str, float] | None = None,
+        stark_ramptime: float | dict[str, float] | None = None,
+        time_range: ArrayLike | None = None,
+        shots: int = DEFAULT_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+        plot: bool = True,
+        save_image: bool = False,
+        xaxis_type: Literal["linear", "log"] = "log",
+    ) -> ExperimentResult[T1Data]:
+        if targets is None:
+            targets = self.qubit_labels
+        elif isinstance(targets, str):
+            targets = [targets]
+        else:
+            targets = list(targets)
+
+        if stark_detuning is None:
+            stark_detuning = {target: 0.15 for target in targets}
+        elif isinstance(stark_detuning, float):
+            detuning = stark_detuning
+            if abs(detuning) > 0.2:
+                raise ValueError("Detuning of a stark tone must not exceed 0.2 GHz: the guard-banded AWG baseband limit.")
+            stark_detuning = {target: detuning for target in targets}
+        else:
+            for target in targets:
+                detuning = stark_detuning[target]
+                if abs(detuning) > 0.2:
+                    raise ValueError("Detuning of a stark tone must not exceed 0.2 GHz: the guard-banded AWG baseband limit.")
+
+        if stark_amplitude is None:
+            stark_amplitude = {target: 0.1 for target in targets}
+        elif isinstance(stark_amplitude, float):
+            stark_amplitude = {target: stark_amplitude for target in targets}
+
+        if stark_ramptime is None:
+            stark_ramptime = {target: 10 for target in targets}
+        elif isinstance(stark_ramptime, float):
+            stark_ramptime = {target: stark_ramptime for target in targets}
+
+        self.validate_rabi_params(targets)
+
+        if time_range is None:
+            time_range = np.logspace(
+                np.log10(100),
+                np.log10(200 * 1000),
+                51,
+            )
+        time_range = self.util.discretize_time_range(np.asarray(time_range))
+
+        data: dict[str, T1Data] = {}
+
+        for target in targets:
+            power = self.calc_control_amplitude(target=target, rabi_rate=stark_amplitude[target])
+            if power > 1:
+                raise ValueError("Drive amplitude of a stark tone must not exceed 1")
+            ramptime = stark_ramptime[target]
+            detuning = stark_detuning[target]
+
+            def stark_t1_sequence(T: int) -> PulseSchedule:
+                with PulseSchedule([target]) as ps:
+                    ps.add(target, self.get_hpi_pulse(target).repeated(2))
+                    ps.add(
+                        target,
+                        FlatTop(
+                            duration=T + ramptime * 2,
+                            amplitude=power,
+                            tau=ramptime,
+                        ).detuned(detuning=detuning))
+                return ps
+
+
+            sweep_result = self.sweep_parameter(
+                sequence=stark_t1_sequence,
+                sweep_range=time_range,
+                shots=shots,
+                interval=interval,
+                plot=plot,
+                title="Stark-driven T1 decay",
+                xlabel="Time (μs)",
+                ylabel="Measured value",
+                xaxis_type=xaxis_type,
+            )
+
+            for qubit, sweep_data in sweep_result.data.items():
+                fit_result = fitting.fit_exp_decay(
+                    target=qubit,
+                    x=sweep_data.sweep_range,
+                    y=0.5 * (1 - sweep_data.normalized),
+                    plot=plot,
+                    title="Stark-driven T1",
+                    xlabel="Time (μs)",
+                    ylabel="Normalized signal",
+                    xaxis_type=xaxis_type,
+                    yaxis_type="linear",
+                )
+                if fit_result["status"] == "success":
+                    t1 = fit_result["tau"]
+                    t1_err = fit_result["tau_err"]
+                    r2 = fit_result["r2"]
+
+                    t1_data = T1Data.new(
+                        sweep_data,
+                        t1=t1,
+                        t1_err=t1_err,
+                        r2=r2,
+                    )
+                    data[qubit] = t1_data
+
+                    fig = fit_result["fig"]
+
+                    if save_image:
+                        viz.save_figure_image(
+                            fig,
+                            name=f"t1_{qubit}",
+                        )
+
+        return ExperimentResult(data=data)
+
+    def _stark_ramsey_experiment(
+        self,
+        targets: Collection[str] | str | None = None,
+        *,
+        stark_detuning: float | dict[str, float] | None = None,
+        stark_amplitude: float | dict[str, float] | None = None,
+        stark_ramptime: float | dict[str, float] | None = None,
+        time_range: ArrayLike | None = None,
+        second_rotation_axis: Literal["X", "Y"] = "Y",
+        shots: int = CALIBRATION_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+        envelope_region: Literal["full", "flat"] = "full",
+        plot: bool = True,
+        save_image: bool = False,
+    ) -> ExperimentResult[RamseyData]:
+        if targets is None:
+            targets = self.qubit_labels
+        elif isinstance(targets, str):
+            targets = [targets]
+        else:
+            targets = list(targets)
+
+        if stark_detuning is None:
+            stark_detuning = {target: 0.15 for target in targets}
+        elif isinstance(stark_detuning, float):
+            detuning = stark_detuning
+            if abs(detuning) > 0.2:
+                raise ValueError("Detuning of a stark tone must not exceed 0.2 GHz: the guard-banded AWG baseband limit.")
+            stark_detuning = {target: detuning for target in targets}
+        else:
+            for target in targets:
+                detuning = stark_detuning[target]
+                if abs(detuning) > 0.2:
+                    raise ValueError("Detuning of a stark tone must not exceed 0.2 GHz: the guard-banded AWG baseband limit.")
+
+        if stark_amplitude is None:
+            stark_amplitude = {target: 0.1 for target in targets}
+        elif isinstance(stark_amplitude, float):
+            stark_amplitude = {target: stark_amplitude for target in targets}
+
+        if stark_ramptime is None:
+            stark_ramptime = {target: 10 for target in targets}
+        elif isinstance(stark_ramptime, float):
+            stark_ramptime = {target: stark_ramptime for target in targets}
+
+        if time_range is None:
+            time_range = np.arange(0, 401, 4)
+        else:
+            time_range = self.util.discretize_time_range(time_range)
+
+        self.validate_rabi_params(targets)
+
+        data: dict[str, RamseyData] = {}
+
+        for target in targets:
+            power = self.calc_control_amplitude(target=target, rabi_rate=stark_amplitude[target])
+            if power > 1:
+                raise ValueError("Drive amplitude of a stark tone must not exceed 1")
+            ramptime = stark_ramptime[target]
+            detuning = stark_detuning[target]
+            def stark_ramsey_sequence(T: int) -> PulseSchedule:
+                x90 = self.get_hpi_pulse(target=target)
+                with PulseSchedule([target]) as ps:
+                    ps.add(target, x90)
+                    if envelope_region == "full":
+                        ps.add(
+                            target,
+                            FlatTop(
+                                duration=T + ramptime * 2,
+                                amplitude=power,
+                                tau=ramptime,
+                            ).detuned(detuning=detuning))
+                        if second_rotation_axis == "X":
+                            ps.add(target, x90.shifted(np.pi))
+                        else:
+                            ps.add(target, x90.shifted(-np.pi / 2))
+                    else:
+                        ps.add(
+                            target,
+                            FlatTop(
+                                duration=ramptime * 2,
+                                amplitude=power,
+                                tau=ramptime,
+                            ).detuned(detuning=detuning))
+                        ps.add(target, x90.repeated(2))
+                        ps.add(
+                            target,
+                            FlatTop(
+                                duration = T + ramptime * 2,
+                                amplitude=power,
+                                tau=ramptime,
+                            ).detuned(detuning=detuning))
+                        if second_rotation_axis == "X":
+                            ps.add(target, VirtualZ(theta=-np.pi))
+                            ps.add(target, x90)
+                        else:
+                            ps.add(target, VirtualZ(theta=np.pi/2))
+                            ps.add(target, x90)
+                return ps
+
+            sweep_result = self.sweep_parameter(
+                sequence=stark_ramsey_sequence,
+                sweep_range=time_range,
+                shots=shots,
+                interval=interval,
+                plot=plot,
+            )
+
+            for qubit, sweep_data in sweep_result.data.items():
+                fit_result = fitting.fit_ramsey(
+                    target=qubit,
+                    times=sweep_data.sweep_range,
+                    data=sweep_data.normalized,
+                    title="Stark-driven Ramsey fringe",
+                    amplitude_est=1.0,
+                    offset_est=0.0,
+                    plot=plot,
+                )
+                if fit_result["status"] == "success":
+                    f = self.qubits[qubit].frequency
+                    t2 = fit_result["tau"]
+                    ramsey_freq = fit_result["f"]
+                    if stark_detuning[qubit] > 0:
+                        dressed_freq = f - ramsey_freq
+                    else:
+                        dressed_freq = f + ramsey_freq
+
+                    r2 = fit_result["r2"]
+                    ramsey_data = RamseyData.new(
+                        sweep_data=sweep_data,
+                        t2=t2,
+                        ramsey_freq=ramsey_freq,
+                        bare_freq=dressed_freq,
+                        r2=r2,
+                    )
+                    data[qubit] = ramsey_data
+
+                    sign = 1 if stark_detuning[qubit] > 0 else -1
+                    ac_stark_shift = sign * ramsey_data.ramsey_freq
+
+                    print("AC stark shift :")
+                    print(f"{qubit}: {ac_stark_shift:.6f}")
+                    print("")
+
+
+                    fig = fit_result["fig"]
+
+                    if save_image:
+                        viz.save_figure_image(
+                            fig,
+                            name=f"stark_ramsey_{qubit}",
+                        )
+
+        return ExperimentResult(data=data)
 
     def obtain_effective_control_frequency(
         self,
@@ -1433,7 +1712,7 @@ class CharacterizationMixin(
 
         time_range = np.asarray(time_range)
         self.validate_rabi_params([target_qubit, spectator_qubit])
-
+    
         result = self.sweep_parameter(
             sequence=jazz_sequence,
             sweep_range=time_range,
