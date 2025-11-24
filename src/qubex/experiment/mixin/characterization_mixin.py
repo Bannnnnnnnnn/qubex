@@ -1190,6 +1190,127 @@ class CharacterizationMixin(
 
         return ExperimentResult(data=data)
 
+    def _stark_P1_experiment(
+        self,
+        target: str,
+        *,
+        stark_detuning: float | None = None,
+        stark_amplitude: float | None = None,
+        stark_ramptime: float | None = None,
+        wait_time: int | None = None,
+        mode: Literal["single", "avg"] = "avg",
+        shots: int = DEFAULT_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+    ):
+
+        if stark_detuning is None:
+            stark_detuning = 0.15   
+        else:
+            if abs(stark_detuning) > 0.2:
+                raise ValueError("Detuning of a stark tone exceeds 0.2 GHz AWG limit.") 
+        
+        if stark_amplitude is None:
+            stark_amplitude = 0.1
+
+        if stark_ramptime is None:
+            stark_ramptime = 10
+
+        if wait_time is None:
+            chip = self.system_manager.experiment_system.chip
+            half_t1 = self.system_manager.config_loader._props_dict[chip.id]["t1"][target] * np.log(2)
+            wait_time = np.round(half_t1 / SAMPLING_PERIOD) * SAMPLING_PERIOD
+        self.validate_rabi_params([target])
+
+        stark_power = self.calc_control_amplitude(target=target, rabi_rate=stark_amplitude)
+        if stark_power > 1:
+            raise ValueError("Stark drive amplitude must not exceed 1")
+            
+        def stark_P1_sequence() -> PulseSchedule:
+            with PulseSchedule([target]) as ps:
+                ps.add(target, self.get_hpi_pulse(target).repeated(2))
+                ps.add(target,
+                        FlatTop(
+                            duration=wait_time + stark_ramptime * 2,
+                            amplitude=stark_power,
+                            tau = stark_ramptime,
+                        ).detuned(detuning=stark_detuning))
+            return ps
+
+        result = self.measure(
+            sequence=stark_P1_sequence(),
+            mode=mode,
+            shots=shots,
+            interval=interval,
+            plot=False,
+        )
+
+        return result
+    
+    def _stark_P1_spectroscopy(
+        self,
+        target: str,
+        *,
+        stark_detuning: float | None = None,
+        stark_ramptime: float | None = None,
+        stark_amplitude_range: ArrayLike = np.linspace(0, 0.1, 51),
+        wait_time: int | None = None,
+        shots: int = DEFAULT_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+        plot: bool = True,
+    ):
+
+        if stark_detuning is None:
+            stark_detuning = 0.15   
+        else:
+            if abs(stark_detuning) > 0.2:
+                raise ValueError("Detuning of a stark tone exceeds 0.2 GHz AWG limit.") 
+            
+        for stark_amplitude in stark_amplitude_range:
+            stark_power = self.calc_control_amplitude(target=target, rabi_rate=stark_amplitude)
+            if stark_power > 1:
+                raise ValueError("Stark drive amplitude must not exceed 1")
+
+        if stark_ramptime is None:
+            stark_ramptime = 50
+        
+        if wait_time is None:
+            chip = self.system_manager.experiment_system.chip
+            half_t1 = self.system_manager.config_loader._props_dict[chip.id]["t1"][target] * np.log(2)
+            wait_time = np.round(half_t1 / SAMPLING_PERIOD) * SAMPLING_PERIOD
+
+        self.validate_rabi_params([target])
+        results = []
+        p1_list = []
+        for stark_amplitude in stark_amplitude_range:
+            result = self._stark_P1_experiment(
+                target=target, 
+                stark_amplitude=stark_amplitude,
+                stark_detuning=stark_detuning,
+                stark_ramptime=stark_ramptime,
+                shots=shots,
+                interval=interval,
+                mode="single"
+                )
+            results.append(result)
+            p1_list.append(result.probabilities["1"])
+        
+        if plot:
+            fig = go.Figure()
+            fig.add_scatter(name="data", x=stark_amplitude_range, y=p1_list)
+            fig.update_layout(
+                title="P1 spectroscopy",
+                xaxis_title="Stark Amplitude (GHz)",
+                yaxis_title="Probability_1",
+                showlegend=True,
+            )
+            fig.show()
+        
+        return {
+            "raw_result" : results,
+            "amplitude_range": stark_amplitude_range,
+            "p1": p1_list,
+        }
+
     def obtain_effective_control_frequency(
         self,
         targets: Collection[str] | str | None = None,
