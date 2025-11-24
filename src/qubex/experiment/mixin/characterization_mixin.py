@@ -32,7 +32,6 @@ from ...pulse import (
     RampType,
     Rect,
     Waveform,
-    VirtualZ,
 )
 from ...style import COLORS
 from ...typing import TargetMap
@@ -42,6 +41,7 @@ from ..experiment_constants import (
     DEFAULT_RABI_TIME_RANGE,
 )
 from ..experiment_result import (
+    SweepData,
     AmplRabiData,
     ExperimentResult,
     FreqRabiData,
@@ -1191,127 +1191,239 @@ class CharacterizationMixin(
 
         return ExperimentResult(data=data)
 
-    def _stark_P1_experiment(
+    def _simultaneous_measurement_coherenece(
         self,
-        target: str,
+        targets: Collection[str] | str | None = None,
         *,
-        stark_detuning: float | None = None,
-        stark_amplitude: float | None = None,
-        stark_ramptime: float | None = None,
-        wait_time: int | None = None,
-        mode: Literal["single", "avg"] = "avg",
-        shots: int = DEFAULT_SHOTS,
-        interval: float = DEFAULT_INTERVAL,
-    ):
-
-        if stark_detuning is None:
-            stark_detuning = 0.15   
-        else:
-            if abs(stark_detuning) > 0.2:
-                raise ValueError("Detuning of a stark tone exceeds 0.2 GHz AWG limit.") 
-        
-        if stark_amplitude is None:
-            stark_amplitude = 0.1
-
-        if stark_ramptime is None:
-            stark_ramptime = 10
-
-        if wait_time is None:
-            chip = self.system_manager.experiment_system.chip
-            half_t1 = self.system_manager.config_loader._props_dict[chip.id]["t1"][target] * np.log(2)
-            wait_time = np.round(half_t1 / SAMPLING_PERIOD) * SAMPLING_PERIOD
-        self.validate_rabi_params([target])
-
-        stark_power = self.calc_control_amplitude(target=target, rabi_rate=stark_amplitude)
-        if stark_power > 1:
-            raise ValueError("Stark drive amplitude must not exceed 1")
-            
-        def stark_P1_sequence() -> PulseSchedule:
-            with PulseSchedule([target]) as ps:
-                ps.add(target, self.get_hpi_pulse(target).repeated(2))
-                ps.add(target,
-                        FlatTop(
-                            duration=wait_time + stark_ramptime * 2,
-                            amplitude=stark_power,
-                            tau = stark_ramptime,
-                        ).detuned(detuning=stark_detuning))
-            return ps
-
-        result = self.measure(
-            sequence=stark_P1_sequence(),
-            mode=mode,
-            shots=shots,
-            interval=interval,
-            plot=False,
-        )
-
-        return result
-    
-    def _stark_P1_spectroscopy(
-        self,
-        target: str,
-        *,
-        stark_detuning: float | None = None,
-        stark_ramptime: float | None = None,
-        stark_amplitude_range: ArrayLike = np.linspace(0, 0.1, 51),
-        wait_time: int | None = None,
+        time_range: ArrayLike | None = None,
+        detuning: float | None = None,
+        second_rotation_axis: Literal["X", "Y"] = "Y",
         shots: int = DEFAULT_SHOTS,
         interval: float = DEFAULT_INTERVAL,
         plot: bool = True,
+        save_image: bool = False,
     ):
-
-        if stark_detuning is None:
-            stark_detuning = 0.15   
+        if targets is None:
+            targets = self.qubit_labels
+        elif isinstance(targets, str):
+            targets = [targets]
         else:
-            if abs(stark_detuning) > 0.2:
-                raise ValueError("Detuning of a stark tone exceeds 0.2 GHz AWG limit.") 
-            
-        for stark_amplitude in stark_amplitude_range:
-            stark_power = self.calc_control_amplitude(target=target, rabi_rate=stark_amplitude)
-            if stark_power > 1:
-                raise ValueError("Stark drive amplitude must not exceed 1")
+            targets = list(targets)
 
-        if stark_ramptime is None:
-            stark_ramptime = 50
+        if time_range is None:
+            time_range = np.arange(0, 50_001, 1000)
         
-        if wait_time is None:
-            chip = self.system_manager.experiment_system.chip
-            half_t1 = self.system_manager.config_loader._props_dict[chip.id]["t1"][target] * np.log(2)
-            wait_time = np.round(half_t1 / SAMPLING_PERIOD) * SAMPLING_PERIOD
+        time_range = self.util.discretize_time_range(
+            time_range=np.asarray(time_range),
+            sampling_period=2 * SAMPLING_PERIOD,
+        )
 
-        self.validate_rabi_params([target])
-        results = []
-        p1_list = []
-        for stark_amplitude in stark_amplitude_range:
-            result = self._stark_P1_experiment(
-                target=target, 
-                stark_amplitude=stark_amplitude,
-                stark_detuning=stark_detuning,
-                stark_ramptime=stark_ramptime,
-                shots=shots,
-                interval=interval,
-                mode="single"
-                )
-            results.append(result)
-            p1_list.append(result.probabilities["1"])
-        
-        if plot:
-            fig = go.Figure()
-            fig.add_scatter(name="data", x=stark_amplitude_range, y=p1_list)
-            fig.update_layout(
-                title="P1 spectroscopy",
-                xaxis_title="Stark Amplitude (GHz)",
-                yaxis_title="Probability_1",
-                showlegend=True,
-            )
-            fig.show()
-        
-        return {
-            "raw_result" : results,
-            "amplitude_range": stark_amplitude_range,
-            "p1": p1_list,
+        if detuning is None:
+            detuning = 0.001
+
+        self.validate_rabi_params(targets)
+
+        modes = ("T1", "T2", "Ramsey")
+
+        signals: dict[str, defaultdict[str, list[float]]] = {
+            mode: defaultdict(list) for mode in modes
         }
+
+        data_t1: dict[str, T1Data] = {}
+        data_t2: dict[str, T2Data] = {}
+        data_ramsey: dict[str, RamseyData] = {}
+
+        for target in targets:
+            x90 = self.get_hpi_pulse(target)
+
+            def t1_sequence(T: int) -> PulseSchedule:
+                with PulseSchedule([target]) as ps:
+                    ps.add(target, x90.repeated(2))
+                    ps.add(target, Blank(T))
+                return ps
+            
+            def t2_sequence(T: int) -> PulseSchedule:
+                half_T = T // 2
+                with PulseSchedule([target]) as ps:
+                    ps.add(target, x90)
+                    ps.add(target, Blank(half_T))
+                    ps.add(target, x90.repeated(2).shifted(np.pi/2))
+                    ps.add(target, Blank(half_T))
+                    ps.add(target, x90.scaled(-1))
+                return ps
+            
+            def ramsey_sequence(T: int) -> PulseSchedule:
+                with PulseSchedule([target]) as ps:
+                    x90 = self.get_hpi_pulse(target)
+                    ps.add(target, x90)
+                    ps.add(target, Blank(T))
+                    if second_rotation_axis == "X":
+                        ps.add(target, x90.shifted(np.pi))
+                    else:
+                        ps.add(target, x90.shifted(-np.pi / 2))
+                return ps
+
+            detuned_frequencies = {target: self.qubits[target].frequency + detuning}              
+
+            for T in time_range:
+                measurements = {
+                    "T1": self.measure(
+                        sequence=t1_sequence(T=T),
+                        shots=shots,
+                        interval=interval,
+                        plot=False,
+                    ),
+                    "T2": self.measure(
+                        sequence=t2_sequence(T=T),
+                        shots=shots,
+                        interval=interval,
+                        plot=False,
+                    ),
+                    "Ramsey": self.measure(
+                        sequence=ramsey_sequence(T=T),
+                        frequencies=detuned_frequencies,
+                        shots=shots,
+                        interval=interval,
+                        plot=False,
+                    ),
+                }
+
+                for mode in modes:
+                    for measured_target, data in measurements[mode].data.items():
+                        signals[mode][measured_target].append(data.kerneled)
+
+        sweep_data: dict[str, dict[str, SweepData]] = {
+            mode: {
+                target: SweepData(
+                    target=target,
+                    data=np.asarray(values),
+                    sweep_range=time_range,
+                    rabi_param=self.rabi_params.get(target),
+                    state_centers=self.state_centers.get(target),
+                    title="Sweep result",
+                    xlabel="Sweep value",
+                    ylabel="Measured value",
+                    xaxis_type="linear",
+                    yaxis_type="linear",
+                )
+                for target, values in signals[mode].items()
+            }
+            for mode in modes
+        }
+
+        for target, sweep_result in sweep_data["T1"].items():
+            fit_result_t1 = fitting.fit_exp_decay(
+                target=target,
+                x=sweep_result.sweep_range,
+                y=0.5 * (1 - sweep_result.normalized),
+                plot=plot   ,
+                title="T1",
+                xlabel="Time (μs)",
+                ylabel="Normalized signal",
+                xaxis_type="linear",
+            )
+            if fit_result_t1["status"] == "success":
+                t1 = fit_result_t1["tau"]
+                t1_err = fit_result_t1["tau_err"]
+                r2 = fit_result_t1["r2"]
+
+                t1_data = T1Data.new(
+                    sweep_result,
+                    t1=t1,
+                    t1_err=t1_err,
+                    r2=r2,
+                )
+                data_t1[target] = t1_data
+
+                fig = fit_result_t1["fig"]
+
+                if save_image:
+                    viz.save_figure_image(
+                        fig,
+                        name=f"t1_{target}",
+                    )
+        
+        for target, sweep_result in sweep_data["T2"].items():
+            fit_result_t2 = fitting.fit_exp_decay(
+                target=target,
+                x=sweep_result.sweep_range,
+                y=0.5 * (1 + sweep_result.normalized),
+                plot=plot,
+                title="T2 echo",
+                xlabel="Time (μs)",
+                ylabel="Normalized signal",
+                xaxis_type="linear",
+            )
+            if fit_result_t2["status"] == "success":
+                t2 = fit_result_t2["tau"]
+                t2_err = fit_result_t2["tau_err"]
+                r2 = fit_result_t2["r2"]
+
+                t2_data = T2Data.new(
+                    sweep_result,
+                    t2=t2,
+                    t2_err=t2_err,
+                    r2=r2,
+                )
+                data_t2[target] = t2_data
+
+                fig = fit_result_t2["fig"]
+
+                if save_image:
+                    viz.save_figure_image(
+                        fig,
+                        name=f"t2_echo_{target}",
+                    )
+
+        for target, sweep_result in sweep_data["Ramsey"].items():
+            fit_result_ramsey = fitting.fit_ramsey(
+                target=target,
+                times=sweep_result.sweep_range,
+                data=sweep_result.normalized,
+                amplitude_est=1.0,
+                offset_est=0.0,
+                plot=plot,
+            )
+            if fit_result_ramsey["status"] == "success":
+                f = self.qubits[target].frequency
+                t2 = fit_result_ramsey["tau"]
+                ramsey_freq = fit_result_ramsey["f"]
+                phi = fit_result_ramsey["phi"]
+                if second_rotation_axis == "Y":
+                    if phi > 0:
+                        bare_freq = f + detuning + ramsey_freq
+                    else:
+                        bare_freq = f + detuning - ramsey_freq
+                else:
+                    bare_freq = f + detuning - ramsey_freq
+                r2 = fit_result_ramsey["r2"]
+                ramsey_data = RamseyData.new(
+                    sweep_result,
+                    t2=t2,
+                    ramsey_freq=ramsey_freq,
+                    bare_freq=bare_freq,
+                    r2=r2,
+                )
+                data_ramsey[target] = ramsey_data
+
+                fig = fit_result_ramsey["fig"]
+
+                if save_image:
+                    viz.save_figure_image(
+                        fig,
+                        name=f"ramsey_{target}",
+                    )
     
+        exp_t1 = ExperimentResult(data = data_t1)
+        exp_t2 = ExperimentResult(data = data_t2)
+        exp_ramsey = ExperimentResult(data = data_ramsey) 
+    
+        return {
+            "T1": exp_t1,
+            "T2": exp_t2,
+            "Ramsey": exp_ramsey,
+        }
+
     def _stark_t1_experiment(
         self,
         targets: Collection[str] | str | None = None,
@@ -1590,6 +1702,127 @@ class CharacterizationMixin(
 
         return ExperimentResult(data=data)
 
+    def _stark_P1_experiment(
+        self,
+        target: str,
+        *,
+        stark_detuning: float | None = None,
+        stark_amplitude: float | None = None,
+        stark_ramptime: float | None = None,
+        wait_time: int | None = None,
+        mode: Literal["single", "avg"] = "avg",
+        shots: int = DEFAULT_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+    ):
+
+        if stark_detuning is None:
+            stark_detuning = 0.15   
+        else:
+            if abs(stark_detuning) > 0.2:
+                raise ValueError("Detuning of a stark tone exceeds 0.2 GHz AWG limit.") 
+        
+        if stark_amplitude is None:
+            stark_amplitude = 0.1
+
+        if stark_ramptime is None:
+            stark_ramptime = 10
+
+        if wait_time is None:
+            chip = self.system_manager.experiment_system.chip
+            half_t1 = self.system_manager.config_loader._props_dict[chip.id]["t1"][target] * np.log(2)
+            wait_time = np.round(half_t1 / SAMPLING_PERIOD) * SAMPLING_PERIOD
+        self.validate_rabi_params([target])
+
+        stark_power = self.calc_control_amplitude(target=target, rabi_rate=stark_amplitude)
+        if stark_power > 1:
+            raise ValueError("Stark drive amplitude must not exceed 1")
+            
+        def stark_P1_sequence() -> PulseSchedule:
+            with PulseSchedule([target]) as ps:
+                ps.add(target, self.get_hpi_pulse(target).repeated(2))
+                ps.add(target,
+                        FlatTop(
+                            duration=wait_time + stark_ramptime * 2,
+                            amplitude=stark_power,
+                            tau = stark_ramptime,
+                        ).detuned(detuning=stark_detuning))
+            return ps
+
+        result = self.measure(
+            sequence=stark_P1_sequence(),
+            mode=mode,
+            shots=shots,
+            interval=interval,
+            plot=False,
+        )
+
+        return result
+    
+    def _stark_P1_spectroscopy(
+        self,
+        target: str,
+        *,
+        stark_detuning: float | None = None,
+        stark_ramptime: float | None = None,
+        stark_amplitude_range: ArrayLike = np.linspace(0, 0.1, 51),
+        wait_time: int | None = None,
+        shots: int = DEFAULT_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+        plot: bool = True,
+    ):
+
+        if stark_detuning is None:
+            stark_detuning = 0.15   
+        else:
+            if abs(stark_detuning) > 0.2:
+                raise ValueError("Detuning of a stark tone exceeds 0.2 GHz AWG limit.") 
+            
+        for stark_amplitude in stark_amplitude_range:
+            stark_power = self.calc_control_amplitude(target=target, rabi_rate=stark_amplitude)
+            if stark_power > 1:
+                raise ValueError("Stark drive amplitude must not exceed 1")
+
+        if stark_ramptime is None:
+            stark_ramptime = 50
+        
+        if wait_time is None:
+            chip = self.system_manager.experiment_system.chip
+            half_t1 = self.system_manager.config_loader._props_dict[chip.id]["t1"][target] * np.log(2)
+            wait_time = np.round(half_t1 / SAMPLING_PERIOD) * SAMPLING_PERIOD
+
+        self.validate_rabi_params([target])
+        results = []
+        p1_list = []
+        for stark_amplitude in stark_amplitude_range:
+            result = self._stark_P1_experiment(
+                target=target, 
+                stark_amplitude=stark_amplitude,
+                stark_detuning=stark_detuning,
+                stark_ramptime=stark_ramptime,
+                shots=shots,
+                interval=interval,
+                mode="single"
+                )
+            results.append(result)
+            p1_list.append(result.probabilities["1"])
+        
+        if plot:
+            fig = go.Figure()
+            fig.add_scatter(name="data", x=stark_amplitude_range, y=p1_list)
+            fig.update_layout(
+                title="P1 spectroscopy",
+                xaxis_title="Stark Amplitude (GHz)",
+                yaxis_title="Probability_1",
+                showlegend=True,
+            )
+            fig.show()
+        
+        return {
+            "raw_result" : results,
+            "amplitude_range": stark_amplitude_range,
+            "p1": p1_list,
+        }
+
     def obtain_effective_control_frequency(
         self,
         targets: Collection[str] | str | None = None,
@@ -1712,7 +1945,7 @@ class CharacterizationMixin(
 
         time_range = np.asarray(time_range)
         self.validate_rabi_params([target_qubit, spectator_qubit])
-    
+
         result = self.sweep_parameter(
             sequence=jazz_sequence,
             sweep_range=time_range,
