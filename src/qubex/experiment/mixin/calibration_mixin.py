@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Collection, Literal
+from typing import Collection, Literal, Sequence
 
 import numpy as np
 import plotly.graph_objects as go
@@ -2229,3 +2229,348 @@ class CalibrationMixin(
                 continue
 
         return Result(data=return_data)
+
+    def calibrate_freq_mux_pulse(
+        self,
+        targets: Sequence[str] | None = None,
+        *,
+        pulse_type: Literal["pi", "hpi"],
+        duration: float | None = None,
+        ramptime: float | None = None,
+        detuning_range: ArrayLike = np.linspace(-0.01, 0.01, 21),
+        n_rotations: int = 1,
+        r2_threshold: float = 0.5,
+        use_stored_amplitude: bool = False,
+        plot: bool = True,
+        shots: int = CALIBRATION_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+    ):
+        if targets is None:
+            targets = self.qubit_labels
+
+        if len(targets) != 2:
+            raise ValueError("Mux pulse needs just 2 targets")
+        
+        rabi_params = self.rabi_params
+        self.validate_rabi_params(rabi_params)
+
+        def calibrate(targets: list):
+            if pulse_type == "hpi":
+                pulse = FlatTop(
+                    duration=duration if duration is not None else HPI_DURATION,
+                    amplitude=1,
+                    tau=ramptime if ramptime is not None else HPI_RAMPTIME,
+                )
+                area = pulse.real.sum() * pulse.SAMPLING_PERIOD
+                rabi_rate = 0.25 / area
+            elif pulse_type == "pi":
+                pulse = FlatTop(
+                    duration=duration if duration is not None else PI_DURATION,
+                    amplitude=1,
+                    tau=ramptime if ramptime is not None else PI_RAMPTIME,
+                )
+                area = pulse.real.sum() * pulse.SAMPLING_PERIOD
+                rabi_rate = 0.25 / area
+            else:
+                raise ValueError("Invalid pulse type.")
+            
+            n_per_rotation = 2 if pulse_type == "pi" else 4
+
+            if not use_stored_amplitude:
+                result = self.calibrate_default_pulse(
+                    targets=targets,
+                    pulse_type=pulse_type,
+                    duration=duration,
+                    ramptime=ramptime,
+                    plot=False,
+                    shots=shots,
+                    interval=interval,
+                )
+                rough_cal_amplitude = {target: data.calib_value for target, data in result.data.items()}
+            else:
+                rough_cal_amplitude = {target: self.calc_control_amplitude(target, rabi_rate) for target in targets}
+
+            sequence={target: pulse.scaled(rough_cal_amplitude[target]).repeated(n_per_rotation * n_rotations) for target in targets}
+
+            P = np.zeros((len(detuning_range), len(detuning_range)))
+
+            for i, dq0 in enumerate(detuning_range):
+                for j, dq1 in enumerate(detuning_range):
+                    frequencies = {
+                        target: self.targets[target].frequency + detuning 
+                        for target, detuning in zip(targets, (dq0, dq1))
+                    }
+
+                    result = self.measure(
+                        sequence=sequence,
+                        frequencies = frequencies,
+                        mode = "single",
+                        shots=shots,
+                        interval=interval,
+                        plot=False,
+                    )
+
+                    P[i, j] = result.get_probabilities(targets).get("00")
+
+            fit_result = fitting.fit_2d_detuning_map(
+                targets=targets,
+                x_detuning_range=detuning_range,
+                y_detuning_range=detuning_range,
+                data=P,
+                plot=plot,
+            )
+
+            r2 = fit_result["r2"]
+            if r2 > r2_threshold:
+                for target, data in fit_result.data["detuning"].items():
+                    print(f"{target}:{data}")
+                if pulse_type == "hpi":
+                    for target in targets:
+                        self.calib_note.update_hpi_param(
+                            target,
+                            {
+                                "target": target,
+                                "duration": pulse.duration,
+                                "amplitude": rough_cal_amplitude[target],
+                                "tau": pulse.tau,
+                            },
+                        )
+                elif pulse_type == "pi":
+                    for target in targets:
+                        self.calib_note.update_pi_param(
+                            target,
+                            {
+                                "target": target,
+                                "duration": pulse.duration,
+                                "amplitude": rough_cal_amplitude[target],
+                                "tau": pulse.tau,
+                            },
+                        )
+            else:
+                print(f"Error: R² value is too low ({r2:.3f})")
+                print(f"Calibration data not stored for {targets}.")
+
+            return fit_result
+        
+        result = calibrate(targets)
+
+        return Result(data=result)
+
+    def calibrate_ampl_mux_pulse(
+        self,
+        targets: Sequence[str] | None = None,
+        *,
+        pulse_type: Literal["pi", "hpi"],
+        fit_freq: dict[str, float] | None = None,
+        duration: float | None = None,
+        ramptime: float | None = None,
+        n_points: int = 20,
+        n_rotations: int = 1,
+        r2_threshold: float = 0.5,
+        use_stored_amplitude: bool = False,
+        plot: bool = True,
+        shots: int = CALIBRATION_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+    ):
+        if targets is None:
+            targets = self.qubit_labels
+
+        if len(targets) != 2:
+            raise ValueError("Mux pulse needs just 2 targets")
+        
+        rabi_params = self.rabi_params
+        self.validate_rabi_params(rabi_params)
+
+        if fit_freq is None:
+            fit_freq = {target : 0 for target in targets}
+
+        if not use_stored_amplitude:
+            result = self.calibrate_default_pulse(
+                targets=targets,
+                pulse_type=pulse_type,
+                duration=duration,
+                ramptime=ramptime,
+                plot=False,
+                shots=shots,
+                interval=interval,
+            )
+            rough_cal_amplitude = {target: data.calib_value for target, data in result.data.items()}
+
+        def calibrate(targets: list):
+            if pulse_type == "hpi":
+                pulse = FlatTop(
+                    duration=duration if duration is not None else HPI_DURATION,
+                    amplitude=1,
+                    tau=ramptime if ramptime is not None else HPI_RAMPTIME,
+                )
+                area = pulse.real.sum() * pulse.SAMPLING_PERIOD
+                rabi_rate = 0.25 / area
+            elif pulse_type == "pi":
+                pulse = FlatTop(
+                    duration=duration if duration is not None else PI_DURATION,
+                    amplitude=1,
+                    tau=ramptime if ramptime is not None else PI_RAMPTIME,
+                )
+                area = pulse.real.sum() * pulse.SAMPLING_PERIOD
+                rabi_rate = 0.5 / area    
+            else:
+                raise ValueError("Invalid pulse type.")
+            
+            if use_stored_amplitude:
+                ampl = {target: self.calc_control_amplitude(target, rabi_rate) for target in targets}
+            else:
+                ampl = rough_cal_amplitude
+
+            ampl_min: dict[str, float] = {}
+            ampl_max: dict[str, float] = {}
+            ampl_range: dict[str, np.ndarray] = {}
+
+            for target in targets:
+                base_ampl = ampl[target]
+                delta = 0.5 / n_rotations
+
+                a_min = base_ampl * (1 - delta)
+                a_max = base_ampl * (1 + delta)
+
+                a_min = np.clip(a_min, 0.0, 1.0)
+                a_max = np.clip(a_max, 0.0, 1.0)
+
+                if a_min == a_max:
+                    a_min, a_max = 0.0, 1.0
+
+                ampl_min[target] = a_min
+                ampl_max[target] = a_max
+                ampl_range[target] = np.linspace(a_min, a_max, n_points)
+
+            n_per_rotation = 2 if pulse_type == "pi" else 4
+
+            q0, q1 = targets
+            P = np.zeros((len(ampl_range[q0]), len(ampl_range[q1])))
+
+            frequencies = {target: self.targets[target].frequency + fit_freq[target] for target in targets}
+            for i, dq0 in enumerate(ampl_range[targets[0]]):
+                for j, dq1 in enumerate(ampl_range[targets[1]]):
+                    sequence={
+                        q0: pulse.scaled(dq0).repeated(n_per_rotation * n_rotations),
+                        q1: pulse.scaled(dq1).repeated(n_per_rotation * n_rotations),
+                    }
+                    result = self.measure(
+                        sequence=sequence,
+                        frequencies=frequencies,
+                        mode="single",
+                        shots=shots,
+                        interval=interval,
+                        plot=False,
+                    )
+
+                    P[i, j] = result.get_probabilities(targets).get("00")
+
+            fit_result = fitting.fit_2d_ampl_map(
+                targets=targets,
+                x_amplitude_range=ampl_range[q0],
+                y_amplitude_range=ampl_range[q1],
+                data=P,
+                plot=plot,
+            )
+
+            r2 = fit_result["r2"]
+            if r2 > r2_threshold:
+                if pulse_type == "hpi":
+                    for target in targets:
+                        self.calib_note.update_hpi_param(
+                            target,
+                            {
+                                "target": target,
+                                "duration": pulse.duration,
+                                "amplitude": fit_result["amplitude"][target],
+                                "tau": pulse.tau,
+                            },
+                        )
+                elif pulse_type == "pi":
+                    for target in targets:
+                        self.calib_note.update_pi_param(
+                            target,
+                            {
+                                "target": target,
+                                "duration": pulse.duration,
+                                "amplitude": fit_result["amplitude"][target],
+                                "tau": pulse.tau,
+                            },
+                        )
+            else:
+                print(f"Error: R² value is too low ({r2:.3f})")
+                print(f"Calibration data not stored for {targets}.")
+
+            return fit_result
+        
+        result = calibrate(targets)
+
+        return Result(data=result)
+    
+    def calibrate_mux_pulse(
+        self,
+        targets: Sequence[str] | None = None,
+        *,
+        pulse_type: Literal["pi", "hpi"],
+        detuning_range: ArrayLike = np.linspace(-0.01, 0.01, 21),
+        duration: float | None = None,
+        ramptime: float | None = None,
+        n_points: int = 20,
+        n_rotations: int = 1,
+        n_iterations: int = 2,
+        r2_threshold: float = 0.5,
+        plot: bool = True,
+        shots: int = CALIBRATION_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+    ):
+        if targets is None:
+            targets = self.qubit_labels
+
+        if len(targets) != 2:
+            raise ValueError("Mux pulse needs just 2 targets")
+        
+        fit_freq = dict[str, float]
+        fit_ampl = dict[str, float]
+
+        for i in range(n_iterations):
+            print(f"\nIteration {i + 1}/{n_iterations}")
+
+            use_stored_amp_for_freq = (i != 0)
+
+            freq_result = self.calibrate_freq_mux_pulse(
+                targets=targets,
+                pulse_type=pulse_type,
+                detuning_range=detuning_range,
+                duration=duration,
+                ramptime=ramptime,
+                n_rotations=n_rotations,
+                r2_threshold=r2_threshold,
+                use_stored_amplitude=use_stored_amp_for_freq,
+                plot=plot,
+                shots=shots,
+                interval=interval,
+            )
+            fit_freq = freq_result.data["detuning"]
+
+            ampl_result = self.calibrate_ampl_mux_pulse(
+                targets=targets,
+                pulse_type=pulse_type,
+                fit_freq=fit_freq,
+                duration=duration,
+                ramptime=ramptime,
+                n_rotations=n_rotations,
+                n_points=n_points,
+                r2_threshold=r2_threshold,
+                use_stored_amplitude=True,
+                plot=plot,
+                shots=shots,
+                interval=interval,
+            )
+            fit_ampl = ampl_result.data["amplitude"]
+
+        return Result(
+            data = {
+                "amplitude": fit_ampl,
+                "detuning": fit_freq,
+            }
+        )
