@@ -3504,3 +3504,393 @@ def fit_rotation(
         figure=fig,
         figures={"fig3d": fig3d},
     )
+
+
+def fit_2d_detuning_map(
+    *,
+    targets: Sequence[str],
+    x_detuning_range: NDArray,
+    y_detuning_range: NDArray,
+    data: NDArray,
+    p0=None,
+    plot: bool = True,
+    title: str = "Detuning map",
+    xlabel: str = "Detuning range",
+    ylabel: str = "Detuning range",
+    zlabel: str = "Probability",
+) -> FitResult:
+    """
+    Fit a 2D detuning map with a 2D Gaussian and extract the optimal detunings.
+
+    Parameters
+    ----------
+    targets : Sequence[str]
+        List of two qubit labels [q0_label, q1_label].
+    x_detuning_range : NDArray[np.float64]
+        1D array of detuning values for q0 (axis-0).
+    y_detuning_range : NDArray[np.float64]
+        1D array of detuning values for q1 (axis-1).
+    data : NDArray[np.float64]
+        2D array of measured values with shape.
+        The first index corresponds to q0, the second index to q1.
+    p0 : optional
+        Initial guess for the Gaussian parameters
+        (A, x0, y0, sx, sy, C). If None, a heuristic guess is used.
+    plot : bool, optional
+        If True, show a 3D Plotly surface of the data and the fitted peak.
+    title : str, optional
+        Title prefix for the figure.
+    xlabel : str, optional
+        Label for the x-axis (q0 detuning). If None, a label is generated
+        from targets[0].
+    ylabel : str, optional
+        Label for the y-axis (q1 detuning). If None, a label is generated
+        from targets[1].
+    zlabel : str, optional
+        Label for the z-axis (metric).
+
+    Returns
+    -------
+    FitResult
+        Result object with the following fields in data:
+            - "amplitude": dict mapping each target to its optimal detuning,
+            - "metric": fitted metric value at the optimal detuning
+            - "r2": coefficient of determination of the Gaussian fit
+            - "popt": optimal Gaussian parameters
+            - "pcov": covariance matrix of the fit
+            - "fig": Plotly Figure object with the 3D surface and peak marker
+    """
+    # --- input normalization and checks ---
+    x_detuning_range = np.asarray(x_detuning_range, dtype=np.float64)
+    y_detuning_range = np.asarray(y_detuning_range, dtype=np.float64)
+    Z = np.asarray(data, dtype=np.float64)
+
+    if Z.shape != (x_detuning_range.size, y_detuning_range.size):
+        return FitResult(
+            status=FitStatus.ERROR,
+            message=(
+                "Shape mismatch: data must have shape "
+                "(len(x_detuning_range), len(y_detuning_range))."
+            ),
+            data={},
+        )
+
+    if len(targets) != 2:
+        return FitResult(
+            status=FitStatus.ERROR,
+            message="targets must be a sequence of two labels [q0, q1].",
+            data={},
+        )
+
+    q0_label, q1_label = targets
+
+    if xlabel is None:
+        xlabel = f"{q0_label} detuning"
+    if ylabel is None:
+        ylabel = f"{q1_label} detuning"
+
+    # --- 2D Gaussian model ---
+    def gauss2d(xy_tuple, A, x0, y0, sx, sy, C):
+        """
+        2D Gaussian:
+          f(x, y) = A * exp(-(((x - x0)^2)/(2*sx^2) + ((y - y0)^2)/(2*sy^2))) + C
+        """
+        x_, y_ = xy_tuple
+        return (
+            A
+            * np.exp(-(((x_ - x0) ** 2) / (2 * sx**2) + ((y_ - y0) ** 2) / (2 * sy**2)))
+            + C
+        )
+
+    # --- meshgrid ---
+    X, Y = np.meshgrid(x_detuning_range, y_detuning_range, indexing="ij")
+
+    Xv = X.ravel()
+    Yv = Y.ravel()
+    Zv = Z.ravel()
+
+    # --- initial parameter guess ---
+    A_init = Zv.max() - Zv.min()
+    idx_peak = np.argmax(Zv)
+    x0_init = Xv[idx_peak]
+    y0_init = Yv[idx_peak]
+
+    span_x = x_detuning_range.max() - x_detuning_range.min()
+    span_y = y_detuning_range.max() - y_detuning_range.min()
+    sx_init = span_x / 4 if span_x > 0 else 0.001
+    sy_init = span_y / 4 if span_y > 0 else 0.001
+    C_init = Zv.min()
+
+    if p0 is None:
+        p0 = (A_init, x0_init, y0_init, sx_init, sy_init, C_init)
+
+    # --- Gaussian fit ---
+    try:
+        popt, pcov = curve_fit(gauss2d, (Xv, Yv), Zv, p0=p0)
+    except RuntimeError:
+        print(f"Failed to fit 2D map for {q0_label}-{q1_label}.")
+        return FitResult(
+            status=FitStatus.ERROR,
+            message="Failed to fit 2D detuning map.",
+            data={
+                "amplitude": {q0_label: np.nan, q1_label: np.nan},
+                "r2": np.nan,
+            },
+        )
+
+    A_fit, x0_fit, y0_fit, sx_fit, sy_fit, C_fit = popt
+
+    # --- R² computation ---
+    Z_fit_vec = gauss2d((Xv, Yv), *popt)
+    ss_res = np.sum((Zv - Z_fit_vec) ** 2)
+    ss_tot = np.sum((Zv - Zv.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot != 0 else np.nan
+
+    # --- metric at the optimal detuning ---
+    z_opt = gauss2d(
+        (np.array([x0_fit], dtype=np.float64), np.array([y0_fit], dtype=np.float64)),
+        *popt,
+    )[0]
+
+    # --- 3D Plotly surface ---
+    fig = go.Figure()
+    fig.add_surface(
+        x=X,
+        y=Y,
+        z=Z,
+        colorbar=dict(title=zlabel),
+        name="Data",
+    )
+    fig.add_scatter3d(
+        x=[x0_fit],
+        y=[y0_fit],
+        z=[z_opt],
+        mode="markers",
+        marker=dict(size=5),
+        name="Peak (fit)",
+    )
+    fig.update_layout(
+        title=f"{title} : {q0_label}-{q1_label}",
+        scene=dict(
+            xaxis_title=f"{xlabel} {q0_label}",
+            yaxis_title=f"{ylabel} {q1_label}",
+            zaxis_title=zlabel,
+        ),
+        width=600,
+        height=500,
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+
+    if plot:
+        fig.show(config=_plotly_config(f"detuning_map_{q0_label}_{q1_label}"))
+
+    return FitResult(
+        status=FitStatus.SUCCESS,
+        message="2D detuning map fitting successful.",
+        data={
+            "detuning": {
+                q0_label: x0_fit,
+                q1_label: y0_fit,
+            },
+            "metric": z_opt,
+            "r2": r2,
+            "popt": popt,
+            "pcov": pcov,
+            "fig": fig,
+        },
+    )
+
+
+def fit_2d_ampl_map(
+    *,
+    targets: Sequence[str],
+    x_amplitude_range: NDArray,
+    y_amplitude_range: NDArray,
+    data: NDArray,
+    p0=None,
+    plot: bool = True,
+    title: str = "Amplitude map",
+    xlabel: str = "Amplitude range",
+    ylabel: str = "Amplitude range",
+    zlabel: str = "Probability",
+) -> FitResult:
+    """
+    Fit a 2D amplitude map with a 2D Gaussian and extract the optimal amplitudes.
+
+    Parameters
+    ----------
+    targets : Sequence[str]
+        List of two qubit labels [q0_label, q1_label].
+    x_amplitude_range : NDArray[np.float64]
+        1D array of amplitudes for q0 (axis-0).
+    y_amplitude_range : NDArray[np.float64]
+        1D array of amplitudes for q1 (axis-1).
+    data : NDArray[np.float64]
+        2D array of measured values with shape.
+        The first index corresponds to q0, the second index to q1.
+    p0 : optional
+        Initial guess for the Gaussian parameters
+        (A, x0, y0, sx, sy, C). If None, a heuristic guess is used.
+    plot : bool, optional
+        If True, show a 3D Plotly surface of the data and the fitted peak.
+    title : str, optional
+        Title prefix for the figure.
+    xlabel : str, optional
+        Label for the x-axis (q0 amplitude). If None, a label is generated
+        from targets[0].
+    ylabel : str, optional
+        Label for the y-axis (q1 amplitude). If None, a label is generated
+        from targets[1].
+    zlabel : str, optional
+        Label for the z-axis (metric).
+
+    Returns
+    -------
+    FitResult
+        Result object with the following fields in data:
+            - "amplitude": dict mapping each target to its optimal amplitude
+            - "metric": fitted metric value at the optimal amplitudes
+            - "r2": coefficient of determination of the Gaussian fit
+            - "popt": optimal Gaussian parameters
+            - "pcov": covariance matrix of the fit
+            - "fig": Plotly Figure object with the 3D surface and peak marker
+    """
+    # --- input normalization and checks ---
+    x_amplitude_range = np.asarray(x_amplitude_range, dtype=np.float64)
+    y_amplitude_range = np.asarray(y_amplitude_range, dtype=np.float64)
+    Z = np.asarray(data, dtype=np.float64)
+
+    if Z.shape != (x_amplitude_range.size, y_amplitude_range.size):
+        return FitResult(
+            status=FitStatus.ERROR,
+            message=(
+                "Shape mismatch: data must have shape "
+                "(len(x_amplitude_range), len(y_amplitude_range))."
+            ),
+            data={},
+        )
+
+    if len(targets) != 2:
+        return FitResult(
+            status=FitStatus.ERROR,
+            message="targets must be a sequence of two labels [q0, q1].",
+            data={},
+        )
+
+    q0_label, q1_label = targets
+
+    if xlabel is None:
+        xlabel = f"{q0_label} amplitude"
+    if ylabel is None:
+        ylabel = f"{q1_label} amplitude"
+
+    # --- 2D Gaussian model ---
+    def gauss2d(xy_tuple, A, x0, y0, sx, sy, C):
+        """
+        2D Gaussian:
+          f(x, y) = A * exp(-(((x - x0)^2)/(2*sx^2) + ((y - y0)^2)/(2*sy^2))) + C
+        """
+        x_, y_ = xy_tuple
+        return (
+            A
+            * np.exp(-(((x_ - x0) ** 2) / (2 * sx**2) + ((y_ - y0) ** 2) / (2 * sy**2)))
+            + C
+        )
+
+    # --- meshgrid ---
+    X, Y = np.meshgrid(x_amplitude_range, y_amplitude_range, indexing="ij")
+
+    Xv = X.ravel()
+    Yv = Y.ravel()
+    Zv = Z.ravel()
+
+    # --- initial parameter guess ---
+    A_init = Zv.max() - Zv.min()
+    idx_peak = np.argmax(Zv)
+    x0_init = Xv[idx_peak]
+    y0_init = Yv[idx_peak]
+
+    span_x = x_amplitude_range.max() - x_amplitude_range.min()
+    span_y = y_amplitude_range.max() - y_amplitude_range.min()
+    sx_init = span_x / 4 if span_x > 0 else 0.001
+    sy_init = span_y / 4 if span_y > 0 else 0.001
+    C_init = Zv.min()
+
+    if p0 is None:
+        p0 = (A_init, x0_init, y0_init, sx_init, sy_init, C_init)
+
+    # --- Gaussian fit ---
+    try:
+        popt, pcov = curve_fit(gauss2d, (Xv, Yv), Zv, p0=p0)
+    except RuntimeError:
+        print(f"Failed to fit 2D amplitude map for {q0_label}-{q1_label}.")
+        return FitResult(
+            status=FitStatus.ERROR,
+            message="Failed to fit 2D amplitude map.",
+            data={
+                "amplitude": {q0_label: np.nan, q1_label: np.nan},
+                "r2": np.nan,
+            },
+        )
+
+    A_fit, x0_fit, y0_fit, sx_fit, sy_fit, C_fit = popt
+
+    # --- R² computation ---
+    Z_fit_vec = gauss2d((Xv, Yv), *popt)
+    ss_res = np.sum((Zv - Z_fit_vec) ** 2)
+    ss_tot = np.sum((Zv - Zv.mean()) ** 2)
+    r2 = 1 - ss_res / ss_tot if ss_tot != 0 else np.nan
+
+    # --- metric at the optimal amplitudes ---
+    z_opt = gauss2d(
+        (np.array([x0_fit], dtype=np.float64), np.array([y0_fit], dtype=np.float64)),
+        *popt,
+    )[0]
+
+    # --- 3D Plotly surface ---
+    fig = go.Figure()
+    fig.add_surface(
+        x=X,
+        y=Y,
+        z=Z,
+        colorbar=dict(title=zlabel),
+        name="Data",
+    )
+    fig.add_scatter3d(
+        x=[x0_fit],
+        y=[y0_fit],
+        z=[z_opt],
+        mode="markers",
+        marker=dict(size=5),
+        name="Peak (fit)",
+    )
+    fig.update_layout(
+        title=f"{title} : {q0_label}-{q1_label}",
+        scene=dict(
+            xaxis_title=f"{xlabel} {q0_label}",
+            yaxis_title=f"{ylabel} {q1_label}",
+            zaxis_title=zlabel,
+        ),
+        width=600,
+        height=500,
+        margin=dict(l=0, r=0, b=0, t=40),
+    )
+
+    if plot:
+        fig.show(config=_plotly_config(f"ampl_map_{q0_label}_{q1_label}"))
+
+    return FitResult(
+        status=FitStatus.SUCCESS,
+        message="2D amplitude map fitting successful.",
+        data={
+            "amplitude": {
+                q0_label: x0_fit,
+                q1_label: y0_fit,
+            },
+            "metric": z_opt,
+            "r2": r2,
+            "popt": popt,
+            "pcov": pcov,
+            "fig": fig,
+        },
+    )
