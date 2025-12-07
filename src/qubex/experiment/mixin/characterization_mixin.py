@@ -32,6 +32,7 @@ from ...pulse import (
     RampType,
     Rect,
     Waveform,
+    VirtualZ,
 )
 from ...style import COLORS
 from ...typing import TargetMap
@@ -1212,7 +1213,7 @@ class CharacterizationMixin(
 
         if time_range is None:
             time_range = np.arange(0, 50_001, 1000)
-        
+
         time_range = self.util.discretize_time_range(
             time_range=np.asarray(time_range),
             sampling_period=2 * SAMPLING_PERIOD,
@@ -1241,17 +1242,17 @@ class CharacterizationMixin(
                     ps.add(target, x90.repeated(2))
                     ps.add(target, Blank(T))
                 return ps
-            
+
             def t2_sequence(T: int) -> PulseSchedule:
                 half_T = T // 2
                 with PulseSchedule([target]) as ps:
                     ps.add(target, x90)
                     ps.add(target, Blank(half_T))
-                    ps.add(target, x90.repeated(2).shifted(np.pi/2))
+                    ps.add(target, x90.repeated(2).shifted(np.pi / 2))
                     ps.add(target, Blank(half_T))
                     ps.add(target, x90.scaled(-1))
                 return ps
-            
+
             def ramsey_sequence(T: int) -> PulseSchedule:
                 with PulseSchedule([target]) as ps:
                     x90 = self.get_hpi_pulse(target)
@@ -1263,7 +1264,7 @@ class CharacterizationMixin(
                         ps.add(target, x90.shifted(-np.pi / 2))
                 return ps
 
-            detuned_frequencies = {target: self.qubits[target].frequency + detuning}              
+            detuned_frequencies = {target: self.qubits[target].frequency + detuning}
 
             for T in time_range:
                 measurements = {
@@ -1316,7 +1317,7 @@ class CharacterizationMixin(
                 target=target,
                 x=sweep_result.sweep_range,
                 y=0.5 * (1 - sweep_result.normalized),
-                plot=plot   ,
+                plot=plot,
                 title="T1",
                 xlabel="Time (μs)",
                 ylabel="Normalized signal",
@@ -1342,7 +1343,7 @@ class CharacterizationMixin(
                         fig,
                         name=f"t1_{target}",
                     )
-        
+
         for target, sweep_result in sweep_data["T2"].items():
             fit_result_t2 = fitting.fit_exp_decay(
                 target=target,
@@ -1413,11 +1414,11 @@ class CharacterizationMixin(
                         fig,
                         name=f"ramsey_{target}",
                     )
-    
-        exp_t1 = ExperimentResult(data = data_t1)
-        exp_t2 = ExperimentResult(data = data_t2)
-        exp_ramsey = ExperimentResult(data = data_ramsey) 
-    
+
+        exp_t1 = ExperimentResult(data=data_t1)
+        exp_t2 = ExperimentResult(data=data_t2)
+        exp_ramsey = ExperimentResult(data=data_ramsey)
+
         return {
             "T1": exp_t1,
             "T2": exp_t2,
@@ -1450,13 +1451,17 @@ class CharacterizationMixin(
         elif isinstance(stark_detuning, float):
             detuning = stark_detuning
             if abs(detuning) > 0.2:
-                raise ValueError("Detuning of a stark tone must not exceed 0.2 GHz: the guard-banded AWG baseband limit.")
+                raise ValueError(
+                    "Detuning of a stark tone must not exceed 0.2 GHz: the guard-banded AWG baseband limit."
+                )
             stark_detuning = {target: detuning for target in targets}
         else:
             for target in targets:
                 detuning = stark_detuning[target]
                 if abs(detuning) > 0.2:
-                    raise ValueError("Detuning of a stark tone must not exceed 0.2 GHz: the guard-banded AWG baseband limit.")
+                    raise ValueError(
+                        "Detuning of a stark tone must not exceed 0.2 GHz: the guard-banded AWG baseband limit."
+                    )
 
         if stark_amplitude is None:
             stark_amplitude = {target: 0.1 for target in targets}
@@ -1481,7 +1486,9 @@ class CharacterizationMixin(
         data: dict[str, T1Data] = {}
 
         for target in targets:
-            power = self.calc_control_amplitude(target=target, rabi_rate=stark_amplitude[target])
+            power = self.calc_control_amplitude(
+                target=target, rabi_rate=stark_amplitude[target]
+            )
             if power > 1:
                 raise ValueError("Drive amplitude of a stark tone must not exceed 1")
             ramptime = stark_ramptime[target]
@@ -1496,9 +1503,9 @@ class CharacterizationMixin(
                             duration=T + ramptime * 2,
                             amplitude=power,
                             tau=ramptime,
-                        ).detuned(detuning=detuning))
+                        ).detuned(detuning=detuning),
+                    )
                 return ps
-
 
             sweep_result = self.sweep_parameter(
                 sequence=stark_t1_sequence,
@@ -1574,13 +1581,17 @@ class CharacterizationMixin(
         elif isinstance(stark_detuning, float):
             detuning = stark_detuning
             if abs(detuning) > 0.2:
-                raise ValueError("Detuning of a stark tone must not exceed 0.2 GHz: the guard-banded AWG baseband limit.")
+                raise ValueError(
+                    "Detuning of a stark tone must not exceed 0.2 GHz: the guard-banded AWG baseband limit."
+                )
             stark_detuning = {target: detuning for target in targets}
         else:
             for target in targets:
                 detuning = stark_detuning[target]
                 if abs(detuning) > 0.2:
-                    raise ValueError("Detuning of a stark tone must not exceed 0.2 GHz: the guard-banded AWG baseband limit.")
+                    raise ValueError(
+                        "Detuning of a stark tone must not exceed 0.2 GHz: the guard-banded AWG baseband limit."
+                    )
 
         if stark_amplitude is None:
             stark_amplitude = {target: 0.1 for target in targets}
@@ -1602,11 +1613,14 @@ class CharacterizationMixin(
         data: dict[str, RamseyData] = {}
 
         for target in targets:
-            power = self.calc_control_amplitude(target=target, rabi_rate=stark_amplitude[target])
+            power = self.calc_control_amplitude(
+                target=target, rabi_rate=stark_amplitude[target]
+            )
             if power > 1:
                 raise ValueError("Drive amplitude of a stark tone must not exceed 1")
             ramptime = stark_ramptime[target]
             detuning = stark_detuning[target]
+
             def stark_ramsey_sequence(T: int) -> PulseSchedule:
                 x90 = self.get_hpi_pulse(target=target)
                 with PulseSchedule([target]) as ps:
@@ -1618,7 +1632,8 @@ class CharacterizationMixin(
                                 duration=T + ramptime * 2,
                                 amplitude=power,
                                 tau=ramptime,
-                            ).detuned(detuning=detuning))
+                            ).detuned(detuning=detuning),
+                        )
                         if second_rotation_axis == "X":
                             ps.add(target, x90.shifted(np.pi))
                         else:
@@ -1630,20 +1645,22 @@ class CharacterizationMixin(
                                 duration=ramptime * 2,
                                 amplitude=power,
                                 tau=ramptime,
-                            ).detuned(detuning=detuning))
+                            ).detuned(detuning=detuning),
+                        )
                         ps.add(target, x90.repeated(2))
                         ps.add(
                             target,
                             FlatTop(
-                                duration = T + ramptime * 2,
+                                duration=T + ramptime * 2,
                                 amplitude=power,
                                 tau=ramptime,
-                            ).detuned(detuning=detuning))
+                            ).detuned(detuning=detuning),
+                        )
                         if second_rotation_axis == "X":
                             ps.add(target, VirtualZ(theta=-np.pi))
                             ps.add(target, x90)
                         else:
-                            ps.add(target, VirtualZ(theta=np.pi/2))
+                            ps.add(target, VirtualZ(theta=np.pi / 2))
                             ps.add(target, x90)
                 return ps
 
@@ -1691,7 +1708,6 @@ class CharacterizationMixin(
                     print(f"{qubit}: {ac_stark_shift:.6f}")
                     print("")
 
-
                     fig = fit_result["fig"]
 
                     if save_image:
@@ -1714,13 +1730,12 @@ class CharacterizationMixin(
         shots: int = DEFAULT_SHOTS,
         interval: float = DEFAULT_INTERVAL,
     ):
-
         if stark_detuning is None:
-            stark_detuning = 0.15   
+            stark_detuning = 0.15
         else:
             if abs(stark_detuning) > 0.2:
-                raise ValueError("Detuning of a stark tone exceeds 0.2 GHz AWG limit.") 
-        
+                raise ValueError("Detuning of a stark tone exceeds 0.2 GHz AWG limit.")
+
         if stark_amplitude is None:
             stark_amplitude = 0.1
 
@@ -1729,23 +1744,29 @@ class CharacterizationMixin(
 
         if wait_time is None:
             chip = self.system_manager.experiment_system.chip
-            half_t1 = self.system_manager.config_loader._props_dict[chip.id]["t1"][target] * np.log(2)
+            half_t1 = self.system_manager.config_loader._props_dict[chip.id]["t1"][
+                target
+            ] * np.log(2)
             wait_time = np.round(half_t1 / SAMPLING_PERIOD) * SAMPLING_PERIOD
         self.validate_rabi_params([target])
 
-        stark_power = self.calc_control_amplitude(target=target, rabi_rate=stark_amplitude)
+        stark_power = self.calc_control_amplitude(
+            target=target, rabi_rate=stark_amplitude
+        )
         if stark_power > 1:
             raise ValueError("Stark drive amplitude must not exceed 1")
-            
+
         def stark_P1_sequence() -> PulseSchedule:
             with PulseSchedule([target]) as ps:
                 ps.add(target, self.get_hpi_pulse(target).repeated(2))
-                ps.add(target,
-                        FlatTop(
-                            duration=wait_time + stark_ramptime * 2,
-                            amplitude=stark_power,
-                            tau = stark_ramptime,
-                        ).detuned(detuning=stark_detuning))
+                ps.add(
+                    target,
+                    FlatTop(
+                        duration=wait_time + stark_ramptime * 2,
+                        amplitude=stark_power,
+                        tau=stark_ramptime,
+                    ).detuned(detuning=stark_detuning),
+                )
             return ps
 
         result = self.measure(
@@ -1757,7 +1778,7 @@ class CharacterizationMixin(
         )
 
         return result
-    
+
     def _stark_P1_spectroscopy(
         self,
         target: str,
@@ -1770,24 +1791,27 @@ class CharacterizationMixin(
         interval: float = DEFAULT_INTERVAL,
         plot: bool = True,
     ):
-
         if stark_detuning is None:
-            stark_detuning = 0.15   
+            stark_detuning = 0.15
         else:
             if abs(stark_detuning) > 0.2:
-                raise ValueError("Detuning of a stark tone exceeds 0.2 GHz AWG limit.") 
-            
+                raise ValueError("Detuning of a stark tone exceeds 0.2 GHz AWG limit.")
+
         for stark_amplitude in stark_amplitude_range:
-            stark_power = self.calc_control_amplitude(target=target, rabi_rate=stark_amplitude)
+            stark_power = self.calc_control_amplitude(
+                target=target, rabi_rate=stark_amplitude
+            )
             if stark_power > 1:
                 raise ValueError("Stark drive amplitude must not exceed 1")
 
         if stark_ramptime is None:
             stark_ramptime = 50
-        
+
         if wait_time is None:
             chip = self.system_manager.experiment_system.chip
-            half_t1 = self.system_manager.config_loader._props_dict[chip.id]["t1"][target] * np.log(2)
+            half_t1 = self.system_manager.config_loader._props_dict[chip.id]["t1"][
+                target
+            ] * np.log(2)
             wait_time = np.round(half_t1 / SAMPLING_PERIOD) * SAMPLING_PERIOD
 
         self.validate_rabi_params([target])
@@ -1795,17 +1819,17 @@ class CharacterizationMixin(
         p1_list = []
         for stark_amplitude in stark_amplitude_range:
             result = self._stark_P1_experiment(
-                target=target, 
+                target=target,
                 stark_amplitude=stark_amplitude,
                 stark_detuning=stark_detuning,
                 stark_ramptime=stark_ramptime,
                 shots=shots,
                 interval=interval,
-                mode="single"
-                )
+                mode="single",
+            )
             results.append(result)
             p1_list.append(result.probabilities["1"])
-        
+
         if plot:
             fig = go.Figure()
             fig.add_scatter(name="data", x=stark_amplitude_range, y=p1_list)
@@ -1816,9 +1840,9 @@ class CharacterizationMixin(
                 showlegend=True,
             )
             fig.show()
-        
+
         return {
-            "raw_result" : results,
+            "raw_result": results,
             "amplitude_range": stark_amplitude_range,
             "p1": p1_list,
         }
@@ -1899,7 +1923,7 @@ class CharacterizationMixin(
         second_rotation_axis: Literal["X", "Y"] = "Y",
         shots: int = DEFAULT_SHOTS,
         interval: float = DEFAULT_INTERVAL,
-        rotation_frequency: float = 0.001, 
+        rotation_frequency: float = 0.001,
         plot: bool = True,
     ) -> Result:
         if time_range is None:
@@ -1924,7 +1948,7 @@ class CharacterizationMixin(
                 target_qubit: x180,
                 spectator_qubit: x180,
             }
-        
+
         # Raise an error when rotation_frequency is negative
         if rotation_frequency < 0:
             raise ValueError("rotation_frequency must be non-negative.")
@@ -1938,9 +1962,19 @@ class CharacterizationMixin(
                 ps.add(spectator_qubit, x180[spectator_qubit])
                 ps.add(target_qubit, Blank(tau))
                 if second_rotation_axis == "X":
-                    ps.add(target_qubit, x90[target_qubit].shifted(np.pi - rotation_frequency * 2*tau * 2*np.pi)) 
+                    ps.add(
+                        target_qubit,
+                        x90[target_qubit].shifted(
+                            np.pi - rotation_frequency * 2 * tau * 2 * np.pi
+                        ),
+                    )
                 else:
-                    ps.add(target_qubit, x90[target_qubit].shifted(-np.pi / 2 - rotation_frequency * 2*tau * 2*np.pi)) 
+                    ps.add(
+                        target_qubit,
+                        x90[target_qubit].shifted(
+                            -np.pi / 2 - rotation_frequency * 2 * tau * 2 * np.pi
+                        ),
+                    )
             return ps
 
         time_range = np.asarray(time_range)
@@ -1972,7 +2006,7 @@ class CharacterizationMixin(
         if fit_result["status"] != "success":
             raise RuntimeError("Fitting failed in JAZZ experiment.")
 
-        xi = fit_result["f"] * 1e-3 - rotation_frequency 
+        xi = fit_result["f"] * 1e-3 - rotation_frequency
         zeta = 2 * xi
 
         print(f"ξ: {xi * 1e6:.2f} kHz")
@@ -2043,7 +2077,6 @@ class CharacterizationMixin(
                 "g": g,
             }
         )
-
 
     @deprecated("Use `measure_electrical_delay` instead.")
     def measure_phase_shift(
