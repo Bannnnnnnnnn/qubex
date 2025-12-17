@@ -558,7 +558,141 @@ class CharacterizationProtocol(Protocol):
         >>> ramsey_result = result["Ramsey"]
 
         """
-        ... 
+        ...
+
+    def _stark_P1_experiment(
+        self,
+        target: str,
+        *,
+        stark_detuning: float | None = None,
+        stark_amplitude: float | None = None,
+        stark_ramptime: float | None = None,
+        wait_time: int | None = None,
+        mode: Literal["single", "avg"] = "avg",
+        shots: int = DEFAULT_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+    ):
+        """
+        Conducts a Ramsey experiment under an off resonance tone(a stark tone) in series.
+
+        Parameters
+        ----------
+        targets : Collection[str] | str, optional
+            Target labels to check the Stark-driven Ramsey oscillation.
+        time_range : ArrayLike, optional
+            Time range of the experiment in ns. Defaults to np.arange(0, 401, 4).
+        stark_detuning : float| dict[str, float], optional
+            Frequency offset of the Stark tone from the qubit frequency. Defaults to 0.15 GHz (Blue detuning).
+        stark_amplitude : float| dict[str, float], optional
+            Drive amplitude of the Stark tone expressed as the on-resonance Rabi rate Ω. Defaults to 0.1 GHz.
+        stark_ramptime : float| dict[str, float], optional
+            Ramp time of the stark tone. Defaults to 10 ns.
+            Time range of the experiment in ns. Defaults to np.arange(0, 50_001, 1000).
+        detuning : float, optional
+            Detuning of the control frequency. Defaults to 0.001 GHz.
+        second_rotation_axis : Literal["X", "Y"], optional
+            Axis of the second rotation pulse. Defaults to "Y".
+        shots : int, optional
+            Number of shots. Defaults to CALIBRATION_SHOTS.
+        interval : float, optional
+            Interval between shots. Defaults to DEFAULT_INTERVAL.
+        plot : bool, optional
+            Whether to plot the measured signals. Defaults to True.
+        save_image : bool, optional
+            Whether to save the images. Defaults to False.
+
+        Returns
+        -------
+        dict[str, ExperimentResult]
+            Dictionary containing the results of each experiment.
+            The keys are:
+                - "T1": ExperimentResult[T1Data]
+                - "T2": ExperimentResult[T2Data]
+                - "Ramsey": ExperimentResult[RamseyData]
+            Each ExperimentResult holds a mapping from target label to the
+            corresponding data object.
+
+        Examples
+        --------
+        >>> result = ex._simultaneous_measurement_coherenece(
+        ...     targets=["Q00", "Q01", "Q02"],
+        ...     time_range=np.arange(0, 50_001, 1000),
+        ...     detuning=0.001,
+        ...     shots=2048,
+        ... )
+        >>> t1_result = result["T1"]
+        >>> t2_result = result["T2"]
+        >>> ramsey_result = result["Ramsey"]
+
+        """
+        ...
+
+    def _stark_P1_spectroscopy(
+        self,
+        target: str,
+        *,
+        stark_detuning: float | None = None,
+        stark_ramptime: float | None = None,
+        stark_amplitude_range: ArrayLike = np.linspace(0, 0.1, 51),
+        wait_time: int | None = None,
+        shots: int = DEFAULT_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+        plot: bool = True,
+    ):
+        """
+        Conducts a Ramsey experiment under an off resonance tone(a stark tone) in series.
+
+        Parameters
+        ----------
+        targets : Collection[str] | str, optional
+            Target labels to check the Stark-driven Ramsey oscillation.
+        time_range : ArrayLike, optional
+            Time range of the experiment in ns. Defaults to np.arange(0, 401, 4).
+        stark_detuning : float| dict[str, float], optional
+            Frequency offset of the Stark tone from the qubit frequency. Defaults to 0.15 GHz (Blue detuning).
+        stark_amplitude : float| dict[str, float], optional
+            Drive amplitude of the Stark tone expressed as the on-resonance Rabi rate Ω. Defaults to 0.1 GHz.
+        stark_ramptime : float| dict[str, float], optional
+            Ramp time of the stark tone. Defaults to 10 ns.
+            Time range of the experiment in ns. Defaults to np.arange(0, 50_001, 1000).
+        detuning : float, optional
+            Detuning of the control frequency. Defaults to 0.001 GHz.
+        second_rotation_axis : Literal["X", "Y"], optional
+            Axis of the second rotation pulse. Defaults to "Y".
+        shots : int, optional
+            Number of shots. Defaults to CALIBRATION_SHOTS.
+        interval : float, optional
+            Interval between shots. Defaults to DEFAULT_INTERVAL.
+        plot : bool, optional
+            Whether to plot the measured signals. Defaults to True.
+        save_image : bool, optional
+            Whether to save the images. Defaults to False.
+
+        Returns
+        -------
+        dict[str, ExperimentResult]
+            Dictionary containing the results of each experiment.
+            The keys are:
+                - "T1": ExperimentResult[T1Data]
+                - "T2": ExperimentResult[T2Data]
+                - "Ramsey": ExperimentResult[RamseyData]
+            Each ExperimentResult holds a mapping from target label to the
+            corresponding data object.
+
+        Examples
+        --------
+        >>> result = ex._simultaneous_measurement_coherenece(
+        ...     targets=["Q00", "Q01", "Q02"],
+        ...     time_range=np.arange(0, 50_001, 1000),
+        ...     detuning=0.001,
+        ...     shots=2048,
+        ... )
+        >>> t1_result = result["T1"]
+        >>> t2_result = result["T2"]
+        >>> ramsey_result = result["Ramsey"]
+
+        """
+        ...
 
     def obtain_effective_control_frequency(
         self,
