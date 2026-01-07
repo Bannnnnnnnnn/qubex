@@ -1743,11 +1743,11 @@ class CharacterizationMixin(
             stark_ramptime = 10
 
         if wait_time is None:
-            chip = self.system_manager.experiment_system.chip
-            half_t1 = self.system_manager.config_loader._props_dict[chip.id]["t1"][
+            half_t1 = self.system_manager.config_loader._load_param_data("t1")[
                 target
             ] * np.log(2)
             wait_time = np.round(half_t1 / SAMPLING_PERIOD) * SAMPLING_PERIOD
+
         self.validate_rabi_params([target])
 
         stark_power = self.calc_control_amplitude(
@@ -1787,6 +1787,7 @@ class CharacterizationMixin(
         stark_ramptime: float | None = None,
         stark_amplitude_range: ArrayLike = np.linspace(0, 0.1, 51),
         wait_time: int | None = None,
+        mode: Literal["single", "avg"] = "single",
         shots: int = DEFAULT_SHOTS,
         interval: float = DEFAULT_INTERVAL,
         plot: bool = True,
@@ -1822,9 +1823,10 @@ class CharacterizationMixin(
                 stark_amplitude=stark_amplitude,
                 stark_detuning=stark_detuning,
                 stark_ramptime=stark_ramptime,
+                wait_time=wait_time,
+                mode=mode,
                 shots=shots,
                 interval=interval,
-                mode="single",
             )
             results.append(result)
             p1_list.append(result.probabilities["1"])
