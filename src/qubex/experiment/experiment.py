@@ -1395,6 +1395,12 @@ class Experiment(
     ):
         return f"{target}_insitu"
 
+    def fh_target(
+        self,
+        target: str,
+    ):
+        return f"{target}-fh"
+
     def make_stark_channel(
         self,
         target: str,
@@ -1422,6 +1428,23 @@ class Experiment(
         qubit = self.targets[target]
         self.register_custom_target(
             label=self.insitu_target(target=target),
+            frequency=qubit.frequency + detuning,
+            box_id=qubit.channel._port.box_id,
+            port_number=qubit.channel._port.number,
+            channel_number=qubit.channel.number + channel,
+            update_lsi=lsi,
+        )
+
+    def make_fh_channel(
+        self,
+        target: str,
+        detuning: float,
+        lsi: bool,
+        channel: int,
+    ):
+        qubit = self.targets[target]
+        self.register_custom_target(
+            label=self.fh_target(target=target),
             frequency=qubit.frequency + detuning,
             box_id=qubit.channel._port.box_id,
             port_number=qubit.channel._port.number,

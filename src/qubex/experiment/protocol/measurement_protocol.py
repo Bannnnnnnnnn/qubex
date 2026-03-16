@@ -470,6 +470,21 @@ class MeasurementProtocol(Protocol):
         plot: bool = True,
     ) -> ExperimentResult[RabiData]: ...
 
+    def obtain_gf_rabi_params(
+        self,
+        targets: Collection[str] | str | None = None,
+        *,
+        time_range: ArrayLike = DEFAULT_RABI_TIME_RANGE,
+        ramptime: float | None = None,
+        frequencies: dict[str, float] | None = None,
+        is_damped: bool = True,
+        fit_threshold: float = 0.5,
+        shots: int = CALIBRATION_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+        plot: bool = True,
+        store_params: bool = False,
+    ) -> ExperimentResult[RabiData]: ...
+
     def rabi_experiment(
         self,
         *,
@@ -494,6 +509,22 @@ class MeasurementProtocol(Protocol):
         frequencies: dict[str, float] | None = None,
         detuning: float | None = None,
         is_damped: bool = False,
+        shots: int = DEFAULT_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+        plot: bool = True,
+        store_params: bool = False,
+    ) -> ExperimentResult[RabiData]: ...
+
+    def gf_rabi_experiment(
+        self,
+        *,
+        amplitudes: dict[str, float],
+        time_range: ArrayLike,
+        ramptime: float | None = None,
+        frequencies: dict[str, float] | None = None,
+        detuning: float | None = None,
+        is_damped: bool = True,
+        fit_threshold: float = 0.5,
         shots: int = DEFAULT_SHOTS,
         interval: float = DEFAULT_INTERVAL,
         plot: bool = True,

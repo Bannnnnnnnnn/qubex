@@ -742,6 +742,65 @@ class MeasurementMixin(
         )
         return result
 
+    def obtain_gf_rabi_params(
+        self,
+        targets: Collection[str] | str | None = None,
+        *,
+        time_range: ArrayLike = DEFAULT_RABI_TIME_RANGE,
+        ramptime: float | None = None,
+        frequencies: dict[str, float] | None = None,
+        is_damped: bool = True,
+        fit_threshold: float = 0.5,
+        shots: int = CALIBRATION_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+        plot: bool = True,
+        store_params: bool = False,
+    ) -> ExperimentResult[RabiData]:
+        # TODO: Integrate with obtain_rabi_params
+
+        if targets is None:
+            targets = self.qubit_labels
+        elif isinstance(targets, str):
+            targets = [targets]
+        else:
+            targets = list(targets)
+
+        time_range = np.asarray(time_range)
+
+        if ramptime is None:
+            ramptime = HPI_DURATION - HPI_RAMPTIME
+
+        amplitudes = {
+            target: self.params.get_ef_control_amplitude(target) for target in targets
+        }
+
+        rabi_data = {}
+        rabi_params = {}
+        for target in targets:
+            ge_label = Target.ge_label(target)
+            ef_label = Target.ef_label(target)
+            gf_label = f"{ge_label}_{ef_label}"
+            data = self.gf_rabi_experiment(
+                amplitudes={target: amplitudes[target]},
+                time_range=time_range,
+                ramptime=ramptime,
+                frequencies=frequencies,
+                is_damped=is_damped,
+                fit_threshold=fit_threshold,
+                shots=shots,
+                interval=interval,
+                store_params=store_params,
+                plot=plot,
+            ).data[gf_label]
+            rabi_data[gf_label] = data
+            rabi_params[gf_label] = data.rabi_param
+
+        result = ExperimentResult(
+            data=rabi_data,
+            rabi_params=rabi_params,
+        )
+        return result
+
     def rabi_experiment(
         self,
         *,
@@ -978,6 +1037,134 @@ class MeasurementMixin(
         result = ExperimentResult(
             data=ef_rabi_data,
             rabi_params=ef_rabi_params,
+        )
+
+        # return the result
+        return result
+
+    def gf_rabi_experiment(
+        self,
+        *,
+        amplitudes: dict[str, float],
+        time_range: ArrayLike,
+        ramptime: float | None = None,
+        frequencies: dict[str, float] | None = None,
+        detuning: float | None = None,
+        is_damped: bool = True,
+        fit_threshold: float = 0.5,
+        shots: int = DEFAULT_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+        plot: bool = True,
+        store_params: bool = False,
+    ) -> ExperimentResult[RabiData]:
+        # TODO: Integrate with rabi_experiment
+
+        amplitudes = {
+            Target.ef_label(label): amplitude for label, amplitude in amplitudes.items()
+        }
+        ge_labels = [Target.ge_label(label) for label in amplitudes]
+        ef_labels = [Target.ef_label(label) for label in amplitudes]
+
+        # drive time range
+        time_range = np.array(time_range, dtype=np.float64)
+
+        if ramptime is None:
+            ramptime = 0.0
+
+        effective_time_range = time_range + ramptime
+
+        # target frequencies
+        if frequencies is None:
+            frequencies = {
+                target: self.targets[target].frequency for target in amplitudes
+            }
+
+        # ef rabi sequence with rect pulses of duration T
+        def gf_rabi_sequence(T: int) -> PulseSchedule:
+            with PulseSchedule() as ps:
+                # prepare qubits to the excited state
+                for ge in ge_labels:
+                    ps.add(ge, self.x180(ge))
+                ps.barrier()
+                # apply the ef drive to induce the ef Rabi oscillation
+                for ef in ef_labels:
+                    ps.add(
+                        ef,
+                        FlatTop(
+                            duration=T + 2 * ramptime,
+                            amplitude=amplitudes[ef],
+                            tau=ramptime,
+                        ),
+                    )
+                ps.barrier()
+                for ge in ge_labels:
+                    ps.add(ge, self.x180(ge))
+            return ps
+
+        # detune target frequencies if necessary
+        if detuning is not None:
+            frequencies = {
+                target: frequencies[target] + detuning for target in amplitudes
+            }
+
+        # run the Rabi experiment by sweeping the drive time
+        sweep_result = self.sweep_parameter(
+            sequence=gf_rabi_sequence,
+            sweep_range=time_range,
+            frequencies=frequencies,
+            shots=shots,
+            interval=interval,
+            plot=plot,
+        )
+
+        # fit the Rabi oscillation
+        gf_rabi_params = {}
+        gf_rabi_data = {}
+        for qubit, data in sweep_result.data.items():
+            ef_label = Target.ef_label(qubit)
+            ge_label = Target.ge_label(qubit)
+            gf_label = f"{ge_label}_{ef_label}"
+            ge_rabi_param = self.ge_rabi_params[qubit]
+            iq_e = ge_rabi_param.endpoints[0]
+            fit_result = fitting.fit_rabi(
+                target=qubit,
+                times=effective_time_range,
+                data=data.data,
+                reference_point=iq_e,
+                plot=plot,
+                is_damped=is_damped,
+            )
+
+            if fit_result["status"] == "error" or fit_result["r2"] < fit_threshold:
+                gf_rabi_params[gf_label] = RabiParam.nan(target=gf_label)
+            else:
+                gf_rabi_params[gf_label] = RabiParam(
+                    target=gf_label,
+                    amplitude=fit_result["amplitude"],
+                    frequency=fit_result["frequency"],
+                    phase=fit_result["phase"],
+                    offset=fit_result["offset"],
+                    noise=fit_result["noise"],
+                    angle=fit_result["angle"],
+                    distance=fit_result["distance"],
+                    r2=fit_result["r2"],
+                    reference_phase=fit_result["reference_phase"],
+                )
+            gf_rabi_data[gf_label] = RabiData(
+                target=gf_label,
+                data=data.data,
+                time_range=effective_time_range,
+                rabi_param=gf_rabi_params[gf_label],
+            )
+
+        # store the Rabi parameters if necessary
+        if store_params:
+            self.store_rabi_params(gf_rabi_params)
+
+        # create the experiment result
+        result = ExperimentResult(
+            data=gf_rabi_data,
+            rabi_params=gf_rabi_params,
         )
 
         # return the result
