@@ -410,6 +410,198 @@ class CalibrationMixin(
             interval=interval,
         )
 
+    def calibrate_gf_pulse(
+        self,
+        targets: Collection[str] | str | None = None,
+        *,
+        pulse_type: Literal["pi", "hpi"],
+        duration: float | None = None,
+        ramptime: float | None = None,
+        n_points: int = 20,
+        n_rotations: int = 1,
+        r2_threshold: float = 0.5,
+        plot: bool = True,
+        shots: int = CALIBRATION_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+    ) -> ExperimentResult[AmplCalibData]:
+        if targets is None:
+            targets = self.qubit_labels
+        elif isinstance(targets, str):
+            targets = [targets]
+        else:
+            targets = list(targets)
+
+        rabi_params = self.rabi_params
+        if rabi_params is None:
+            raise ValueError("Rabi parameters are not stored.")
+
+        ef_labels = [
+            Target.ef_label(label) for label in targets if label in self.ef_rabi_params
+        ]
+
+        def calibrate(target: str) -> AmplCalibData:
+            ge_label = Target.ge_label(target)
+            ef_label = Target.ef_label(target)
+            gf_label = f"{ge_label}_{ef_label}"
+
+            if pulse_type == "hpi":
+                pulse = FlatTop(
+                    duration=duration if duration is not None else HPI_DURATION,
+                    amplitude=1,
+                    tau=ramptime if ramptime is not None else HPI_RAMPTIME,
+                )
+                area = pulse.real.sum() * pulse.SAMPLING_PERIOD
+                rabi_rate = 0.25 / area
+            elif pulse_type == "pi":
+                pulse = FlatTop(
+                    duration=duration if duration is not None else PI_DURATION,
+                    amplitude=1,
+                    tau=ramptime if ramptime is not None else PI_RAMPTIME,
+                )
+                area = pulse.real.sum() * pulse.SAMPLING_PERIOD
+                rabi_rate = 0.5 / area
+            else:
+                raise ValueError("Invalid pulse type.")
+
+            ampl = self.calc_control_amplitude(gf_label, rabi_rate)
+
+            ampl_min = ampl * (1 - 0.8 / n_rotations)
+            ampl_max = ampl * (1 + 0.5 / n_rotations)
+            ampl_min = np.clip(ampl_min, 0, 1)
+            ampl_max = np.clip(ampl_max, 0, 1)
+            if ampl_min == ampl_max:
+                ampl_min = 0
+                ampl_max = 1
+            ampl_range = np.linspace(ampl_min, ampl_max, n_points)
+
+            n_per_rotation = 2 if pulse_type == "pi" else 4
+            repetitions = n_per_rotation * n_rotations
+
+            def sequence(x: float) -> PulseSchedule:
+                with PulseSchedule() as ps:
+                    ps.add(ge_label, self.x180(target))
+                    ps.barrier()
+                    ps.add(ef_label, pulse.scaled(x).repeated(repetitions))
+                    ps.barrier()
+                    ps.add(ge_label, self.x180(target))
+                return ps
+
+            sweep_data = self.sweep_parameter(
+                sequence=sequence,
+                sweep_range=ampl_range,
+                repetitions=1,
+                rabi_level="ef",
+                shots=shots,
+                interval=interval,
+                plot=plot,
+            ).data
+
+            for target, data in sweep_data.items():
+                fit_result = fitting.fit_ampl_calib_data(
+                    target=gf_label,
+                    amplitude_range=ampl_range,
+                    data=data.data,
+                    plot=plot,
+                    # maximize=False,
+                    title=f"ef {pulse_type} pulse calibration",
+                    ylabel="Normalized signal",
+                )
+
+            r2 = fit_result["r2"]
+
+            if r2 > r2_threshold:
+                if pulse_type == "hpi":
+                    self.calib_note.update_hpi_param(
+                        ef_label,
+                        {
+                            "target": ef_label,
+                            "duration": pulse.duration,
+                            "amplitude": fit_result["amplitude"],
+                            "tau": pulse.tau,
+                        },
+                    )
+                elif pulse_type == "pi":
+                    self.calib_note.update_pi_param(
+                        ef_label,
+                        {
+                            "target": ef_label,
+                            "duration": pulse.duration,
+                            "amplitude": fit_result["amplitude"],
+                            "tau": pulse.tau,
+                        },
+                    )
+            else:
+                print(f"Error: R² value is too low ({r2:.3f})")
+                print(f"Calibration data not stored for {ef_label}.")
+
+            return AmplCalibData.new(
+                sweep_data=sweep_data,
+                calib_value=fit_result["amplitude"],
+                r2=r2,
+            )
+
+        data: dict[str, AmplCalibData] = {}
+        for target in ef_labels:
+            data[target] = calibrate(target)
+
+        print("")
+        print(f"Calibration results for {pulse_type} pulse:")
+        for target, calib_data in data.items():
+            print(f"  {target}: {calib_data.calib_value:.6f}")
+
+        return ExperimentResult(data=data)
+
+    def calibrate_gf_hpi_pulse(
+        self,
+        targets: Collection[str] | str | None = None,
+        *,
+        duration: float | None = None,
+        ramptime: float | None = None,
+        n_points: int = 20,
+        n_rotations: int = 1,
+        r2_threshold: float = 0.5,
+        plot: bool = True,
+        shots: int = CALIBRATION_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+    ) -> ExperimentResult[AmplCalibData]:
+        return self.calibrate_gf_pulse(
+            targets=targets,
+            pulse_type="hpi",
+            duration=duration,
+            ramptime=ramptime,
+            n_points=n_points,
+            n_rotations=n_rotations,
+            r2_threshold=r2_threshold,
+            plot=plot,
+            shots=shots,
+            interval=interval,
+        )
+
+    def calibrate_gf_pi_pulse(
+        self,
+        targets: Collection[str] | str | None = None,
+        duration: float | None = None,
+        ramptime: float | None = None,
+        n_points: int = 20,
+        n_rotations: int = 1,
+        r2_threshold: float = 0.5,
+        plot: bool = True,
+        shots: int = CALIBRATION_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+    ) -> ExperimentResult[AmplCalibData]:
+        return self.calibrate_ef_pulse(
+            targets=targets,
+            pulse_type="pi",
+            duration=duration,
+            ramptime=ramptime,
+            n_points=n_points,
+            n_rotations=n_rotations,
+            r2_threshold=r2_threshold,
+            plot=plot,
+            shots=shots,
+            interval=interval,
+        )
+
     def calibrate_drag_amplitude(
         self,
         targets: Collection[str] | str | None = None,

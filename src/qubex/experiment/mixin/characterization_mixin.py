@@ -1400,6 +1400,176 @@ class CharacterizationMixin(
 
         return ExperimentResult(data=data)
 
+    def gf_ramsey_experiment(
+        self,
+        targets: Collection[str] | str | None = None,
+        *,
+        time_range: ArrayLike | None = None,
+        detuning: float | None = None,
+        spectator_state: Literal["0", "1", "+", "-", "+i", "-i"] = "0",
+        shots: int = CALIBRATION_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+        plot: bool = True,
+        save_image: bool = False,
+    ) -> ExperimentResult[RamseyData]:
+        if targets is None:
+            targets = self.qubit_labels
+        elif isinstance(targets, str):
+            targets = [targets]
+        else:
+            targets = list(targets)
+
+        if time_range is None:
+            time_range = np.arange(0, 10001, 100)
+        else:
+            time_range = self.util.discretize_time_range(time_range)
+
+        if detuning is None:
+            detuning = 0.001
+
+        self.validate_rabi_params(targets)
+
+        target_groups = self.util.create_qubit_subgroups(targets)
+        spectator_groups = reversed(target_groups)  # TODO: make it more general
+
+        data: dict[str, RamseyData] = {}
+
+        for target_qubits, spectator_qubits in zip(target_groups, spectator_groups):
+            if spectator_state != "0":
+                target_list = target_qubits + spectator_qubits
+            else:
+                target_list = target_qubits
+
+            if len(target_list) == 0:
+                continue
+
+            print(f"Target qubits: {target_qubits}")
+            print(f"Spectator qubits: {spectator_qubits}")
+
+            def gf_ramsey_sequence(T: int) -> PulseSchedule:
+                with PulseSchedule(target_list) as ps:
+                    # Excite spectator qubits if needed
+                    if spectator_state != "0":
+                        for spectator in spectator_qubits:
+                            if spectator in self.qubit_labels:
+                                pulse = self.get_pulse_for_state(
+                                    target=spectator,
+                                    state=spectator_state,
+                                )
+                                ps.add(spectator, pulse)
+                        ps.barrier()
+
+                    # Ramsey sequence for the target qubit
+                    for target in target_qubits:
+                        ef_label = Target.ef_label(target)
+                        x180 = self.x180(target)
+                        ef90 = self.ef_hpi_pulse[ef_label]
+                        ps.add(target, x180)
+                        ps.barrier()
+                        ps.add(ef_label, ef90)
+                        ps.barrier()
+                        ps.add(ef_label, Blank(T))
+                        ps.barrier()
+                        ps.add(ef_label, ef90.shifted(-np.pi / 2))
+                        ps.barrier()
+                        ps.add(target, x180)
+                return ps
+
+            ef_labels = [Target.ef_label(target) for target in targets]
+            gf_labels = [
+                f"{Target.ge_label(target)}-{Target.ef_label(target)}"
+                for target in targets
+            ]
+            detuned_frequencies = {
+                ef: self.targets[ef].frequency + detuning for ef in ef_labels
+            }
+
+            _sweep_result = self.sweep_parameter(
+                sequence=gf_ramsey_sequence,
+                sweep_range=time_range,
+                frequencies=detuned_frequencies,
+                shots=shots,
+                interval=interval,
+                plot=plot,
+            )
+
+            for target, _sweep_data in _sweep_result.data.items():
+                label = f"{Target.ge_label(target)}_{Target.ef_label(target)}"
+                rabi_data = self.calib_note.rabi_params.get(label)
+                rabi_params = RabiParam(
+                    target=rabi_data["target"],
+                    amplitude=rabi_data["amplitude"],
+                    frequency=rabi_data["frequency"],
+                    phase=rabi_data["phase"],
+                    offset=rabi_data["offset"],
+                    noise=rabi_data["noise"],
+                    angle=rabi_data["angle"],
+                    distance=rabi_data["distance"],
+                    r2=rabi_data["r2"],
+                    reference_phase=rabi_data["reference_phase"],
+                )
+                sweep_result = {
+                    target: SweepData(
+                        target=label,
+                        data=_sweep_data.data,
+                        sweep_range=_sweep_data.sweep_range,
+                        rabi_param=rabi_params,
+                        title=_sweep_data.title,
+                        xlabel=_sweep_data.xlabel,
+                        ylabel=_sweep_data.ylabel,
+                        xaxis_type=_sweep_data.xaxis_type,
+                        yaxis_type=_sweep_data.yaxis_type,
+                    )
+                }
+
+            for target, sweep_data in sweep_result.items():
+                if target in target_qubits:
+                    fit_result = fitting.fit_ramsey(
+                        target=target,
+                        times=sweep_data.sweep_range,
+                        data=sweep_data.normalized,
+                        amplitude_est=1.0,
+                        offset_est=0.0,
+                        plot=plot,
+                    )
+                    if fit_result["status"] != "error":
+                        ef_label = Target.ef_label(target)
+                        f = self.targets[ef_label].frequency
+                        t2 = fit_result["tau"]
+                        ramsey_freq = fit_result["f"]
+                        phi = fit_result["phi"]
+                        if phi > 0:
+                            bare_freq = f + detuning + ramsey_freq
+                        else:
+                            bare_freq = f + detuning - ramsey_freq
+                        r2 = fit_result["r2"]
+                        ramsey_data = RamseyData.new(
+                            sweep_data=sweep_data,
+                            t2=t2,
+                            ramsey_freq=ramsey_freq,
+                            bare_freq=bare_freq,
+                            r2=r2,
+                        )
+                        data[target] = ramsey_data
+
+                        print(f"Bare ef frequency with |{spectator_state}〉:")
+                        print(f"  {target}: {ramsey_data.bare_freq:.6f}")
+                        print("")
+                        print(
+                            f"  anharmonicity: {ramsey_data.bare_freq - self.targets[target].frequency:.6f}"
+                        )
+                        print("")
+
+                        fig = fit_result["fig"]
+
+                        if save_image:
+                            viz.save_figure_image(
+                                fig,
+                                name=f"ramsey_{target}",
+                            )
+
+        return ExperimentResult(data=data)
+
     def _simultaneous_measurement_coherence(
         self,
         targets: Collection[str] | str | None = None,
