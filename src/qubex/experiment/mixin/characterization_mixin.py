@@ -1476,10 +1476,6 @@ class CharacterizationMixin(
                 return ps
 
             ef_labels = [Target.ef_label(target) for target in targets]
-            gf_labels = [
-                f"{Target.ge_label(target)}-{Target.ef_label(target)}"
-                for target in targets
-            ]
             detuned_frequencies = {
                 ef: self.targets[ef].frequency + detuning for ef in ef_labels
             }

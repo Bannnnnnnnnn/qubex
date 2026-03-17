@@ -444,6 +444,19 @@ class CharacterizationProtocol(Protocol):
         """
         ...
 
+    def gf_ramsey_experiment(
+        self,
+        targets: Collection[str] | str | None = None,
+        *,
+        time_range: ArrayLike | None = None,
+        detuning: float | None = None,
+        spectator_state: Literal["0", "1", "+", "-", "+i", "-i"] = "0",
+        shots: int = CALIBRATION_SHOTS,
+        interval: float = DEFAULT_INTERVAL,
+        plot: bool = True,
+        save_image: bool = False,
+    ) -> ExperimentResult[RamseyData]: ...
+
     def _simultaneous_measurement_coherence(
         self,
         targets: Collection[str] | str | None = None,
