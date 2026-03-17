@@ -463,7 +463,10 @@ class CalibrationMixin(
             else:
                 raise ValueError("Invalid pulse type.")
 
-            ampl = self.calc_control_amplitude(gf_label, rabi_rate)
+            rabi_params = self.calib_note.rabi_params.get(gf_label)
+            defalut_amplitude = self.params.get_ef_control_amplitude(target)
+
+            ampl = rabi_rate * defalut_amplitude / rabi_params["frequency"]
 
             ampl_min = ampl * (1 - 0.8 / n_rotations)
             ampl_max = ampl * (1 + 0.5 / n_rotations)
@@ -494,18 +497,17 @@ class CalibrationMixin(
                 shots=shots,
                 interval=interval,
                 plot=plot,
-            ).data
+            ).data[ge_label]
 
-            for target, data in sweep_data.items():
-                fit_result = fitting.fit_ampl_calib_data(
-                    target=gf_label,
-                    amplitude_range=ampl_range,
-                    data=data.data,
-                    plot=plot,
-                    # maximize=False,
-                    title=f"ef {pulse_type} pulse calibration",
-                    ylabel="Normalized signal",
-                )
+            fit_result = fitting.fit_ampl_calib_data(
+                target=target,
+                amplitude_range=ampl_range,
+                data=sweep_data.data,
+                plot=plot,
+                # maximize=False,
+                title=f"ef {pulse_type} pulse calibration",
+                ylabel="Normalized signal",
+            )
 
             r2 = fit_result["r2"]
 
@@ -541,7 +543,7 @@ class CalibrationMixin(
             )
 
         data: dict[str, AmplCalibData] = {}
-        for target in ef_labels:
+        for target in targets:
             data[target] = calibrate(target)
 
         print("")
