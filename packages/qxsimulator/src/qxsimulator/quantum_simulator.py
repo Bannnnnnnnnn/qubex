@@ -42,6 +42,7 @@ class Control:
         durations: list | npt.NDArray | None = None,
         frequency: float | None = None,
         interpolation: str = "previous",
+        frame_shifts: list | npt.NDArray | None = None,
         final_frame_shift: float = 0.0,
     ):
         """
@@ -80,10 +81,17 @@ class Control:
             else np.full(len(self.waveform), Waveform.SAMPLING_PERIOD)
         )
         self.interpolation = interpolation
+        self.frame_shifts = (
+            np.asarray(frame_shifts).astype(np.float64)
+            if frame_shifts is not None
+            else np.zeros(len(self.waveform), dtype=np.float64)
+        )
         self.final_frame_shift = final_frame_shift
 
         if len(self.waveform) != len(self.durations):
             raise ValueError("The lengths of rabi_rates and durations do not match.")
+        if len(self.waveform) != len(self.frame_shifts):
+            raise ValueError("The lengths of waveform and frame_shifts do not match.")
 
     @property
     def n_segments(self) -> int:
@@ -122,6 +130,33 @@ class Control:
     ) -> npt.NDArray[np.complex128]:
         """Return interpolated control samples at given times."""
         return self.interpolator(times)
+
+    def get_frame_shifts(
+        self,
+        times: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        """Return piecewise-constant frame shifts at the given times."""
+        if self.n_segments == 0:
+            return np.zeros_like(times, dtype=np.float64)
+
+        indices = np.searchsorted(self.times[1:], times, side="right")
+        shifts = np.empty_like(times, dtype=np.float64)
+        final_mask = indices >= self.n_segments
+        shifts[final_mask] = self.final_frame_shift
+        shifts[~final_mask] = self.frame_shifts[indices[~final_mask]]
+        return shifts
+
+    def get_logical_frame_shifts(
+        self,
+        times: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        """Return user-facing logical frame shifts at the given times."""
+        return -self.get_frame_shifts(times)
+
+    @property
+    def logical_final_frame_shift(self) -> float:
+        """Return the final user-facing logical frame shift."""
+        return -self.final_frame_shift
 
     def plot(
         self,
@@ -236,12 +271,18 @@ class SimulationResult:
     @property
     def initial_state(self) -> qt.Qobj:
         """Return the initial state of the simulation."""
-        return self.states[0]
+        return self._apply_logical_frame_to_state(
+            self.states[0],
+            float(self.times[0]),
+        )
 
     @property
     def final_state(self) -> qt.Qobj:
         """Return the final state of the simulation."""
-        return self.states[-1]
+        return self._apply_logical_frame_to_state(
+            self.states[-1],
+            float(self.times[-1]),
+        )
 
     def _get_subspace_slice(self, subspace: SubspaceType) -> slice:
         subspaces = {
@@ -253,6 +294,83 @@ class SimulationResult:
             return slice(0, None)
         else:
             return subspaces[subspace]
+
+    def _get_logical_frame_angles(
+        self,
+        time: float,
+    ) -> dict[str, float]:
+        sample_times = np.array([time], dtype=np.float64)
+        angles = defaultdict(float)
+        for control in self.controls:
+            angles[control.target] += float(
+                control.get_logical_frame_shifts(sample_times)[0]
+            )
+        return {
+            label: angle
+            for label, angle in angles.items()
+            if not np.isclose(angle, 0.0)
+        }
+
+    def _get_logical_frame_angle(self, label: str, time: float) -> float:
+        return self._get_logical_frame_angles(time).get(label, 0.0)
+
+    def _apply_rotation_to_state(
+        self,
+        state: qt.Qobj,
+        rotation: qt.Qobj,
+    ) -> qt.Qobj:
+        if state.isket:
+            return rotation @ state
+        if state.isbra:
+            return state @ rotation.dag()
+        return rotation @ state @ rotation.dag()
+
+    def _apply_logical_frame_to_state(
+        self,
+        state: qt.Qobj,
+        time: float,
+    ) -> qt.Qobj:
+        angles = self._get_logical_frame_angles(time)
+        if not angles:
+            return state
+        rotation = self.system.get_rotation_matrix(angles)
+        return self._apply_rotation_to_state(state, rotation)
+
+    def _apply_logical_frame_to_substate(
+        self,
+        state: qt.Qobj,
+        label: str,
+        time: float,
+    ) -> qt.Qobj:
+        angle = self._get_logical_frame_angle(label, time)
+        if np.isclose(angle, 0.0):
+            return state
+        dim = self.system.get_object(label).dimension
+        rotation = (1j * angle * qt.num(dim)).expm()
+        return self._apply_rotation_to_state(state, rotation)
+
+    def _apply_logical_frame_to_general_substate(
+        self,
+        state: qt.Qobj,
+        labels: Sequence[str],
+        time: float,
+    ) -> qt.Qobj:
+        rotations = []
+        has_rotation = False
+        for label in labels:
+            angle = self._get_logical_frame_angle(label, time)
+            dim = self.system.get_object(label).dimension
+            if np.isclose(angle, 0.0):
+                rotations.append(qt.qeye(dim))
+                continue
+            rotations.append((1j * angle * qt.num(dim)).expm())
+            has_rotation = True
+
+        if not has_rotation:
+            return state
+
+        rotation = qt.tensor(*rotations)
+        return self._apply_rotation_to_state(state, rotation)
 
     def get_substates(
         self,
@@ -282,7 +400,12 @@ class SimulationResult:
             frame = "qubit"
 
         index = self.system.get_index(label)
-        substates = np.array([state.ptrace(index) for state in self.states])
+        substates = np.array(
+            [
+                self._apply_logical_frame_to_substate(state.ptrace(index), label, time)
+                for time, state in zip(self.times, self.states, strict=True)
+            ]
+        )
 
         target_frequency = None
         if frame_frequency is not None:
@@ -543,7 +666,15 @@ class SimulationResult:
             perm_order = [sorted_indices.index(i) for i in target_indices]
             substates = np.array([rho.permute(perm_order) for rho in substates])
 
-        # 3. Apply frame transformation if requested
+        # 3. Apply logical frame transformations from VirtualZ metadata.
+        substates = np.array(
+            [
+                self._apply_logical_frame_to_general_substate(rho, labels, time)
+                for time, rho in zip(self.times, substates, strict=True)
+            ]
+        )
+
+        # 4. Apply frame transformation if requested.
         if frame_frequencies is not None:
             substates = self._apply_frame_transformation(
                 substates, labels, frame_frequencies
@@ -971,7 +1102,11 @@ class QuantumSimulator:
         )  # type: ignore
 
         R = self.system.get_rotation_matrix(
-            {control.target: -control.final_frame_shift for control in controls},
+            {
+                control.target: control.logical_final_frame_shift
+                for control in controls
+                if not np.isclose(control.logical_final_frame_shift, 0.0)
+            },
         )
         SR = qt.to_super(R)
 
@@ -1166,11 +1301,10 @@ class QuantumSimulator:
     def _convert_pulse_schedule_to_controls(
         pulse_schedule: PulseSchedule,
     ) -> list[Control]:
-        rabi_rates = pulse_schedule.values
-        durations = [Waveform.SAMPLING_PERIOD] * pulse_schedule.length
+        sequences = pulse_schedule.get_sequences()
         frequencies = {}
         targets = {}
-        for label in rabi_rates:
+        for label in sequences:
             if frequency := pulse_schedule.get_frequency(label):
                 frequencies[label] = frequency
             else:
@@ -1180,14 +1314,15 @@ class QuantumSimulator:
             else:
                 raise ValueError(f"Object for {label} is not provided.")
         controls = []
-        for label, waveform in rabi_rates.items():
+        for label, sequence in sequences.items():
             controls.append(
                 Control(
                     target=targets[label],
                     frequency=frequencies[label],
-                    waveform=waveform,
-                    durations=durations,
-                    final_frame_shift=pulse_schedule.get_final_frame_shift(label),
+                    waveform=sequence.values,
+                    durations=np.full(sequence.length, sequence.sampling_period),
+                    frame_shifts=sequence.frame_shifts,
+                    final_frame_shift=sequence.final_frame_shift,
                 )
             )
         return controls
