@@ -70,7 +70,12 @@ from .quantum_efficiency_measurement import (
     sweep_readout_snr,
 )
 from .readout_parameters_characterization import characterize_readout_parameters
-from .repetition_code import repetition_code
+from .repetition_code import (
+    plot_repetition_code_analysis,
+    plot_repetition_code_correlation,
+    plot_repetition_code_logical_summary,
+    repetition_code,
+)
 from .rzx_gate import rzx, rzx_gate_property
 from .simultaneous_coherence_measurement import simultaneous_coherence_measurement
 from .stark_characterization import stark_ramsey_experiment, stark_t1_experiment
@@ -129,6 +134,9 @@ __all__ = [
     "partial_transpose",
     "pb_experiment_1q",
     "pb_experiment_2q",
+    "plot_repetition_code_analysis",
+    "plot_repetition_code_correlation",
+    "plot_repetition_code_logical_summary",
     "purity_benchmarking",
     "purity_sequence_1q",
     "purity_sequence_2q",
