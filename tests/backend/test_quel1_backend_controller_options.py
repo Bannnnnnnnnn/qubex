@@ -27,6 +27,7 @@ class _FakeBox:
     def __init__(self, boxtype: str, status: dict[int, bool]) -> None:
         self.boxtype = boxtype
         self._status = status
+        self._dev = _FakeDevice()
         self.relinkup_calls: list[dict[str, Any]] = []
         self.reconnect_calls: list[dict[str, Any]] = []
 
@@ -41,6 +42,39 @@ class _FakeBox:
     def reconnect(self, **kwargs: Any) -> None:
         """Accept reconnect calls."""
         self.reconnect_calls.append(kwargs)
+
+
+class _FakeDevice:
+    def __init__(self) -> None:
+        self.load_config_calls: list[dict[str, Any]] = []
+
+    def _load_config_parameter(self, **kwargs: Any) -> dict[str, Any]:
+        """Return a minimal QuEL-1 SE Fujitsu11 relinkup parameter."""
+        self.load_config_calls.append(kwargs)
+        return {
+            "ad9082": [
+                {
+                    "dac": {
+                        "channel_assign": {
+                            "dac0": [0],
+                            "dac1": [1],
+                            "dac2": [4, 3, 2],
+                            "dac3": [7, 6, 5],
+                        }
+                    }
+                },
+                {
+                    "dac": {
+                        "channel_assign": {
+                            "dac0": [2],
+                            "dac1": [1],
+                            "dac2": [5, 4, 0],
+                            "dac3": [7, 6, 3],
+                        }
+                    }
+                },
+            ]
+        }
 
 
 def _make_controller() -> Quel1BackendController:
@@ -209,6 +243,40 @@ def test_relinkup_keeps_explicit_noise_threshold(
 
     assert fake_box.relinkup_calls[0]["background_noise_threshold"] == 12345
     assert fake_box.reconnect_calls == [{"background_noise_threshold": 12345}]
+
+
+def test_relinkup_injects_s159a_five_channel_assign(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given S159A, when relinkup runs, then MxFE0 is configured for one 5ch control lane."""
+    controller = _make_controller()
+    fake_box = _FakeBox("quel1se-fujitsu11-a", {0: False})
+    monkeypatch.setattr(
+        controller._runtime_context, "validate_box_availability", lambda _: None
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_get_existing_or_create_box",
+        lambda **kwargs: fake_box,
+    )
+
+    controller.relinkup("S159A")
+
+    relinkup_kwargs = fake_box.relinkup_calls[0]
+    assert fake_box._dev.load_config_calls == [{"config_options": None}]
+    assert relinkup_kwargs["config_options"] is None
+    assert relinkup_kwargs["param"]["ad9082"][0]["dac"]["channel_assign"] == {
+        "dac0": [0],
+        "dac1": [1],
+        "dac2": [7, 6, 4, 3, 2],
+        "dac3": [5],
+    }
+    assert relinkup_kwargs["param"]["ad9082"][1]["dac"]["channel_assign"] == {
+        "dac0": [2],
+        "dac1": [1],
+        "dac2": [5, 4, 0],
+        "dac3": [7, 6, 3],
+    }
 
 
 def test_linkup_uses_default_reconnect_noise_threshold(

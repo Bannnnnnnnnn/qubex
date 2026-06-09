@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Sequence
+from itertools import combinations, pairwise
 from typing import Final, Literal
 
 import numpy as np
@@ -256,6 +257,69 @@ def create_control_configuration(
             get_spectator_qubits=get_spectator_qubits,
             excluded_targets=excluded_targets,
         )
+        cr_channel_count = n_channels - 2
+        if cr_channel_count > 1:
+            if not cr_targets:
+                lo, cnco, _ = MixingUtil.calc_lo_cnco(
+                    f=(f_ge + f_ef) / 2,
+                    ssb=ssb,
+                    cnco_center=cnco_center,
+                )
+                fnco_ge, _ = MixingUtil.calc_fnco(f=f_ge, ssb=ssb, lo=lo, cnco=cnco)
+                fnco_ef, _ = MixingUtil.calc_fnco(f=f_ef, ssb=ssb, lo=lo, cnco=cnco)
+                fnco_cr, _ = MixingUtil.calc_fnco(f=f_ge, ssb=ssb, lo=lo, cnco=cnco)
+                channels: dict[int, ControlChannelConfig] = {
+                    0: {"fnco": fnco_ge, "targets": [qubit.label]},
+                    1: {"fnco": fnco_ef, "targets": [f"{qubit.label}-ef"]},
+                }
+                for offset in range(cr_channel_count):
+                    channel_idx = offset + 2
+                    channels[channel_idx] = {
+                        "fnco": fnco_cr,
+                        "targets": [f"{qubit.label}-CR"] if offset == 0 else [],
+                    }
+                return {
+                    "lo": lo,
+                    "cnco": cnco,
+                    "channels": channels,
+                }
+
+            groups = _split_cr_target_groups(cr_targets, cr_channel_count)
+            f_cr_by_group = [
+                _mean_target_frequency(group, fallback=f_ge) for group in groups
+            ]
+            f_ef_for_mix = f_ef if f_ef >= min_frequency else f_ge
+            f_min = min(f_ge, f_ef_for_mix, *f_cr_by_group)
+            f_max = max(f_ge, f_ef_for_mix, *f_cr_by_group)
+            lo, cnco, _ = MixingUtil.calc_lo_cnco(
+                f=(f_min + f_max) / 2,
+                ssb=ssb,
+                cnco_center=cnco_center,
+            )
+            fnco_ge, _ = MixingUtil.calc_fnco(f=f_ge, ssb=ssb, lo=lo, cnco=cnco)
+            fnco_ef, _ = MixingUtil.calc_fnco(f=f_ef_for_mix, ssb=ssb, lo=lo, cnco=cnco)
+            channels = {
+                0: {"fnco": fnco_ge, "targets": [qubit.label]},
+                1: {"fnco": fnco_ef, "targets": [f"{qubit.label}-ef"]},
+            }
+            for offset, (group, f_cr) in enumerate(
+                zip(groups, f_cr_by_group, strict=True)
+            ):
+                channel_idx = offset + 2
+                fnco_cr, _ = MixingUtil.calc_fnco(f=f_cr, ssb=ssb, lo=lo, cnco=cnco)
+                target_labels = _target_labels(group)
+                if offset == 0:
+                    target_labels = [f"{qubit.label}-CR", *target_labels]
+                channels[channel_idx] = {
+                    "fnco": fnco_cr,
+                    "targets": target_labels,
+                }
+            return {
+                "lo": lo,
+                "cnco": cnco,
+                "channels": channels,
+            }
+
         f_crs = [target["frequency"] for target in cr_targets]
         if not f_crs:
             f_crs = [f_ge]
@@ -296,6 +360,7 @@ def create_control_configuration(
             get_spectator_qubits=get_spectator_qubits,
             excluded_targets=excluded_targets,
         )
+        cr_channel_count = n_channels - 1
         if not cr_targets:
             lo, cnco, _ = MixingUtil.calc_lo_cnco(
                 f=f_ge,
@@ -304,41 +369,44 @@ def create_control_configuration(
             )
             fnco_ge, _ = MixingUtil.calc_fnco(f=f_ge, ssb=ssb, lo=lo, cnco=cnco)
             fnco_cr, _ = MixingUtil.calc_fnco(f=f_ge, ssb=ssb, lo=lo, cnco=cnco)
+            channels = {0: {"fnco": fnco_ge, "targets": [qubit.label]}}
+            for offset in range(cr_channel_count):
+                channel_idx = offset + 1
+                channels[channel_idx] = {
+                    "fnco": fnco_cr,
+                    "targets": [f"{qubit.label}-CR"] if offset == 0 else [],
+                }
             return {
                 "lo": lo,
                 "cnco": cnco,
-                "channels": {
-                    0: {"fnco": fnco_ge, "targets": [qubit.label]},
-                    1: {"fnco": fnco_cr, "targets": [f"{qubit.label}-CR"]},
-                    2: {"fnco": fnco_cr, "targets": []},
-                },
+                "channels": channels,
             }
 
-        group1, group2 = _split_cr_target_group(cr_targets)
-        f_cr_1 = _mean_target_frequency(group1, fallback=f_ge)
-        f_cr_2 = _mean_target_frequency(group2, fallback=f_cr_1)
-        f_min = min(f_ge, f_cr_1, f_cr_2)
-        f_max = max(f_ge, f_cr_1, f_cr_2)
+        groups = _split_cr_target_groups(cr_targets, cr_channel_count)
+        f_cr_by_group = [
+            _mean_target_frequency(group, fallback=f_ge) for group in groups
+        ]
+        f_min = min(f_ge, *f_cr_by_group)
+        f_max = max(f_ge, *f_cr_by_group)
         lo, cnco, _ = MixingUtil.calc_lo_cnco(
             f=(f_min + f_max) / 2, ssb=ssb, cnco_center=cnco_center
         )
         fnco_ge, _ = MixingUtil.calc_fnco(f=f_ge, ssb=ssb, lo=lo, cnco=cnco)
-        fnco_cr_1, _ = MixingUtil.calc_fnco(f=f_cr_1, ssb=ssb, lo=lo, cnco=cnco)
-        fnco_cr_2, _ = MixingUtil.calc_fnco(f=f_cr_2, ssb=ssb, lo=lo, cnco=cnco)
+        channels = {0: {"fnco": fnco_ge, "targets": [qubit.label]}}
+        for offset, (group, f_cr) in enumerate(zip(groups, f_cr_by_group, strict=True)):
+            channel_idx = offset + 1
+            fnco_cr, _ = MixingUtil.calc_fnco(f=f_cr, ssb=ssb, lo=lo, cnco=cnco)
+            target_labels = _target_labels(group)
+            if offset == 0:
+                target_labels = [f"{qubit.label}-CR", *target_labels]
+            channels[channel_idx] = {
+                "fnco": fnco_cr,
+                "targets": target_labels,
+            }
         return {
             "lo": lo,
             "cnco": cnco,
-            "channels": {
-                0: {"fnco": fnco_ge, "targets": [qubit.label]},
-                1: {
-                    "fnco": fnco_cr_1,
-                    "targets": [f"{qubit.label}-CR", *_target_labels(group1)],
-                },
-                2: {
-                    "fnco": fnco_cr_2,
-                    "targets": _target_labels(group2),
-                },
-            },
+            "channels": channels,
         }
     raise ValueError("Invalid mode.")
 
@@ -352,6 +420,8 @@ def _resolve_control_layout(*, mode: ConfigurationMode, n_channels: int) -> str:
     if n_channels == 2:
         return "ge-ef" if mode == "ge-ef-cr" else "ge-cr"
     if n_channels == 3:
+        return mode
+    if n_channels > 3:
         return mode
     raise ValueError(f"Unsupported control channel count: {n_channels}.")
 
@@ -430,6 +500,53 @@ def _split_cr_target_group(
     if best_split is None:
         raise ValueError("No split found.")
     return best_split
+
+
+def _split_cr_target_groups(
+    group: list[CrTargetConfig],
+    n_groups: int,
+) -> list[list[CrTargetConfig]]:
+    """Split CR targets into contiguous frequency groups."""
+    if n_groups <= 0:
+        raise ValueError("CR target group count must be positive.")
+    if n_groups == 2 and len(group) <= 4:
+        group1, group2 = _split_cr_target_group(group)
+        return [group1, group2]
+
+    sorted_group = sorted(group, key=lambda x: x["frequency"])
+    if not sorted_group:
+        raise ValueError("No CR target found.")
+
+    active_group_count = min(n_groups, len(sorted_group))
+    if active_group_count == 1:
+        groups = [sorted_group]
+    elif active_group_count == len(sorted_group):
+        groups = [[target] for target in sorted_group]
+    else:
+        best_groups: list[list[CrTargetConfig]] | None = None
+        best_score: tuple[float, int] | None = None
+        for split_points in combinations(
+            range(1, len(sorted_group)),
+            active_group_count - 1,
+        ):
+            bounds = (0, *split_points, len(sorted_group))
+            candidate = [sorted_group[start:end] for start, end in pairwise(bounds)]
+            bandwidths = [
+                max(target["frequency"] for target in candidate_group)
+                - min(target["frequency"] for target in candidate_group)
+                for candidate_group in candidate
+            ]
+            sizes = [len(candidate_group) for candidate_group in candidate]
+            score = (max(bandwidths), max(sizes) - min(sizes))
+            if best_score is None or score < best_score:
+                best_score = score
+                best_groups = candidate
+        if best_groups is None:
+            raise ValueError("No split found.")
+        groups = best_groups
+
+    groups.extend([] for _ in range(n_groups - len(groups)))
+    return groups
 
 
 def _find_center_freq_for_cr(

@@ -481,6 +481,11 @@ _QUEL1SE_R8_PORTS_BY_AWG_OPTION: Final[dict[str, dict[int, int]]] = {
     "se8_mxfe1_awg2222": {6: 2, 7: 2, 8: 2, 9: 2},
     "se8_mxfe1_awg3113": {6: 3, 7: 1, 8: 1, 9: 3},
 }
+_S159A_ID: Final = "S159A"
+_S159A_PORTS_BY_NUMBER: Final[dict[int, int]] = {
+    2: 5,
+    4: 1,
+}
 
 
 def _resolve_quel1se_r8_awg_option(options: Sequence[str] | None = None) -> str:
@@ -495,11 +500,20 @@ def _resolve_quel1se_r8_awg_option(options: Sequence[str] | None = None) -> str:
 
 
 def _get_number_of_channels(
+    box_id: str,
     box_type: BoxType,
     port_number: int | tuple[int, int],
     options: Sequence[str] | None = None,
 ) -> int:
     """Return the number of channels for a box port with optional profile overrides."""
+    if (
+        box_id == _S159A_ID
+        and box_type == BoxType.QUEL1SE_A
+        and isinstance(port_number, int)
+    ):
+        override = _S159A_PORTS_BY_NUMBER.get(port_number)
+        if override is not None:
+            return override
     if box_type == BoxType.QUEL1SE_R8:
         awg_option = _resolve_quel1se_r8_awg_option(options)
         if isinstance(port_number, int):
@@ -552,7 +566,9 @@ def _initialize_ports(
             port_id = f"{box_id}.FOGI{index}"
         else:
             raise ValueError(f"Invalid port type: {port_type}")
-        n_channels = _get_number_of_channels(box_type, port_num, options=options)
+        n_channels = _get_number_of_channels(
+            box_id, box_type, port_num, options=options
+        )
         port: GenPort | CapPort | Port
         if port_type == PortType.NOT_AVAILABLE:
             continue
