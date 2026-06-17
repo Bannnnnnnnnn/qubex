@@ -245,10 +245,10 @@ def test_relinkup_keeps_explicit_noise_threshold(
     assert fake_box.reconnect_calls == [{"background_noise_threshold": 12345}]
 
 
-def test_relinkup_injects_s159a_five_channel_assign(
+def test_relinkup_injects_s159a_multi_channel_assign(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Given S159A, when relinkup runs, then MxFE0 is configured for one 5ch control lane."""
+    """Given S159A, when relinkup runs, then custom channel assignment is injected."""
     controller = _make_controller()
     fake_box = _FakeBox("quel1se-fujitsu11-a", {0: False})
     monkeypatch.setattr(
@@ -268,14 +268,14 @@ def test_relinkup_injects_s159a_five_channel_assign(
     assert relinkup_kwargs["param"]["ad9082"][0]["dac"]["channel_assign"] == {
         "dac0": [0],
         "dac1": [1],
-        "dac2": [7, 6, 4, 3, 2],
-        "dac3": [5],
+        "dac2": [4, 3],
+        "dac3": [7, 6, 5, 2],
     }
     assert relinkup_kwargs["param"]["ad9082"][1]["dac"]["channel_assign"] == {
         "dac0": [2],
         "dac1": [1],
-        "dac2": [5, 4, 0],
-        "dac3": [7, 6, 3],
+        "dac2": [5, 4],
+        "dac3": [7, 6, 3, 0],
     }
 
 

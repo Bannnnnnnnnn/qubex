@@ -483,8 +483,10 @@ _QUEL1SE_R8_PORTS_BY_AWG_OPTION: Final[dict[str, dict[int, int]]] = {
 }
 _S159A_ID: Final = "S159A"
 _S159A_PORTS_BY_NUMBER: Final[dict[int, int]] = {
-    2: 5,
-    4: 1,
+    2: 2,
+    4: 4,
+    9: 2,
+    11: 4,
 }
 
 

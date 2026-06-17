@@ -14,7 +14,7 @@ def _make_box(box_id: str) -> Box:
         type=BoxType.QUEL1SE_A,
         address="10.0.0.2",
         adapter="dummy",
-        port_numbers=[2, 4],
+        port_numbers=[2, 4, 9, 11],
     )
 
 
@@ -25,15 +25,19 @@ def _make_qubit(label: str, frequency: float) -> Qubit:
     return qubit
 
 
-def test_s159a_overrides_mxfe0_control_channel_counts() -> None:
-    """Given S159A, when ports are initialized, then port 2 has five channels."""
+def test_s159a_overrides_control_channel_counts() -> None:
+    """Given S159A, when ports are initialized, then requested control counts are used."""
     s159a = _make_box("S159A")
     other = _make_box("S160A")
 
-    assert s159a.get_port(2).n_channels == 5
-    assert s159a.get_port(4).n_channels == 1
+    assert s159a.get_port(2).n_channels == 2
+    assert s159a.get_port(4).n_channels == 4
+    assert s159a.get_port(9).n_channels == 2
+    assert s159a.get_port(11).n_channels == 4
     assert other.get_port(2).n_channels == 3
     assert other.get_port(4).n_channels == 3
+    assert other.get_port(9).n_channels == 3
+    assert other.get_port(11).n_channels == 3
 
 
 def test_five_channel_ge_cr_cr_assigns_extra_cr_channels() -> None:
