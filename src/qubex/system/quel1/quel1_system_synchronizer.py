@@ -145,12 +145,14 @@ class Quel1SystemSynchronizer:
         if not parallel:
             for box in boxes:
                 self.sync_box_to_hardware(box)
+            self._update_backend_cache_from_model(boxes)
             return
         run_parallel(
             boxes,
             self.sync_box_to_hardware,
             on_error=self._log_box_sync_error,
         )
+        self._update_backend_cache_from_model(boxes)
 
     def get_box_config_cache_snapshot(self) -> dict[str, dict]:
         """Return a snapshot of backend box-config cache when supported."""
@@ -220,6 +222,7 @@ class Quel1SystemSynchronizer:
                 Literal["U", "L"] | None,
                 int | None,
                 int,
+                list[int | None],
                 list[int],
                 int | None,
             ]
@@ -255,16 +258,26 @@ class Quel1SystemSynchronizer:
                         if fullscale_current is not None
                         else None
                     )
+                    channel_configs = port_config.get("channels", {})
+                    cnco_freqs_hz = [
+                        self._coerce_channel_cnco(channel, cnco_freq_hz)
+                        for channel in channel_configs.values()
+                    ]
                     fnco_freqs_hz = [
                         int(channel["fnco_freq"])
-                        for channel in port_config.get("channels", {}).values()
+                        for channel in channel_configs.values()
                     ]
                 elif direction == "in":
                     sideband = None
                     fullscale_current = None
+                    channel_configs = port_config.get("runits", {})
+                    cnco_freqs_hz = [
+                        self._coerce_channel_cnco(channel, cnco_freq_hz)
+                        for channel in channel_configs.values()
+                    ]
                     fnco_freqs_hz = [
                         int(channel["fnco_freq"])
-                        for channel in port_config.get("runits", {}).values()
+                        for channel in channel_configs.values()
                     ]
                 else:
                     continue
@@ -290,6 +303,7 @@ class Quel1SystemSynchronizer:
                         sideband,
                         lo_freq_hz,
                         cnco_freq_hz,
+                        cnco_freqs_hz,
                         fnco_freqs_hz,
                         fullscale_current,
                     )
@@ -300,6 +314,7 @@ class Quel1SystemSynchronizer:
             sideband,
             lo_freq_hz,
             cnco_freq_hz,
+            cnco_freqs_hz,
             fnco_freqs_hz,
             fullscale_current,
         ) in updates:
@@ -309,6 +324,7 @@ class Quel1SystemSynchronizer:
                 sideband=sideband,
                 lo_freq=lo_freq_hz,
                 cnco_freq=cnco_freq_hz,
+                cnco_freqs=cnco_freqs_hz,
                 fnco_freqs=fnco_freqs_hz,
                 fullscale_current=fullscale_current,
             )
@@ -358,6 +374,97 @@ class Quel1SystemSynchronizer:
                 )
         except Exception:
             logger.exception("Failed to configure %s", port.id)
+
+    def _update_backend_cache_from_model(self, boxes: Sequence[Box]) -> None:
+        """Best-effort update of backend dump cache from the in-memory model."""
+        update_cache = getattr(self._backend_controller, "update_box_config_cache", None)
+        if not callable(update_cache):
+            return
+        box_configs = self._build_box_config_cache_from_model(boxes)
+        if not box_configs:
+            return
+        try:
+            update_cache(box_configs)
+        except Exception:
+            logger.debug("Failed to update backend box-config cache from model.", exc_info=True)
+
+    def _build_box_config_cache_from_model(self, boxes: Sequence[Box]) -> dict[str, dict]:
+        """Build a dump-box-like cache snapshot from configured model state."""
+        box_configs: dict[str, dict] = {}
+        for box in boxes:
+            ports: dict[int, dict[str, Any]] = {}
+            for port in box.ports:
+                if not isinstance(port.number, int):
+                    continue
+                if self._is_generator_port(port):
+                    ports[port.number] = self._build_generator_port_cache(port)
+                elif self._is_capture_port(port):
+                    ports[port.number] = self._build_capture_port_cache(port)
+            if ports:
+                box_configs[box.id] = {"ports": ports}
+        return box_configs
+
+    @staticmethod
+    def _build_generator_port_cache(port: GenPort) -> dict[str, Any]:
+        """Build one generator-port cache payload."""
+        port_cache: dict[str, Any] = {
+            "direction": "out",
+            "channels": {
+                channel.number: {
+                    "cnco_freq": Quel1SystemSynchronizer._optional_channel_cnco(channel),
+                    "fnco_freq": channel.fnco_freq,
+                }
+                for channel in port.channels
+            },
+            "cnco_freq": port.cnco_freq,
+        }
+        if port.lo_freq is not None:
+            port_cache["lo_freq"] = port.lo_freq
+        if port.sideband is not None:
+            port_cache["sideband"] = port.sideband
+        if port.fullscale_current is not None:
+            port_cache["fullscale_current"] = port.fullscale_current
+        if port.rfswitch is not None:
+            port_cache["rfswitch"] = port.rfswitch
+        if port.vatt is not None:
+            port_cache["vatt"] = port.vatt
+        return port_cache
+
+    @staticmethod
+    def _build_capture_port_cache(port: CapPort) -> dict[str, Any]:
+        """Build one capture-port cache payload."""
+        port_cache: dict[str, Any] = {
+            "direction": "in",
+            "runits": {
+                channel.number: {
+                    "cnco_freq": Quel1SystemSynchronizer._optional_channel_cnco(channel),
+                    "fnco_freq": channel.fnco_freq,
+                }
+                for channel in port.channels
+            },
+            "cnco_freq": port.cnco_freq,
+        }
+        if port.lo_freq is not None:
+            port_cache["lo_freq"] = port.lo_freq
+        if port.rfswitch is not None:
+            port_cache["rfswitch"] = port.rfswitch
+        return port_cache
+
+    @staticmethod
+    def _optional_channel_cnco(channel: Any) -> int | None:
+        """Return channel CNCO if configured."""
+        try:
+            return channel.cnco_freq
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _coerce_channel_cnco(channel_config: Any, fallback: int) -> int | None:
+        """Return channel CNCO from backend settings, falling back to port CNCO."""
+        if not isinstance(channel_config, Mapping):
+            return fallback
+        cnco = channel_config.get("cnco_freq", fallback)
+        return int(cnco) if cnco is not None else None
 
     @staticmethod
     def _log_box_sync_error(box: Box, exc: BaseException) -> None:

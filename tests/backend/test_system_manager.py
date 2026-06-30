@@ -99,6 +99,7 @@ class FakeControlSystem:
                 call["sideband"],
                 call["lo_freq"],
                 call["cnco_freq"],
+                tuple(call["cnco_freqs"]),
                 tuple(call["fnco_freqs"]),
                 call["fullscale_current"],
             )
@@ -249,7 +250,7 @@ def test_sync_backend_settings_to_experiment_system_updates_in_place(
                     "fullscale_current": 40_527,
                     "channels": {
                         0: {"fnco_freq": 100},
-                        1: {"fnco_freq": 200},
+                        1: {"cnco_freq": 1_750, "fnco_freq": 200},
                     },
                 },
                 2: {
@@ -257,7 +258,7 @@ def test_sync_backend_settings_to_experiment_system_updates_in_place(
                     "lo_freq": 8_000_000_000,
                     "cnco_freq": 2_500,
                     "runits": {
-                        0: {"fnco_freq": 300},
+                        0: {"cnco_freq": 2_750, "fnco_freq": 300},
                     },
                 },
             }
@@ -276,6 +277,7 @@ def test_sync_backend_settings_to_experiment_system_updates_in_place(
         "sideband": "L",
         "lo_freq": 10_000_000_000,
         "cnco_freq": 1_500,
+        "cnco_freqs": [1_500, 1_750],
         "fnco_freqs": [100, 200],
         "fullscale_current": 40_527,
     }
@@ -285,6 +287,7 @@ def test_sync_backend_settings_to_experiment_system_updates_in_place(
         "sideband": None,
         "lo_freq": 8_000_000_000,
         "cnco_freq": 2_500,
+        "cnco_freqs": [2_750],
         "fnco_freqs": [300],
         "fullscale_current": None,
     }

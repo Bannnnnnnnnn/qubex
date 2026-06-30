@@ -12,6 +12,8 @@ from qubex.backend.quel1.quel1_backend_constants import (
 )
 from qubex.backend.quel1.quel1_runtime_context import Quel1RuntimeContext
 
+from .option_resolver import resolve_config_options
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -152,11 +154,20 @@ class Quel1ConfigurationManager:
         boxtype: str,
     ) -> None:
         """Define one box in qubecalib."""
-        self._runtime_context.qubecalib.define_box(
+        option_map = self._runtime_context.driver.Quel1ConfigOption._value2member_map_
+        config_options = resolve_config_options(
+            option_map=option_map,
             box_name=box_name,
-            ipaddr_wss=ipaddr_wss,
-            boxtype=boxtype,
+            option_labels=self._runtime_context.box_options.get(box_name, ()),
         )
+        define_box_kwargs: dict[str, object] = {
+            "box_name": box_name,
+            "ipaddr_wss": ipaddr_wss,
+            "boxtype": boxtype,
+        }
+        if config_options is not None:
+            define_box_kwargs["config_options"] = config_options
+        self._runtime_context.qubecalib.define_box(**define_box_kwargs)
 
     def define_port(
         self,

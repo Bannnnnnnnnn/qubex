@@ -16,7 +16,13 @@ from qubex.backend.quel1.quel1_backend_constants import (
 )
 from qubex.experiment import experiment_tool
 from qubex.experiment.models.result import Result
-from qubex.system.control_system import PortType
+from qubex.system.control_system import (
+    CapChannel,
+    CapPort,
+    GenChannel,
+    GenPort,
+    PortType,
+)
 from qubex.visualization.style import FONT_FAMILY
 
 
@@ -189,6 +195,82 @@ def test_print_box_info_fetch_uses_dump_box(monkeypatch) -> None:
     experiment_tool.print_box_info("A", fetch=True)
 
     assert fake_manager.backend_controller.dumped_box_ids == ["A"]
+
+
+def test_print_box_info_model_mode_shows_channel_nco(monkeypatch) -> None:
+    """Given model mode, when printing box info, then channel CNCO/FNCO/NCO are rendered."""
+    read_out_port = GenPort(
+        id="A.READ.OUT",
+        box_id="A",
+        number=8,
+        type=PortType.READ_OUT,
+        channels=(),
+        sideband="U",
+        lo_freq=9_000_000_000,
+        cnco_freq=1_382_812_500,
+    )
+    read_out_port.channels = (
+        GenChannel(
+            id="A.READ.OUT.CH0",
+            number=0,
+            _port=read_out_port,
+            cnco_freq_override=1_382_812_500,
+            fnco_freq=0,
+        ),
+        GenChannel(
+            id="A.READ.OUT.CH1",
+            number=1,
+            _port=read_out_port,
+            cnco_freq_override=1_078_125_000,
+            fnco_freq=0,
+        ),
+    )
+    read_in_port = CapPort(
+        id="A.READ.IN",
+        box_id="A",
+        number=7,
+        type=PortType.READ_IN,
+        channels=(),
+        lo_freq=9_000_000_000,
+        cnco_freq=1_382_812_500,
+    )
+    read_in_port.channels = (
+        CapChannel(
+            id="A.READ.IN.RUN0",
+            number=0,
+            _port=read_in_port,
+            cnco_freq_override=1_382_812_500,
+            fnco_freq=0,
+        ),
+        CapChannel(
+            id="A.READ.IN.RUN4",
+            number=4,
+            _port=read_in_port,
+            cnco_freq_override=1_078_125_000,
+            fnco_freq=0,
+        ),
+    )
+    fake_manager = FakeSystemManager(
+        experiment_system=FakeExperimentSystem(
+            [
+                FakeBox(
+                    id="A",
+                    ports=(read_out_port, read_in_port),
+                )
+            ]
+        ),
+        backend_controller=FakeBackendController(),
+    )
+    console = experiment_tool.Console(record=True, width=200)
+    monkeypatch.setattr(experiment_tool, "system_manager", fake_manager)
+    monkeypatch.setattr(experiment_tool, "console", console)
+
+    experiment_tool.print_box_info("A", fetch=False)
+
+    text = console.export_text()
+    assert "CHANNEL NCO" in text
+    assert "1_382_812_500" in text
+    assert "1_078_125_000" in text
 
 
 def test_get_quel1_box_reconnects_box_with_default_threshold(monkeypatch) -> None:

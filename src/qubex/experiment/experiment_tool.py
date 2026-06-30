@@ -816,6 +816,7 @@ def print_box_info(box_id: str, fetch: bool | None = None) -> None:
     table2 = Table(
         show_header=True,
         header_style="bold",
+        title="CHANNEL NCO",
     )
     table1.add_column("PORT", justify="center")
     table1.add_column("TYPE", justify="center")
@@ -826,10 +827,32 @@ def print_box_info(box_id: str, fetch: bool | None = None) -> None:
     table1.add_column("FSC", justify="right")
     table2.add_column("PORT", justify="center")
     table2.add_column("TYPE", justify="center")
-    table2.add_column("SSB", justify="center")
-    table2.add_column("FNCO-0", justify="right")
-    table2.add_column("FNCO-1", justify="right")
-    table2.add_column("FNCO-2", justify="right")
+    table2.add_column("CH", justify="right")
+    table2.add_column("CNCO", justify="right")
+    table2.add_column("FNCO", justify="right")
+    table2.add_column("NCO", justify="right")
+
+    def _fmt_freq_hz(value: object) -> str:
+        if value is None:
+            return ""
+        try:
+            return f"{int(value):_}"
+        except (TypeError, ValueError):
+            return ""
+
+    def _fmt_nco_hz(cnco: object, fnco: object) -> str:
+        if cnco is None or fnco is None:
+            return ""
+        try:
+            return f"{int(cnco) + int(fnco):_}"
+        except (TypeError, ValueError):
+            return ""
+
+    def _safe_channel_cnco(channel: Any) -> int | None:
+        try:
+            return channel.cnco_freq
+        except ValueError:
+            return None
 
     if fetch:
         dump_box_impl = _require_backend_callable("dump_box")
@@ -872,11 +895,36 @@ def print_box_info(box_id: str, fetch: bool | None = None) -> None:
 
             if direction != "in":
                 channels = config.get("channels", {})
-                fnco_values = [
-                    f"{int(ch['fnco_freq']):_}"
-                    for _, ch in sorted(channels.items(), key=lambda item: int(item[0]))
-                ]
-                table2.add_row(number, type, ssb, *fnco_values)
+                for channel_number, ch in sorted(
+                    channels.items(),
+                    key=lambda item: int(item[0]),
+                ):
+                    channel_cnco = ch.get("cnco_freq")
+                    channel_fnco = ch.get("fnco_freq")
+                    table2.add_row(
+                        number,
+                        type,
+                        str(channel_number),
+                        _fmt_freq_hz(channel_cnco),
+                        _fmt_freq_hz(channel_fnco),
+                        _fmt_nco_hz(channel_cnco, channel_fnco),
+                    )
+            else:
+                runits = config.get("runits", {})
+                for runit_number, runit in sorted(
+                    runits.items(),
+                    key=lambda item: int(item[0]),
+                ):
+                    runit_cnco = runit.get("cnco_freq")
+                    runit_fnco = runit.get("fnco_freq")
+                    table2.add_row(
+                        number,
+                        type,
+                        str(runit_number),
+                        _fmt_freq_hz(runit_cnco),
+                        _fmt_freq_hz(runit_fnco),
+                        _fmt_nco_hz(runit_cnco, runit_fnco),
+                    )
     else:
         for port in box.ports:
             number = str(port.number)
@@ -901,16 +949,18 @@ def print_box_info(box_id: str, fetch: bool | None = None) -> None:
                 )
 
             table1.add_row(number, type, ssb, lo, cnco, vatt, fsc)
-            if isinstance(port, GenPort):
-                table2.add_row(
-                    number,
-                    type,
-                    ssb,
-                    *[
-                        f"{ch.fnco_freq:_}" if ch.fnco_freq is not None else ""
-                        for ch in port.channels
-                    ],
-                )
+            if isinstance(port, GenPort | CapPort):
+                for channel in port.channels:
+                    channel_cnco = _safe_channel_cnco(channel)
+                    channel_fnco = channel.fnco_freq
+                    table2.add_row(
+                        number,
+                        type,
+                        str(channel.number),
+                        _fmt_freq_hz(channel_cnco),
+                        _fmt_freq_hz(channel_fnco),
+                        _fmt_nco_hz(channel_cnco, channel_fnco),
+                    )
 
     console.print(table1)
     console.print(table2)

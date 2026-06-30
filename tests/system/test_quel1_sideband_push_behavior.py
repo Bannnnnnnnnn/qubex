@@ -128,6 +128,68 @@ def test_sync_read_out_port_passes_sideband_to_backend() -> None:
     assert read_out_call["sideband"] == "U"
 
 
+def test_sync_experiment_system_cache_preserves_channel_cnco() -> None:
+    """Given channel-level CNCO, when syncing, then backend cache includes it."""
+
+    class _BackendController:
+        def __init__(self) -> None:
+            self.box_config_cache: dict[str, dict[str, Any]] = {}
+
+        def config_port(self, **_: Any) -> None:
+            return None
+
+        def config_channel(self, **_: Any) -> None:
+            return None
+
+        def config_runit(self, **_: Any) -> None:
+            return None
+
+        def update_box_config_cache(self, box_configs: dict[str, dict[str, Any]]) -> None:
+            self.box_config_cache.update(box_configs)
+
+    backend_controller = _BackendController()
+    synchronizer = Quel1SystemSynchronizer(
+        backend_controller=cast(Any, backend_controller)
+    )
+    box = Box.new(
+        id="B0",
+        name="BOX0",
+        type="quel1-a",
+        address="127.0.0.1",
+        adapter="A0",
+        port_numbers=[0, 1],
+        options=["dual_readout_group0"],
+    )
+    read_out_port = box.get_port(1)
+    read_in_port = box.get_port(0)
+    assert isinstance(read_out_port, GenPort)
+    assert isinstance(read_in_port, CapPort)
+
+    read_out_port.lo_freq = 8_000_000_000
+    read_out_port.cnco_freq = 1_000_000_000
+    read_out_port.sideband = "U"
+    read_out_port.channels[0].cnco_freq_override = 1_000_000_000
+    read_out_port.channels[1].cnco_freq_override = 2_000_000_000
+    for channel in read_out_port.channels:
+        channel.fnco_freq = 0
+    read_in_port.lo_freq = 8_000_000_000
+    read_in_port.cnco_freq = 1_000_000_000
+    read_in_port.channels[0].cnco_freq_override = 1_000_000_000
+    read_in_port.channels[4].cnco_freq_override = 2_000_000_000
+    for channel in read_in_port.channels:
+        channel.fnco_freq = 0
+
+    synchronizer.sync_experiment_system_to_hardware(
+        experiment_system=cast(Any, SimpleNamespace()),
+        boxes=[box],
+        parallel=False,
+    )
+
+    ports_cache = backend_controller.box_config_cache["B0"]["ports"]
+    assert ports_cache[1]["channels"][1]["cnco_freq"] == 2_000_000_000
+    assert ports_cache[0]["runits"][4]["cnco_freq"] == 2_000_000_000
+
+
 def test_sync_capture_port_passes_sideband_none_to_backend() -> None:
     """Given QuEL-1 capture push, when syncing one port, then sideband=None is forwarded."""
 

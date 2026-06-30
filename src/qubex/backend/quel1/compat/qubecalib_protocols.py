@@ -113,6 +113,7 @@ class BoxPoolProtocol(Protocol):
         ipaddr_sss: str,
         ipaddr_css: str,
         boxtype: str,
+        config_options: Sequence[object] | None = None,
     ) -> Quel1BoxCommonProtocol:
         """Create and register one box instance."""
         ...
@@ -457,7 +458,7 @@ class QubeCalibProtocol(Protocol):
         ipaddr_sss: str | None = None,
         ipaddr_css: str | None = None,
         config_root: str | None = None,
-        config_options: Sequence[Quel1ConfigOptionProtocol] | None = None,
+        config_options: Sequence[object] | None = None,
     ) -> Any:
         """Define one box entry."""
         ...

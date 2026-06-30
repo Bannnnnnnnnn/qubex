@@ -23,6 +23,8 @@ from qubex.backend.quel1.quel1_runtime_context import (
 )
 from qubex.core.parallel_executor import run_parallel, run_parallel_map
 
+from .option_resolver import resolve_config_options
+
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
@@ -30,7 +32,6 @@ if TYPE_CHECKING:
         BoxPoolProtocol as BoxPool,
         BoxSettingProtocol as BoxSetting,
         Quel1BoxCommonProtocol as Quel1Box,
-        Quel1ConfigOptionProtocol as Quel1ConfigOption,
         Quel1SystemProtocol as Quel1System,
     )
 
@@ -546,13 +547,16 @@ class Quel1ConnectionManager:
         else:
             for box_name in box_names:
                 setting = settings_by_name[box_name]
-                box = boxpool.create(
-                    box_name,
-                    ipaddr_wss=str(setting.ipaddr_wss),
-                    ipaddr_sss=str(setting.ipaddr_sss),
-                    ipaddr_css=str(setting.ipaddr_css),
-                    boxtype=setting.boxtype,
-                )
+                create_kwargs: dict[str, Any] = {
+                    "ipaddr_wss": str(setting.ipaddr_wss),
+                    "ipaddr_sss": str(setting.ipaddr_sss),
+                    "ipaddr_css": str(setting.ipaddr_css),
+                    "boxtype": setting.boxtype,
+                }
+                config_options = getattr(setting, "config_options", None)
+                if config_options:
+                    create_kwargs["config_options"] = config_options
+                box = boxpool.create(box_name, **create_kwargs)
                 boxes_to_reconnect.append(box)
 
         if parallel and boxes_to_reconnect:
@@ -659,7 +663,7 @@ class Quel1ConnectionManager:
         *,
         box_name: str,
         boxtype: str,
-    ) -> list[Quel1ConfigOption] | None:
+    ) -> list[object] | None:
         """Resolve config options for relinkup from optional per-box labels."""
         option_labels = list(self._runtime_context.box_options.get(box_name, ()))
         if boxtype == "quel1se-riken8":
@@ -669,16 +673,12 @@ class Quel1ConnectionManager:
         if not option_labels:
             return None
 
-        config_options: list[Quel1ConfigOption] = []
         option_map = self._runtime_context.driver.Quel1ConfigOption._value2member_map_
-        for option_label in option_labels:
-            option = option_map.get(option_label)
-            if option is None:
-                raise ValueError(
-                    f"Unknown Quel1 config option `{option_label}` for box `{box_name}`."
-                )
-            config_options.append(option)
-        return config_options
+        return resolve_config_options(
+            option_map=option_map,
+            box_name=box_name,
+            option_labels=option_labels,
+        )
 
     def _collect_held_resources(self) -> list[_DisconnectResource]:
         """Collect clockmaster and box objects currently held by runtime state."""

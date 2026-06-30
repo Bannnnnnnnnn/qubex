@@ -10,6 +10,11 @@ from typing import Any, cast
 
 import pytest
 
+from qubex.backend.quel1.managers.option_resolver import (
+    expand_config_option_labels,
+    resolve_config_options,
+    resolve_dual_readout_groups_from_labels,
+)
 from qubex.backend.quel1.quel1_backend_constants import (
     DEFAULT_BACKGROUND_NOISE_THRESHOLD_AT_RECONNECT,
     DEFAULT_BACKGROUND_NOISE_THRESHOLD_RELINKUP,
@@ -21,6 +26,7 @@ class _FakeQuel1ConfigOption(str, Enum):
     SE8_MXFE1_AWG1331 = "se8_mxfe1_awg1331"
     SE8_MXFE1_AWG2222 = "se8_mxfe1_awg2222"
     REFCLK_CORRECTED_MXFE1 = "refclk_corrected_mxfe1"
+    DUAL_READOUT_OUTPUT_MXFE0 = "dual_readout_output_mxfe0"
 
 
 class _FakeBox:
@@ -165,6 +171,53 @@ def test_relinkup_maps_explicit_options(monkeypatch: pytest.MonkeyPatch) -> None
     assert relinkup_kwargs["config_options"] == [
         _FakeQuel1ConfigOption.SE8_MXFE1_AWG1331,
         _FakeQuel1ConfigOption.REFCLK_CORRECTED_MXFE1,
+    ]
+
+
+def test_dual_readout_group_option_expands_to_quelware_option() -> None:
+    """Given qubex dual-readout options, when resolving, then quelware option names and groups are produced."""
+    assert expand_config_option_labels(
+        ["dual_readout_group0", "dual_readout_output_mxfe1"]
+    ) == [
+        "dual_readout_output_mxfe0",
+        "dual_readout_output_mxfe1",
+    ]
+    assert resolve_dual_readout_groups_from_labels(
+        ["dual_readout_group0", "dual_readout_output_mxfe1"]
+    ) == frozenset({0, 1})
+
+
+def test_dual_readout_group_option_can_fall_back_to_string() -> None:
+    """Given an older driver enum, when resolving dual-readout, then the label is still preserved."""
+    assert resolve_config_options(
+        option_map={},
+        box_name="B0",
+        option_labels=["dual_readout_group0"],
+    ) == ["dual_readout_output_mxfe0"]
+
+
+def test_relinkup_maps_dual_readout_group_option(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given dual_readout_group0, when relinkup runs, then the quelware config option is passed."""
+    controller = _make_controller()
+    fake_box = _FakeBox("quel1-a", {0: False})
+    _override_driver_classes(controller, Quel1ConfigOption=_FakeQuel1ConfigOption)
+    monkeypatch.setattr(
+        controller._runtime_context, "validate_box_availability", lambda _: None
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_get_existing_or_create_box",
+        lambda **kwargs: fake_box,
+    )
+    controller.set_box_options({"B0": ("dual_readout_group0",)})
+
+    controller.relinkup("B0")
+
+    relinkup_kwargs = fake_box.relinkup_calls[0]
+    assert relinkup_kwargs["config_options"] == [
+        _FakeQuel1ConfigOption.DUAL_READOUT_OUTPUT_MXFE0,
     ]
 
 

@@ -1827,6 +1827,110 @@ def test_configure_updates_port_state_before_target_registry_rebuild(
     assert all(channel.fnco_freq is not None for channel in read_in_port.channels)
 
 
+def test_dual_readout_group0_splits_edge_resonator_to_second_adc(
+    tmp_path: Path,
+) -> None:
+    """Given dual_readout_group0, when loading, then the edge resonator uses the added readout lane."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    _write_yaml(
+        config_dir / "box.yaml",
+        {
+            "BOX1": {
+                "name": "Box One",
+                "type": "quel1-a",
+                "address": "10.0.0.2",
+                "adapter": "dummy",
+                "options": ["dual_readout_group0"],
+            }
+        },
+    )
+    _write_yaml(
+        params_dir / "resonator_frequency.yaml",
+        {
+            "meta": {"unit": "MHz"},
+            "data": {"Q0": 8000, "Q1": 8100, "Q2": 8200, "Q3": 8900},
+        },
+    )
+
+    loader = ConfigLoader(
+        system_id=chip_id,
+        config_dir=config_dir,
+        params_dir=params_dir,
+    )
+    experiment_system = loader.get_experiment_system()
+    control_system = experiment_system.control_system
+    box = control_system.get_box("BOX1")
+    read_out_port = control_system.get_gen_port("BOX1", 1)
+    read_in_port = control_system.get_cap_port("BOX1", 0)
+    donor_ctrl_port = control_system.get_gen_port("BOX1", 2)
+
+    assert box.options == ("dual_readout_group0",)
+    assert read_out_port.n_channels == 2
+    assert read_in_port.n_channels == 5
+    assert donor_ctrl_port.n_channels == 2
+    assert read_out_port.channels[0].cnco_freq != read_out_port.channels[1].cnco_freq
+    assert read_out_port.channels[0].fnco_freq == 0
+    assert read_out_port.channels[1].fnco_freq == 0
+    assert read_in_port.channels[0].cnco_freq == read_out_port.channels[0].cnco_freq
+    assert read_in_port.channels[4].cnco_freq == read_out_port.channels[1].cnco_freq
+    assert read_in_port.channels[0].fnco_freq == 0
+    assert read_in_port.channels[4].fnco_freq == 0
+
+    for label, capture_channel_number in {"Q0": 0, "Q1": 1, "Q2": 2}.items():
+        read_out_target = experiment_system.get_read_out_target(label)
+        read_in_target = experiment_system.get_read_in_target(label)
+        assert read_out_target.channel.port.number == 1
+        assert read_out_target.channel.number == 0
+        assert read_in_target.channel.port.number == 0
+        assert read_in_target.channel.number == capture_channel_number
+
+    read_out_target = experiment_system.get_read_out_target("Q3")
+    read_in_target = experiment_system.get_read_in_target("Q3")
+    assert read_out_target.channel.port.number == 1
+    assert read_out_target.channel.number == 1
+    assert read_in_target.channel.port.number == 0
+    assert read_in_target.channel.number == 4
+
+
+def test_dual_readout_group0_with_one_resonator_initializes_added_lane(
+    tmp_path: Path,
+) -> None:
+    """Given dual_readout_group0 with one valid resonator, when loading, then the added lane still has a CNCO."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    _write_yaml(
+        config_dir / "box.yaml",
+        {
+            "BOX1": {
+                "name": "Box One",
+                "type": "quel1-a",
+                "address": "10.0.0.2",
+                "adapter": "dummy",
+                "options": ["dual_readout_group0"],
+            }
+        },
+    )
+
+    loader = ConfigLoader(
+        system_id=chip_id,
+        config_dir=config_dir,
+        params_dir=params_dir,
+    )
+    experiment_system = loader.get_experiment_system()
+    read_out_port = experiment_system.control_system.get_gen_port("BOX1", 1)
+    read_in_port = experiment_system.control_system.get_cap_port("BOX1", 0)
+
+    assert read_out_port.n_channels == 2
+    assert read_in_port.n_channels == 5
+    assert read_out_port.channels[0].cnco_freq is not None
+    assert read_out_port.channels[1].cnco_freq == read_out_port.channels[0].cnco_freq
+    assert read_out_port.channels[0].fnco_freq == 0
+    assert read_out_port.channels[1].fnco_freq == 0
+    assert read_in_port.channels[4].cnco_freq == read_out_port.channels[0].cnco_freq
+    assert read_in_port.channels[4].fnco_freq == 0
+    assert experiment_system.get_read_out_target("Q0").channel.number == 0
+    assert experiment_system.get_read_in_target("Q0").channel.number == 0
+
+
 def test_configure_initializes_monitor_ports_for_quel1(tmp_path: Path) -> None:
     """Given QuEL-1 system init, when building ports, then monitor input has initial frequencies."""
     config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)

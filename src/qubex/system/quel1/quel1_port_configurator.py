@@ -10,7 +10,7 @@ import numpy as np
 from typing_extensions import TypedDict
 
 from qubex.system.control_system import Box, BoxType
-from qubex.system.quantum_system import Mux, Qubit
+from qubex.system.quantum_system import Mux, Qubit, Resonator
 from qubex.system.quel1.quel1_system_constants import (
     AWG_MAX_HZ,
     CNCO_CENTER_CTRL_HZ,
@@ -30,6 +30,22 @@ class ReadoutMixingConfig(TypedDict):
     lo: int | None
     cnco: int
     fnco: int
+
+
+class ReadoutChannelConfig(TypedDict):
+    """Per-lane readout mixing configuration."""
+
+    cnco: int
+    fnco: int
+    resonators: list[str]
+
+
+class ReadoutPortMixingConfig(TypedDict):
+    """Readout mixing configuration for one physical port."""
+
+    lo: int | None
+    cnco: int
+    channels: dict[int, ReadoutChannelConfig]
 
 
 class ControlChannelConfig(TypedDict):
@@ -110,6 +126,31 @@ class MixingUtil:
             f_mix = lo + cnco + fnco if ssb == "U" else lo - cnco - fnco
         return fnco, f_mix
 
+    @staticmethod
+    def calc_cnco_for_lo(
+        f: float,
+        ssb: Literal["U", "L"] | None,
+        lo: int | None,
+        nco_step: int = NCO_STEP_HZ,
+    ) -> tuple[int, int]:
+        """Calculate CNCO settings for a target frequency with a fixed LO."""
+        if ssb is None and lo is None:
+            cnco = round(f / nco_step) * nco_step
+            f_mix = cnco
+        elif lo is None:
+            raise ValueError("LO frequency is required when SSB is not None.")
+        elif ssb is None:
+            raise ValueError("SSB is required when LO frequency is not None.")
+        elif ssb == "U":
+            cnco = round((f - lo) / nco_step) * nco_step
+            f_mix = lo + cnco
+        elif ssb == "L":
+            cnco = round((lo - f) / nco_step) * nco_step
+            f_mix = lo - cnco
+        else:
+            raise ValueError("Invalid SSB")
+        return cnco, f_mix
+
 
 QUEL1_BOX_TYPES: Final[frozenset[BoxType]] = frozenset(
     {
@@ -158,6 +199,80 @@ def create_readout_configuration(
         cnco=cnco,
     )
     return {"lo": lo, "cnco": cnco, "fnco": fnco}
+
+
+def create_readout_port_configuration(
+    mux: Mux,
+    *,
+    excluded_targets: Sequence[str],
+    n_lanes: int = 1,
+    ssb: Literal["U", "L"] | None = "U",
+    cnco_center: int | None = CNCO_CENTER_READ_HZ,
+) -> ReadoutPortMixingConfig:
+    """Build readout mixing settings for one mux with optional dual-readout lanes."""
+    resonators = _valid_readout_resonators(
+        mux=mux,
+        excluded_targets=excluded_targets,
+    )
+    freqs = [resonator.frequency * 1e9 for resonator in resonators]
+    f_target = (max(freqs) + min(freqs)) / 2
+    lo, _, _ = MixingUtil.calc_lo_cnco(
+        f=f_target,
+        ssb=ssb,
+        cnco_center=cnco_center,
+    )
+
+    lanes = split_readout_resonators(resonators, n_lanes=n_lanes)
+    channels: dict[int, ReadoutChannelConfig] = {}
+    for lane_index, lane_resonators in enumerate(lanes):
+        lane_freqs = [resonator.frequency * 1e9 for resonator in lane_resonators]
+        lane_target = (max(lane_freqs) + min(lane_freqs)) / 2
+        lane_cnco, _ = MixingUtil.calc_cnco_for_lo(
+            f=lane_target,
+            ssb=ssb,
+            lo=lo,
+        )
+        channels[lane_index] = {
+            "cnco": lane_cnco,
+            "fnco": 0,
+            "resonators": [resonator.label for resonator in lane_resonators],
+        }
+    return {"lo": lo, "cnco": channels[0]["cnco"], "channels": channels}
+
+
+def split_readout_resonators(
+    resonators: Sequence[Resonator],
+    *,
+    n_lanes: int,
+) -> tuple[tuple[Resonator, ...], ...]:
+    """Split readout resonators into primary and optional edge lanes."""
+    valid_resonators = tuple(resonators)
+    if n_lanes < 2 or len(valid_resonators) < 4:
+        return (valid_resonators,)
+
+    ordered = tuple(sorted(valid_resonators, key=lambda resonator: resonator.frequency))
+    span_without_low = ordered[-1].frequency - ordered[1].frequency
+    span_without_high = ordered[-2].frequency - ordered[0].frequency
+    if span_without_high <= span_without_low:
+        primary = ordered[:-1]
+        secondary = (ordered[-1],)
+    else:
+        primary = ordered[1:]
+        secondary = (ordered[0],)
+    return (primary, secondary)
+
+
+def _valid_readout_resonators(
+    *,
+    mux: Mux,
+    excluded_targets: Sequence[str],
+) -> list[Resonator]:
+    """Return resonators used to calculate readout mixing settings."""
+    return [
+        resonator
+        for resonator in mux.resonators
+        if resonator.is_valid and resonator.label not in excluded_targets
+    ]
 
 
 def create_control_configuration(
