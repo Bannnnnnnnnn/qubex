@@ -135,6 +135,9 @@ def test_sync_experiment_system_cache_preserves_channel_cnco() -> None:
         def __init__(self) -> None:
             self.box_config_cache: dict[str, dict[str, Any]] = {}
 
+        def get_box(self, _: str) -> Any:
+            return SimpleNamespace(is_dual_readout_enabled=lambda _port: True)
+
         def config_port(self, **_: Any) -> None:
             return None
 
@@ -188,6 +191,129 @@ def test_sync_experiment_system_cache_preserves_channel_cnco() -> None:
     ports_cache = backend_controller.box_config_cache["B0"]["ports"]
     assert ports_cache[1]["channels"][1]["cnco_freq"] == 2_000_000_000
     assert ports_cache[0]["runits"][4]["cnco_freq"] == 2_000_000_000
+
+
+def test_sync_experiment_system_relinks_dual_readout_before_push() -> None:
+    """Given disabled dual readout, when pushing config, then relinkup happens before port writes."""
+    events: list[tuple[Any, ...]] = []
+
+    class _Quel1Box:
+        def is_dual_readout_enabled(self, port: int) -> bool:
+            events.append(("inspect_dual", port))
+            return False
+
+    class _BackendController:
+        def get_box(self, box_id: str) -> _Quel1Box:
+            events.append(("get_box", box_id))
+            return _Quel1Box()
+
+        def relinkup_boxes(
+            self,
+            box_ids: list[str],
+            *,
+            parallel: bool | None = None,
+        ) -> None:
+            events.append(("relinkup_boxes", tuple(box_ids), parallel))
+
+        def sync_clocks(self, box_ids: list[str]) -> None:
+            events.append(("sync_clocks", tuple(box_ids)))
+
+        def config_port(self, **kwargs: Any) -> None:
+            events.append(("config_port", kwargs["port"]))
+
+        def config_channel(self, **kwargs: Any) -> None:
+            events.append(("config_channel", kwargs["channel"]))
+
+        def config_runit(self, **kwargs: Any) -> None:
+            events.append(("config_runit", kwargs["runit"]))
+
+    backend_controller = _BackendController()
+    synchronizer = Quel1SystemSynchronizer(
+        backend_controller=cast(Any, backend_controller)
+    )
+    box = Box.new(
+        id="B0",
+        name="BOX0",
+        type="quel1-a",
+        address="127.0.0.1",
+        adapter="A0",
+        port_numbers=[1],
+        options=["dual_readout_group0"],
+    )
+
+    synchronizer.sync_experiment_system_to_hardware(
+        experiment_system=cast(Any, SimpleNamespace()),
+        boxes=[box],
+        parallel=True,
+    )
+
+    assert events[:4] == [
+        ("get_box", "B0"),
+        ("inspect_dual", 0),
+        ("relinkup_boxes", ("B0",), False),
+        ("sync_clocks", ("B0",)),
+    ]
+    assert ("config_port", 1) in events[4:]
+
+
+def test_sync_experiment_system_skips_relink_when_dual_readout_enabled() -> None:
+    """Given enabled dual readout, when pushing config, then relinkup is not repeated."""
+    events: list[tuple[Any, ...]] = []
+
+    class _Quel1Box:
+        def is_dual_readout_enabled(self, port: int) -> bool:
+            events.append(("inspect_dual", port))
+            return True
+
+    class _BackendController:
+        def get_box(self, box_id: str) -> _Quel1Box:
+            events.append(("get_box", box_id))
+            return _Quel1Box()
+
+        def relinkup_boxes(
+            self,
+            box_ids: list[str],
+            *,
+            parallel: bool | None = None,
+        ) -> None:
+            events.append(("relinkup_boxes", tuple(box_ids), parallel))
+
+        def sync_clocks(self, box_ids: list[str]) -> None:
+            events.append(("sync_clocks", tuple(box_ids)))
+
+        def config_port(self, **kwargs: Any) -> None:
+            events.append(("config_port", kwargs["port"]))
+
+        def config_channel(self, **kwargs: Any) -> None:
+            events.append(("config_channel", kwargs["channel"]))
+
+        def config_runit(self, **kwargs: Any) -> None:
+            events.append(("config_runit", kwargs["runit"]))
+
+    backend_controller = _BackendController()
+    synchronizer = Quel1SystemSynchronizer(
+        backend_controller=cast(Any, backend_controller)
+    )
+    box = Box.new(
+        id="B0",
+        name="BOX0",
+        type="quel1-a",
+        address="127.0.0.1",
+        adapter="A0",
+        port_numbers=[1],
+        options=["dual_readout_group0"],
+    )
+
+    synchronizer.sync_experiment_system_to_hardware(
+        experiment_system=cast(Any, SimpleNamespace()),
+        boxes=[box],
+        parallel=False,
+    )
+
+    assert ("get_box", "B0") in events
+    assert ("inspect_dual", 0) in events
+    assert not any(event[0] == "relinkup_boxes" for event in events)
+    assert not any(event[0] == "sync_clocks" for event in events)
 
 
 def test_sync_capture_port_passes_sideband_none_to_backend() -> None:

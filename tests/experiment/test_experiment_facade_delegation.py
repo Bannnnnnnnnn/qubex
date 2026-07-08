@@ -55,6 +55,10 @@ class _MeasurementServiceStub:
         self.calls.append(("measure_idle_states", kwargs))
         return "measure_idle_states_result"
 
+    def check_waveform(self, **kwargs: Any) -> str:
+        self.calls.append(("check_waveform", kwargs))
+        return "check_waveform_result"
+
     def execute(self, schedule: object, **kwargs: Any) -> str:
         self.calls.append(("execute", {"schedule": schedule, **kwargs}))
         return "execute_result"
@@ -473,6 +477,42 @@ def test_capture_loopback_delegates_to_measurement_service() -> None:
             {
                 "schedule": schedule,
                 "n_shots": 128,
+            },
+        )
+    ]
+
+
+def test_check_waveform_delegates_demodulation_to_measurement_service() -> None:
+    """Given demodulation flag, when checking waveform, then it delegates to measurement service."""
+    exp = object.__new__(Experiment)
+    measurement_stub = _MeasurementServiceStub()
+    exp.__dict__["_measurement_service"] = measurement_stub
+
+    result = exp.check_waveform(
+        targets=["Q00"],
+        n_shots=1,
+        shot_averaging=False,
+        demodulation=False,
+        plot=False,
+    )
+
+    assert result == "check_waveform_result"
+    assert measurement_stub.calls == [
+        (
+            "check_waveform",
+            {
+                "targets": ["Q00"],
+                "method": None,
+                "n_shots": 1,
+                "shot_interval": None,
+                "shot_averaging": False,
+                "readout_amplitude": None,
+                "readout_duration": None,
+                "readout_pre_margin": None,
+                "readout_post_margin": None,
+                "add_pump_pulses": None,
+                "demodulation": False,
+                "plot": False,
             },
         )
     ]

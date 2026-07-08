@@ -7,7 +7,11 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, TypeGuard
 
 from qubex.core.parallel_executor import run_parallel, run_parallel_map
-from qubex.system.control_system import PortType
+from qubex.system.control_system import (
+    DUAL_READOUT_PORT_LAYOUTS,
+    PortType,
+    resolve_dual_readout_groups,
+)
 from qubex.system.quel1.quel1_control_parameter_defaults import DEFAULT_CAPTURE_DELAY
 
 logger = logging.getLogger(__name__)
@@ -142,6 +146,7 @@ class Quel1SystemSynchronizer:
             parallel = True
         if not boxes:
             return
+        self._ensure_dual_readout_linkup(boxes=boxes, parallel=parallel)
         if not parallel:
             for box in boxes:
                 self.sync_box_to_hardware(box)
@@ -153,6 +158,64 @@ class Quel1SystemSynchronizer:
             on_error=self._log_box_sync_error,
         )
         self._update_backend_cache_from_model(boxes)
+
+    def _ensure_dual_readout_linkup(
+        self,
+        *,
+        boxes: Sequence[Box],
+        parallel: bool,
+    ) -> None:
+        box_ids = [box.id for box in boxes if self._needs_dual_readout_linkup(box)]
+        if not box_ids:
+            return
+
+        logger.info(
+            "Relinking dual-readout boxes before hardware configuration: %s",
+            box_ids,
+        )
+        self._backend_controller.relinkup_boxes(box_ids, parallel=False)
+        self._backend_controller.sync_clocks(box_ids)
+
+    def _needs_dual_readout_linkup(self, box: Box) -> bool:
+        groups = resolve_dual_readout_groups(box.type, box.options)
+        if not groups:
+            return False
+
+        get_box = getattr(self._backend_controller, "get_box", None)
+        if not callable(get_box):
+            return True
+
+        try:
+            quel1_box = get_box(box.id)
+        except Exception:
+            logger.debug(
+                "Could not inspect dual-readout linkup state for %s; relinkup will be attempted.",
+                box.id,
+                exc_info=True,
+            )
+            return True
+
+        is_enabled = getattr(quel1_box, "is_dual_readout_enabled", None)
+        if not callable(is_enabled):
+            return True
+
+        layouts = DUAL_READOUT_PORT_LAYOUTS.get(box.type, {})
+        for group in groups:
+            layout = layouts.get(group)
+            if layout is None:
+                continue
+            try:
+                if not bool(is_enabled(layout.read_in_port)):
+                    return True
+            except Exception:
+                logger.debug(
+                    "Could not inspect dual-readout group %s on %s; relinkup will be attempted.",
+                    group,
+                    box.id,
+                    exc_info=True,
+                )
+                return True
+        return False
 
     def get_box_config_cache_snapshot(self) -> dict[str, dict]:
         """Return a snapshot of backend box-config cache when supported."""

@@ -79,6 +79,7 @@ from qubex.measurement import (
     SweepValue,
 )
 from qubex.measurement.measurement_schedule_builder import CapturePlacement
+from qubex.measurement.models.quel1_measurement_options import Quel1MeasurementOptions
 from qubex.system import TargetRegistry
 from qubex.typing import (
     FrequencyLike,
@@ -326,6 +327,7 @@ class MeasurementService:
         readout_drag_coeff: float | None = None,
         readout_amplification: bool | None = None,
         final_measurement: bool | None = None,
+        quel1_options: Quel1MeasurementOptions | None = None,
     ) -> MeasurementResult:
         """Run one async measurement by delegating to the measurement layer."""
         normalized_shot_interval = normalize_time_to_ns(shot_interval)
@@ -359,9 +361,15 @@ class MeasurementService:
                 time_integration=time_integration,
                 state_classification=state_classification,
             )
+            if quel1_options is None:
+                return await self.ctx.measurement.run_measurement(
+                    schedule=measurement_schedule,
+                    config=config,
+                )
             return await self.ctx.measurement.run_measurement(
                 schedule=measurement_schedule,
                 config=config,
+                quel1_options=quel1_options,
             )
 
     async def run_sweep_measurement(
@@ -1467,11 +1475,13 @@ class MeasurementService:
         method: Literal["measure", "execute"] | None = None,
         n_shots: int | None = None,
         shot_interval: float | None = None,
+        shot_averaging: bool | None = None,
         readout_amplitude: float | None = None,
         readout_duration: float | None = None,
         readout_pre_margin: float | None = None,
         readout_post_margin: float | None = None,
         readout_amplification: bool | None = None,
+        demodulation: bool | None = None,
         plot: bool | None = None,
         **deprecated_options: Any,
     ) -> MeasureResult:
@@ -1489,6 +1499,8 @@ class MeasurementService:
             Number of shots.
         shot_interval : float | None, optional
             Interval between shots in ns.
+        shot_averaging : bool | None, optional
+            Whether to average captured waveforms on hardware.
         readout_amplitude : float, optional
             Amplitude of the readout pulse.
         readout_duration : float, optional
@@ -1499,6 +1511,8 @@ class MeasurementService:
             Post-margin of the readout pulse in ns.
         readout_amplification : bool, optional
             Whether to add readout amplification pulses. Defaults to False.
+        demodulation : bool, optional
+            QuEL-1 DSP demodulation flag. Defaults to backend default.
         plot : bool, optional
             Whether to plot the measured signals. Defaults to True.
 
@@ -1561,12 +1575,18 @@ class MeasurementService:
             for target in targets:
                 ps.add(target, Blank(0))
 
+        quel1_options = (
+            None
+            if demodulation is None
+            else Quel1MeasurementOptions(demodulation=demodulation)
+        )
         result = MeasurementResultConverter.to_measure_result(
             _run_async(
                 lambda: self.run_measurement(
                     schedule=ps,
                     n_shots=n_shots,
                     shot_interval=shot_interval,
+                    shot_averaging=shot_averaging,
                     readout_amplitudes=readout_amplitudes,
                     readout_duration=readout_duration,
                     readout_pre_margin=readout_pre_margin,
@@ -1574,6 +1594,7 @@ class MeasurementService:
                     readout_amplification=readout_amplification,
                     final_measurement=True,
                     time_integration=False,
+                    quel1_options=quel1_options,
                 )
             )
         )

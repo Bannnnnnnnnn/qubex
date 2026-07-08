@@ -46,6 +46,7 @@ from .models.measure_result import (
     MultipleMeasureResult,
 )
 from .models.measurement_schedule import MeasurementSchedule
+from .models.quel1_measurement_options import Quel1MeasurementOptions
 from .models.sweep_measurement_result import (
     NDSweepMeasurementResult,
     SweepAxes,
@@ -680,6 +681,7 @@ class Measurement:
         schedule: MeasurementSchedule,
         *,
         config: MeasurementConfig,
+        quel1_options: Quel1MeasurementOptions | None = None,
     ) -> MeasurementResult:
         """
         Execute one prepared measurement schedule.
@@ -699,6 +701,7 @@ class Measurement:
         return await self.execution_service.run_measurement(
             schedule=schedule,
             config=config,
+            quel1_options=quel1_options,
         )
 
     async def run_sweep_measurement(

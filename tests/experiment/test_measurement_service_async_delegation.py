@@ -37,8 +37,15 @@ def _make_service() -> tuple[MeasurementService, dict[str, Any]]:
         calls["create_config"].append(kwargs)
         return SimpleNamespace(tag="config")
 
-    async def _run_measurement(*, schedule: object, config: object) -> str:
-        calls["run_measurement"].append({"schedule": schedule, "config": config})
+    async def _run_measurement(
+        *,
+        schedule: object,
+        config: object,
+        **kwargs: Any,
+    ) -> str:
+        calls["run_measurement"].append(
+            {"schedule": schedule, "config": config, **kwargs}
+        )
         return "measurement_result"
 
     async def _run_sweep_measurement(
@@ -185,6 +192,24 @@ def test_run_measurement_builds_schedule_and_delegates() -> None:
     called = calls["run_measurement"][0]
     assert cast(SimpleNamespace, called["schedule"]).tag == "built"
     assert cast(SimpleNamespace, called["config"]).tag == "config"
+
+
+def test_run_measurement_delegates_quel1_options_when_provided() -> None:
+    """Given QuEL-1 execution options, when running async measurement, then options are delegated."""
+    from qubex.measurement.models.quel1_measurement_options import (
+        Quel1MeasurementOptions,
+    )
+
+    service, calls = _make_service()
+    pulse_schedule = cast(Any, object())
+    quel1_options = Quel1MeasurementOptions(demodulation=False)
+
+    result = asyncio.run(
+        service.run_measurement(pulse_schedule, quel1_options=quel1_options)
+    )
+
+    assert result == "measurement_result"
+    assert calls["run_measurement"][0]["quel1_options"] is quel1_options
 
 
 def test_run_measurement_normalizes_tunits_inputs_before_delegation() -> None:

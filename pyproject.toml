@@ -81,6 +81,7 @@ qubex = ["py.typed", "*.pyi", "clifford/**/*.json"]
 cache-dir = ".cache/uv"
 
 [tool.uv.sources]
+quel_ic_config = { path = "../quelware-internal/quel_ic_config", editable = true }
 quelware_client = { workspace = true }
 qxdriver_quel1 = { workspace = true }
 qxcore = { workspace = true }

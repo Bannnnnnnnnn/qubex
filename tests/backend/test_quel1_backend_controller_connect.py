@@ -29,15 +29,22 @@ class _BoxSetting:
 
 
 class _FakeBox:
+    boxtype = "quel1-a"
+
     def __init__(self, name: str) -> None:
         self.name = name
         self.reconnect_count = 0
         self.reconnect_calls: list[dict[str, Any]] = []
+        self.relinkup_calls: list[dict[str, Any]] = []
 
     def reconnect(self, **kwargs: Any) -> None:
         """Increment reconnect count and record keyword arguments."""
         self.reconnect_calls.append(kwargs)
         self.reconnect_count += 1
+
+    def relinkup(self, **kwargs: Any) -> None:
+        """Record relinkup keyword arguments."""
+        self.relinkup_calls.append(kwargs)
 
     def dump_box(self) -> dict[str, str]:
         """Return a minimal box dump payload."""
@@ -298,3 +305,51 @@ def test_connect_skips_reconnect_when_already_connected(monkeypatch) -> None:
     controller.connect(["A"])
 
     assert controller._connection_manager.quel1system is existing_system
+
+
+def test_connect_relinks_dual_readout_boxes_before_building_system(monkeypatch) -> None:
+    """Given dual-readout box options, connect relinks before creating runtime maps."""
+    controller = _make_controller()
+    events: list[str] = []
+    _override_driver_classes(
+        controller,
+        BoxPool=_FakeBoxPool,
+        SequencerClient=lambda _ipaddr: object(),
+    )
+    controller.set_box_options({"A": ("dual_readout_group0",)})
+    monkeypatch.setattr(
+        controller._runtime_context, "validate_box_availability", lambda _: None
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_resolve_config_options",
+        lambda **_: ["dual_readout_output_mxfe0"],
+    )
+
+    def _fake_create_from_boxpool(box_names: list[str]) -> object:
+        events.append(f"create_system:{box_names}")
+        return object()
+
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_create_quel1system_from_boxpool",
+        _fake_create_from_boxpool,
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_create_resource_map",
+        lambda kind: events.append(f"resource:{kind}") or {},
+    )
+
+    controller.connect(["A"], parallel=True)
+
+    box = cast(_FakeQubeCalib, controller.qubecalib).sysdb.created_boxes[-1]
+    assert box.relinkup_calls == [
+        {
+            "use_204b": False,
+            "background_noise_threshold": 1024.0,
+            "config_options": ["dual_readout_output_mxfe0"],
+        }
+    ]
+    assert len(box.reconnect_calls) == 2
+    assert events == ["create_system:['A']", "resource:cap", "resource:gen"]

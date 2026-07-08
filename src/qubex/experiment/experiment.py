@@ -1705,11 +1705,13 @@ class Experiment:
         method: Literal["measure", "execute"] | None = None,
         n_shots: int | None = None,
         shot_interval: float | None = None,
+        shot_averaging: bool | None = None,
         readout_amplitude: float | None = None,
         readout_duration: float | None = None,
         readout_pre_margin: float | None = None,
         readout_post_margin: float | None = None,
         add_pump_pulses: bool | None = None,
+        demodulation: bool | None = None,
         plot: bool | None = None,
         **deprecated_options: Any,
     ) -> MeasureResult:
@@ -1727,6 +1729,8 @@ class Experiment:
             Number of shots.
         shot_interval : float, optional
             Interval between shots in ns.
+        shot_averaging : bool, optional
+            Whether to average captured waveforms on hardware.
         readout_amplitude : float, optional
             Amplitude of the readout pulse.
         readout_duration : float, optional
@@ -1737,6 +1741,8 @@ class Experiment:
             Post-margin of the readout pulse in ns.
         add_pump_pulses : bool, optional
             Whether to add pump pulses to the readout sequence. Defaults to False.
+        demodulation : bool, optional
+            QuEL-1 DSP demodulation flag. Defaults to backend default.
         plot : bool, optional
             Whether to plot the measured signals. Defaults to True.
 
@@ -1754,11 +1760,13 @@ class Experiment:
             method=method,
             n_shots=n_shots,
             shot_interval=shot_interval,
+            shot_averaging=shot_averaging,
             readout_amplitude=readout_amplitude,
             readout_duration=readout_duration,
             readout_pre_margin=readout_pre_margin,
             readout_post_margin=readout_post_margin,
             add_pump_pulses=add_pump_pulses,
+            demodulation=demodulation,
             plot=plot,
             **deprecated_options,
         )

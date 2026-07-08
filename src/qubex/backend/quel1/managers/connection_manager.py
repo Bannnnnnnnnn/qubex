@@ -23,7 +23,10 @@ from qubex.backend.quel1.quel1_runtime_context import (
 )
 from qubex.core.parallel_executor import run_parallel, run_parallel_map
 
-from .option_resolver import resolve_config_options
+from .option_resolver import (
+    resolve_config_options,
+    resolve_dual_readout_groups_from_labels,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -248,6 +251,9 @@ class Quel1ConnectionManager:
             gen_resource_map=None,
         )
         try:
+            self._relink_dual_readout_boxes_on_connect(
+                box_names=resolved_box_names,
+            )
             quel1system = self._create_quel1system_from_boxpool(resolved_box_names)
             self.set_quel1system(quel1system)
             cap_resource_map = self._create_resource_map("cap")
@@ -257,6 +263,31 @@ class Quel1ConnectionManager:
             raise
         self.set_cap_resource_map(cap_resource_map)
         self.set_gen_resource_map(gen_resource_map)
+
+    def _relink_dual_readout_boxes_on_connect(
+        self,
+        *,
+        box_names: list[str],
+    ) -> None:
+        dual_readout_box_names = [
+            box_name
+            for box_name in box_names
+            if resolve_dual_readout_groups_from_labels(
+                self._runtime_context.box_options.get(box_name, ())
+            )
+        ]
+        if not dual_readout_box_names:
+            return
+
+        logger.info(
+            "Relinking dual-readout boxes during connect: %s",
+            dual_readout_box_names,
+        )
+        self.relinkup_boxes(
+            box_list=dual_readout_box_names,
+            noise_threshold=None,
+            parallel=False,
+        )
 
     def requires_reconnect(self, box_names: str | list[str] | None) -> bool:
         """Return whether connecting these boxes would rebuild runtime state."""
