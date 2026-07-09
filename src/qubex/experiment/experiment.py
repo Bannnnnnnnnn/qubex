@@ -1730,7 +1730,8 @@ class Experiment:
         shot_interval : float, optional
             Interval between shots in ns.
         shot_averaging : bool, optional
-            Whether to average captured waveforms on hardware.
+            Accepted for API compatibility. Waveform checks always retain
+            individual shots on hardware and average them in software.
         readout_amplitude : float, optional
             Amplitude of the readout pulse.
         readout_duration : float, optional
@@ -1742,7 +1743,7 @@ class Experiment:
         add_pump_pulses : bool, optional
             Whether to add pump pulses to the readout sequence. Defaults to False.
         demodulation : bool, optional
-            QuEL-1 DSP demodulation flag. Defaults to backend default.
+            Software demodulation flag. Defaults to True.
         plot : bool, optional
             Whether to plot the measured signals. Defaults to True.
 

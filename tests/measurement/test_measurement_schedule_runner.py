@@ -112,12 +112,16 @@ def test_execute_async_validates_builds_calls_backend_and_creates_result() -> No
             measurement_config: MeasurementConfig,
             device_config: dict[str, object],
             sampling_period: float,
+            schedule: MeasurementSchedule | None = None,
+            quel1_options: object | None = None,
         ) -> MeasurementResult:
             called["result_kwargs"] = {
                 "backend_result": backend_result,
                 "measurement_config": measurement_config,
                 "device_config": device_config,
                 "sampling_period": sampling_period,
+                "schedule": schedule,
+                "quel1_options": quel1_options,
             }
             return expected
 
@@ -150,6 +154,8 @@ def test_execute_async_validates_builds_calls_backend_and_creates_result() -> No
     assert result_kwargs["measurement_config"] is config
     assert result_kwargs["device_config"] == {"shots": 2}
     assert result_kwargs["sampling_period"] == 8.0
+    assert result_kwargs["schedule"] is schedule
+    assert result_kwargs["quel1_options"] is None
     assert result is expected
 
 
@@ -252,11 +258,15 @@ def test_execute_async_forwards_execution_options_to_backend_controller() -> Non
             measurement_config: MeasurementConfig,
             device_config: dict[str, object],
             sampling_period: float,
+            schedule: MeasurementSchedule | None = None,
+            quel1_options: object | None = None,
         ) -> MeasurementResult:
             _ = backend_result
             _ = measurement_config
             _ = device_config
             _ = sampling_period
+            _ = schedule
+            _ = quel1_options
             return expected
 
     class _BackendController:
@@ -322,12 +332,16 @@ def test_execute_async_falls_back_to_empty_device_config_without_box_config() ->
             measurement_config: MeasurementConfig,
             device_config: dict[str, object],
             sampling_period: float,
+            schedule: MeasurementSchedule | None = None,
+            quel1_options: object | None = None,
         ) -> MeasurementResult:
             called["result_kwargs"] = {
                 "backend_result": backend_result,
                 "measurement_config": measurement_config,
                 "device_config": device_config,
                 "sampling_period": sampling_period,
+                "schedule": schedule,
+                "quel1_options": quel1_options,
             }
             return expected
 
@@ -386,10 +400,14 @@ def test_execute_async_prefers_backend_capture_decimation_hint() -> None:
             measurement_config: MeasurementConfig,
             device_config: dict[str, object],
             sampling_period: float,
+            schedule: MeasurementSchedule | None = None,
+            quel1_options: object | None = None,
         ) -> MeasurementResult:
             _ = backend_result
             _ = measurement_config
             _ = device_config
+            _ = schedule
+            _ = quel1_options
             called["sampling_period"] = sampling_period
             return expected
 
@@ -502,8 +520,17 @@ def test_execute_batch_async_uses_backend_batch_api_when_available() -> None:
             measurement_config: MeasurementConfig,
             device_config: dict[str, object],
             sampling_period: float,
+            schedule: MeasurementSchedule | None = None,
+            quel1_options: object | None = None,
         ) -> MeasurementResult:
-            _ = (backend_result, measurement_config, device_config, sampling_period)
+            _ = (
+                backend_result,
+                measurement_config,
+                device_config,
+                sampling_period,
+                schedule,
+                quel1_options,
+            )
             return expected
 
     class _BackendController:
@@ -625,11 +652,15 @@ def test_execute_async_prefers_adapter_measurement_result_builder_when_available
             measurement_config: MeasurementConfig,
             device_config: dict[str, object],
             sampling_period: float,
+            schedule: MeasurementSchedule | None = None,
+            quel1_options: object | None = None,
         ) -> MeasurementResult:
             called["builder_backend_result"] = backend_result
             called["builder_measurement_config"] = measurement_config
             called["builder_device_config"] = device_config
             called["builder_sampling_period"] = sampling_period
+            called["builder_schedule"] = schedule
+            called["builder_quel1_options"] = quel1_options
             return expected
 
     class _BackendController:
@@ -664,6 +695,8 @@ def test_execute_async_prefers_adapter_measurement_result_builder_when_available
     assert called["builder_measurement_config"] is config
     assert called["builder_device_config"] == {"kind": "quel3"}
     assert called["builder_sampling_period"] == 1.6
+    assert called["builder_schedule"] is schedule
+    assert called["builder_quel1_options"] is None
     assert result is expected
 
 

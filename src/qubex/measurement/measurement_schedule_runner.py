@@ -87,6 +87,8 @@ class MeasurementScheduleRunner:
         *,
         backend_result: object,
         config: MeasurementConfig,
+        schedule: MeasurementSchedule,
+        quel1_options: Quel1MeasurementOptions | None = None,
     ) -> MeasurementResult:
         """Build canonical measurement result via measurement backend adapter."""
         if isinstance(backend_result, MeasurementResult):
@@ -116,7 +118,12 @@ class MeasurementScheduleRunner:
             )
 
         sampling_period = self._backend_controller.sampling_period_ns
-        if config.shot_averaging:
+        quel1_adapter_type = Quel1MeasurementBackendAdapter
+        uses_raw_quel1_capture = isinstance(
+            quel1_adapter_type,
+            type,
+        ) and isinstance(self._measurement_backend_adapter, quel1_adapter_type)
+        if config.shot_averaging and not uses_raw_quel1_capture:
             sampling_period = sampling_period * capture_decimation_factor
 
         return self._measurement_backend_adapter.build_measurement_result(
@@ -124,6 +131,8 @@ class MeasurementScheduleRunner:
             measurement_config=config,
             device_config=device_config,
             sampling_period=sampling_period,
+            schedule=schedule,
+            quel1_options=quel1_options,
         )
 
     def execute_sync(
@@ -147,7 +156,12 @@ class MeasurementScheduleRunner:
                 execution_mode=self._execution_mode,
                 clock_health_checks=self._clock_health_checks,
             )
-        return self._build_result(backend_result=backend_result, config=config)
+        return self._build_result(
+            backend_result=backend_result,
+            config=config,
+            schedule=schedule,
+            quel1_options=quel1_options,
+        )
 
     async def execute_async(
         self,
@@ -192,6 +206,8 @@ class MeasurementScheduleRunner:
         return self._build_result(
             backend_result=backend_result,
             config=config,
+            schedule=schedule,
+            quel1_options=quel1_options,
         )
 
     async def execute_batch_async(
@@ -218,8 +234,13 @@ class MeasurementScheduleRunner:
                 self._build_result(
                     backend_result=backend_result,
                     config=config,
+                    schedule=schedule,
                 )
-                for backend_result in backend_results
+                for schedule, backend_result in zip(
+                    schedules,
+                    backend_results,
+                    strict=True,
+                )
             ]
 
         return [

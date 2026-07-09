@@ -79,6 +79,7 @@ from qubex.measurement import (
     SweepValue,
 )
 from qubex.measurement.measurement_schedule_builder import CapturePlacement
+from qubex.measurement.models import CaptureData, MeasurementConfig
 from qubex.measurement.models.quel1_measurement_options import Quel1MeasurementOptions
 from qubex.system import TargetRegistry
 from qubex.typing import (
@@ -117,6 +118,55 @@ def _get_classifier_stddevs(
         return classifier.stddevs
     except (AttributeError, NotImplementedError):
         return None
+
+
+def _software_average_waveform_result(result: MeasurementResult) -> MeasurementResult:
+    """Average retained waveform shots in software for waveform inspection."""
+    averaged_config = MeasurementConfig(
+        n_shots=result.measurement_config.n_shots,
+        shot_interval=result.measurement_config.shot_interval,
+        shot_averaging=True,
+        time_integration=False,
+        state_classification=False,
+    )
+    averaged_data: dict[str, list[CaptureData]] = {}
+    for target, captures in result.data.items():
+        averaged_captures: list[CaptureData] = []
+        for capture in captures:
+            waveform = np.asarray(capture.data)
+            capture_config = capture.config
+            if (
+                not capture_config.shot_averaging
+                and not capture_config.time_integration
+            ):
+                if waveform.ndim == 1:
+                    averaged_waveform = waveform
+                else:
+                    averaged_waveform = np.sum(waveform, axis=0) / float(
+                        capture_config.n_shots
+                    )
+            else:
+                averaged_waveform = np.squeeze(waveform)
+                if np.asarray(averaged_waveform).ndim == 0:
+                    averaged_waveform = np.asarray(averaged_waveform).reshape(1)
+
+            averaged_captures.append(
+                CaptureData.from_primary_data(
+                    target=capture.target,
+                    data=np.asarray(averaged_waveform),
+                    config=averaged_config,
+                    sampling_period=capture.sampling_period,
+                    classifier_ref=capture.classifier_ref,
+                )
+            )
+        averaged_data[target] = averaged_captures
+
+    return MeasurementResult(
+        data=averaged_data,
+        measurement_config=averaged_config,
+        device_config=result.device_config,
+        classifier_refs=result.classifier_refs,
+    )
 
 
 class MeasurementService:
@@ -1500,7 +1550,8 @@ class MeasurementService:
         shot_interval : float | None, optional
             Interval between shots in ns.
         shot_averaging : bool | None, optional
-            Whether to average captured waveforms on hardware.
+            Accepted for API compatibility. Waveform checks always retain
+            individual shots on hardware and average them in software.
         readout_amplitude : float, optional
             Amplitude of the readout pulse.
         readout_duration : float, optional
@@ -1512,7 +1563,7 @@ class MeasurementService:
         readout_amplification : bool, optional
             Whether to add readout amplification pulses. Defaults to False.
         demodulation : bool, optional
-            QuEL-1 DSP demodulation flag. Defaults to backend default.
+            Software demodulation flag. Defaults to True.
         plot : bool, optional
             Whether to plot the measured signals. Defaults to True.
 
@@ -1580,23 +1631,24 @@ class MeasurementService:
             if demodulation is None
             else Quel1MeasurementOptions(demodulation=demodulation)
         )
-        result = MeasurementResultConverter.to_measure_result(
-            _run_async(
-                lambda: self.run_measurement(
-                    schedule=ps,
-                    n_shots=n_shots,
-                    shot_interval=shot_interval,
-                    shot_averaging=shot_averaging,
-                    readout_amplitudes=readout_amplitudes,
-                    readout_duration=readout_duration,
-                    readout_pre_margin=readout_pre_margin,
-                    readout_post_margin=readout_post_margin,
-                    readout_amplification=readout_amplification,
-                    final_measurement=True,
-                    time_integration=False,
-                    quel1_options=quel1_options,
-                )
+        measurement_result = _run_async(
+            lambda: self.run_measurement(
+                schedule=ps,
+                n_shots=n_shots,
+                shot_interval=shot_interval,
+                shot_averaging=False,
+                readout_amplitudes=readout_amplitudes,
+                readout_duration=readout_duration,
+                readout_pre_margin=readout_pre_margin,
+                readout_post_margin=readout_post_margin,
+                readout_amplification=readout_amplification,
+                final_measurement=True,
+                time_integration=False,
+                quel1_options=quel1_options,
             )
+        )
+        result = MeasurementResultConverter.to_measure_result(
+            _software_average_waveform_result(measurement_result)
         )
         if plot:
             result.plot()

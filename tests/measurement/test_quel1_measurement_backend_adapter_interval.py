@@ -125,10 +125,10 @@ def test_build_execution_request_preserves_positive_interval_without_extra_margi
     assert payload.interval_ns == 384
 
 
-def test_build_execution_request_honors_quel1_dsp_demodulation_option(
+def test_build_execution_request_disables_all_capture_unit_dsp(
     monkeypatch,
 ) -> None:
-    """Given explicit QuEL-1 options, when building request, then DSP demodulation flag follows the option."""
+    """Given QuEL-1 options, execution payload should still request raw capture."""
     backend = _BackendControllerStub()
     adapter = cast(
         Any,
@@ -163,10 +163,25 @@ def test_build_execution_request_honors_quel1_dsp_demodulation_option(
 
     request = adapter.build_execution_request(
         schedule=schedule,
-        config=_make_config(interval=0.0),
-        quel1_options=Quel1MeasurementOptions(demodulation=False),
+        config=MeasurementConfig(
+            n_shots=3,
+            shot_interval=0.0,
+            shot_averaging=True,
+            time_integration=True,
+            state_classification=True,
+        ),
+        quel1_options=Quel1MeasurementOptions(
+            demodulation=True,
+            classification_line_param0=(1.0, 0.0, 0.0),
+            classification_line_param1=(0.0, 1.0, 0.0),
+        ),
     )
 
     payload = request.payload
-    assert hasattr(payload, "dsp_demodulation")
+    assert hasattr(payload, "integral_mode")
+    assert payload.integral_mode == "single"
     assert payload.dsp_demodulation is False
+    assert payload.enable_sum is False
+    assert payload.enable_classification is False
+    assert payload.line_param0 is None
+    assert payload.line_param1 is None

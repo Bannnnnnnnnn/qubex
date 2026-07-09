@@ -15,6 +15,7 @@ from qubex.measurement.models import (
     CaptureData,
     MeasurementConfig,
     MeasurementResult,
+    MeasureMode,
     MeasureResult,
 )
 
@@ -38,6 +39,38 @@ def _make_measurement_result(target: str = "custom-target") -> MeasurementResult
                 CaptureData.from_primary_data(
                     target=target,
                     data=np.array([0.0 + 0.0j], dtype=np.complex128),
+                    config=measurement_config,
+                    sampling_period=2.0,
+                )
+            ]
+        },
+        measurement_config=measurement_config,
+    )
+
+
+def _make_waveform_series_measurement_result(
+    target: str = "custom-target",
+) -> MeasurementResult:
+    measurement_config = MeasurementConfig(
+        n_shots=3,
+        shot_interval=100.0,
+        shot_averaging=False,
+        time_integration=False,
+        state_classification=False,
+    )
+    return MeasurementResult(
+        data={
+            target: [
+                CaptureData.from_primary_data(
+                    target=target,
+                    data=np.array(
+                        [
+                            [1.0 + 0.0j, 2.0 + 0.0j],
+                            [3.0 + 0.0j, 4.0 + 0.0j],
+                            [5.0 + 0.0j, 6.0 + 0.0j],
+                        ],
+                        dtype=np.complex128,
+                    ),
                     config=measurement_config,
                     sampling_period=2.0,
                 )
@@ -312,6 +345,42 @@ def test_check_waveform_for_execute_forces_dsp_sum_disabled() -> None:
 
     assert captured["labels"] == ["custom-target"]
     assert captured["time_integration"] is False
+
+
+def test_check_waveform_software_averages_retained_waveform_shots() -> None:
+    """Given retained waveform shots, check_waveform averages shots in software."""
+    service, _ = _make_service()
+    captured: dict[str, object] = {}
+
+    async def _run_measurement(
+        self: MeasurementService,
+        schedule: object,
+        **kwargs: object,
+    ) -> MeasurementResult:
+        captured["shot_averaging"] = kwargs["shot_averaging"]
+        captured["n_shots"] = kwargs["n_shots"]
+        captured["time_integration"] = kwargs["time_integration"]
+        return _make_waveform_series_measurement_result()
+
+    service.__dict__["run_measurement"] = MethodType(_run_measurement, service)
+
+    result = service.check_waveform(
+        targets=["custom-target"],
+        n_shots=3,
+        shot_averaging=True,
+        plot=False,
+    )
+
+    assert captured == {
+        "shot_averaging": False,
+        "n_shots": 3,
+        "time_integration": False,
+    }
+    assert result.mode == MeasureMode.AVG
+    assert np.array_equal(
+        result.data["custom-target"].raw,
+        np.array([3.0 + 0.0j, 4.0 + 0.0j], dtype=np.complex128),
+    )
 
 
 def test_check_waveform_returns_legacy_measure_result() -> None:

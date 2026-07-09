@@ -38,6 +38,8 @@ class MeasurementBackendAdapter(Protocol):
         measurement_config: MeasurementConfig,
         device_config: dict,
         sampling_period: float,
+        schedule: MeasurementSchedule | None = None,
+        quel1_options: Quel1MeasurementOptions | None = None,
     ) -> MeasurementResult:
         """Build canonical result from a backend-specific result payload."""
         ...

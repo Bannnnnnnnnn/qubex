@@ -18,15 +18,13 @@ from qubex.backend.quel1 import (
 from qubex.measurement.measurement_constraint_profile import (
     MeasurementConstraintProfile,
 )
-from qubex.measurement.models.capture_data import CaptureData
+from qubex.measurement.models.capture_data import CaptureData, CapturePayload
 from qubex.measurement.models.measure_result import MeasureMode
-from qubex.measurement.models.measurement_config import MeasurementConfig
+from qubex.measurement.models.measurement_config import MeasurementConfig, ReturnItem
 from qubex.measurement.models.measurement_result import MeasurementResult
 from qubex.measurement.models.measurement_schedule import MeasurementSchedule
 from qubex.measurement.models.quel1_measurement_options import Quel1MeasurementOptions
 from qubex.system import ExperimentSystem, TargetRegistry
-
-from ._capture_shape import normalize_shot_averaged_capture_array
 
 if TYPE_CHECKING:
     import numpy.typing as npt
@@ -210,7 +208,6 @@ class Quel1MeasurementBackendAdapter:
         """Build a QuEL backend execution request from measurement inputs."""
         profile = self._constraint_profile
         block_duration = profile.block_duration_ns
-        measure_mode = MeasureMode.AVG if config.shot_averaging else MeasureMode.SINGLE
         base_duration = schedule.pulse_schedule.duration
         if profile.enforce_block_alignment and block_duration is not None:
             interval_ns = int(
@@ -251,11 +248,7 @@ class Quel1MeasurementBackendAdapter:
             target: resource_map_by_lookup_target[lookup_target]
             for target, lookup_target in resource_lookup_target_by_target.items()
         }
-        dsp_demodulation = (
-            True
-            if quel1_options is None or quel1_options.demodulation is None
-            else quel1_options.demodulation
-        )
+        _ = quel1_options
 
         payload = Quel1ExecutionPayload(
             gen_sampled_sequence=gen_sampled_sequence,
@@ -263,20 +256,12 @@ class Quel1MeasurementBackendAdapter:
             resource_map=resource_map,
             interval_ns=interval_ns,
             repeats=config.n_shots,
-            integral_mode=measure_mode.integral_mode,
-            dsp_demodulation=dsp_demodulation,
-            enable_sum=config.time_integration,
-            enable_classification=config.state_classification,
-            line_param0=(
-                None
-                if quel1_options is None
-                else quel1_options.classification_line_param0
-            ),
-            line_param1=(
-                None
-                if quel1_options is None
-                else quel1_options.classification_line_param1
-            ),
+            integral_mode=MeasureMode.SINGLE.integral_mode,
+            dsp_demodulation=False,
+            enable_sum=False,
+            enable_classification=False,
+            line_param0=None,
+            line_param1=None,
         )
         return BackendExecutionRequest(
             payload=payload,
@@ -289,17 +274,23 @@ class Quel1MeasurementBackendAdapter:
         measurement_config: MeasurementConfig,
         device_config: dict,
         sampling_period: float,
+        schedule: MeasurementSchedule | None = None,
+        quel1_options: Quel1MeasurementOptions | None = None,
     ) -> MeasurementResult:
-        """Build canonical result from a QuEL-1 backend result payload."""
+        """Build canonical result from raw QuEL-1 captures using software DSP."""
         if not isinstance(backend_result, Quel1BackendExecutionResult):
             raise TypeError(
                 "QuEL-1 adapter expects backend_result to be `Quel1BackendExecutionResult`."
             )
 
-        shot_averaging = measurement_config.shot_averaging
         skip_extra_capture = self._constraint_profile.require_workaround_capture
         norm_factor = 2 ** (-32)  # normalization factor for 32-bit data
         target_registry = getattr(self._experiment_system, "target_registry", None)
+        software_demodulation = (
+            True
+            if quel1_options is None or quel1_options.demodulation is None
+            else quel1_options.demodulation
+        )
 
         iq_data: dict[str, list[npt.ArrayLike]] = {}
         for target, iqs in sorted(backend_result.data.items()):
@@ -316,67 +307,189 @@ class Quel1MeasurementBackendAdapter:
                 iq_data[target] = iqs
 
         measure_data: dict[str, list[CaptureData]] = {}
-        if not shot_averaging:
-            for target, iqs in iq_data.items():
-                if target_registry is not None and hasattr(
-                    target_registry,
-                    "measurement_output_label",
-                ):
-                    qubit = str(target_registry.measurement_output_label(target))
-                elif target.startswith("R"):
-                    qubit = target[1:]
-                else:
-                    qubit = target
-                values: list[CaptureData] = []
-                for index, iq in enumerate(iqs):
-                    if skip_extra_capture and index == 0:
-                        # skip the first extra capture
-                        continue
-                    values.append(
-                        CaptureData.from_primary_data(
-                            target=qubit,
-                            data=_as_read_only_array(
-                                np.asarray(iq, dtype=np.complex128) * norm_factor
-                            ),
-                            config=measurement_config,
-                            sampling_period=sampling_period,
-                        )
+        for target, iqs in iq_data.items():
+            if target_registry is not None and hasattr(
+                target_registry,
+                "measurement_output_label",
+            ):
+                qubit = str(target_registry.measurement_output_label(target))
+            elif target.startswith("R"):
+                qubit = target[1:]
+            else:
+                qubit = target
+
+            demodulation_frequency = self._resolve_result_demodulation_frequency(
+                target=target,
+                schedule=schedule,
+            )
+            values: list[CaptureData] = []
+            for index, iq in enumerate(iqs):
+                if skip_extra_capture and index == 0:
+                    continue
+                waveform_series = self._normalize_raw_waveform_series(
+                    iq,
+                    n_shots=measurement_config.n_shots,
+                    norm_factor=norm_factor,
+                )
+                if software_demodulation and demodulation_frequency != 0.0:
+                    waveform_series = self._demodulate_waveform_series(
+                        waveform_series,
+                        frequency=demodulation_frequency,
+                        sampling_period=sampling_period,
                     )
-                measure_data[qubit] = values
-        else:
-            for target, iqs in iq_data.items():
-                if target_registry is not None and hasattr(
-                    target_registry,
-                    "measurement_output_label",
-                ):
-                    qubit = str(target_registry.measurement_output_label(target))
-                elif target.startswith("R"):
-                    qubit = target[1:]
-                else:
-                    qubit = target
-                values: list[CaptureData] = []
-                for index, iq in enumerate(iqs):
-                    if skip_extra_capture and index == 0:
-                        # skip the first extra capture
-                        continue
-                    values.append(
-                        CaptureData.from_primary_data(
-                            target=qubit,
-                            data=_as_read_only_array(
-                                normalize_shot_averaged_capture_array(iq)
-                                * norm_factor
-                                / measurement_config.n_shots
-                            ),
-                            config=measurement_config,
-                            sampling_period=sampling_period,
-                        )
+                values.append(
+                    self._build_capture_data_from_waveform_series(
+                        target=qubit,
+                        waveform_series=waveform_series,
+                        config=measurement_config,
+                        sampling_period=sampling_period,
+                        quel1_options=quel1_options,
                     )
-                measure_data[qubit] = values
+                )
+            measure_data[qubit] = values
 
         return MeasurementResult(
             data=measure_data,
             device_config=device_config,
             measurement_config=measurement_config,
+        )
+
+    def _build_capture_data_from_waveform_series(
+        self,
+        *,
+        target: str,
+        waveform_series: np.ndarray,
+        config: MeasurementConfig,
+        sampling_period: float,
+        quel1_options: Quel1MeasurementOptions | None,
+    ) -> CaptureData:
+        """Build capture data by applying software sum/average/classification."""
+        payload_kwargs: dict[str, np.ndarray] = {}
+        iq_series = np.sum(waveform_series, axis=1)
+
+        match config.primary_return_item:
+            case ReturnItem.WAVEFORM_SERIES:
+                payload_kwargs["waveform_series"] = _as_read_only_array(
+                    waveform_series
+                )
+            case ReturnItem.IQ_SERIES:
+                payload_kwargs["iq_series"] = _as_read_only_array(iq_series)
+            case ReturnItem.AVERAGED_WAVEFORM:
+                averaged_waveform = np.sum(waveform_series, axis=0) / float(
+                    config.n_shots
+                )
+                payload_kwargs["averaged_waveform"] = _as_read_only_array(
+                    averaged_waveform
+                )
+            case ReturnItem.AVERAGED_IQ:
+                averaged_iq = np.asarray(np.sum(iq_series) / float(config.n_shots))
+                payload_kwargs["averaged_iq"] = _as_read_only_array(averaged_iq)
+            case ReturnItem.STATE_SERIES:
+                payload_kwargs["state_series"] = _as_read_only_array(
+                    self._classify_iq_series(
+                        iq_series,
+                        quel1_options=quel1_options,
+                    )
+                )
+
+        if config.state_classification and "state_series" not in payload_kwargs:
+            payload_kwargs["state_series"] = _as_read_only_array(
+                self._classify_iq_series(
+                    iq_series,
+                    quel1_options=quel1_options,
+                )
+            )
+
+        return CaptureData(
+            target=target,
+            config=config,
+            payload=CapturePayload(**payload_kwargs),
+            sampling_period=sampling_period,
+        )
+
+    @staticmethod
+    def _normalize_raw_waveform_series(
+        raw: object,
+        *,
+        n_shots: int,
+        norm_factor: float,
+    ) -> np.ndarray:
+        """Return raw capture payload as `(n_shots, capture_length)`."""
+        array = np.asarray(raw, dtype=np.complex128) * norm_factor
+        if array.ndim == 0:
+            raise ValueError("QuEL-1 raw waveform capture must not be scalar.")
+        if array.ndim == 1:
+            if n_shots == 1:
+                return array.reshape(1, -1)
+            if array.size % n_shots == 0:
+                return array.reshape(n_shots, -1)
+            raise ValueError(
+                "QuEL-1 raw waveform capture must include one waveform per shot."
+            )
+        if array.shape[0] != n_shots:
+            raise ValueError(
+                "QuEL-1 raw waveform capture shot axis length must match n_shots."
+            )
+        return array.reshape(n_shots, -1)
+
+    @staticmethod
+    def _demodulate_waveform_series(
+        waveform_series: np.ndarray,
+        *,
+        frequency: float,
+        sampling_period: float,
+    ) -> np.ndarray:
+        """Software-demodulate waveform shots with a capture-local NCO phase."""
+        sample_index = np.arange(waveform_series.shape[1], dtype=np.float64)
+        phase = np.exp(-1j * 2.0 * np.pi * frequency * sampling_period * sample_index)
+        return waveform_series * phase.reshape(1, -1)
+
+    @staticmethod
+    def _classify_iq_series(
+        iq_series: np.ndarray,
+        *,
+        quel1_options: Quel1MeasurementOptions | None,
+    ) -> np.ndarray:
+        """Classify IQ series with QuEL-1 line parameters in software."""
+        line_param0 = (
+            None
+            if quel1_options is None
+            else quel1_options.classification_line_param0
+        )
+        line_param1 = (
+            None
+            if quel1_options is None
+            else quel1_options.classification_line_param1
+        )
+        if line_param0 is None:
+            line_param0 = (1.0, 0.0, 0.0)
+        if line_param1 is None:
+            line_param1 = (0.0, 1.0, 0.0)
+
+        x = np.real(iq_series)
+        y = np.imag(iq_series)
+        a0, b0, c0 = line_param0
+        a1, b1, c1 = line_param1
+        bit0 = (a0 * x + b0 * y + c0 >= 0.0).astype(np.int64)
+        bit1 = (a1 * x + b1 * y + c1 >= 0.0).astype(np.int64)
+        return bit0 + 2 * bit1
+
+    def _resolve_result_demodulation_frequency(
+        self,
+        *,
+        target: str,
+        schedule: MeasurementSchedule | None,
+    ) -> float:
+        """Resolve software demodulation frequency for a result target."""
+        schedule_frequency = None
+        if schedule is not None:
+            schedule_frequency = self._resolve_schedule_frequency(
+                pulse_schedule=schedule.pulse_schedule,
+                target=target,
+            )
+        return self._resolve_modulation_frequency(
+            target=target,
+            schedule_frequency=schedule_frequency,
         )
 
     def _resolve_resource_lookup_target(self, target: str) -> str:
@@ -642,7 +755,7 @@ class Quel1MeasurementBackendAdapter:
 
         try:
             return float(self._experiment_system.get_awg_frequency(target))
-        except (KeyError, ValueError):
+        except (AttributeError, KeyError, ValueError):
             pass
 
         nco_frequency = self._resolve_nco_frequency(target=target)
