@@ -1848,7 +1848,7 @@ def test_dual_readout_group0_splits_edge_resonator_to_second_adc(
         params_dir / "resonator_frequency.yaml",
         {
             "meta": {"unit": "MHz"},
-            "data": {"Q0": 8000, "Q1": 8100, "Q2": 8200, "Q3": 8900},
+            "data": {"Q0": 8000, "Q1": 8100, "Q2": 8200, "Q3": 8800},
         },
     )
 
@@ -1868,11 +1868,16 @@ def test_dual_readout_group0_splits_edge_resonator_to_second_adc(
     assert read_out_port.n_channels == 2
     assert read_in_port.n_channels == 5
     assert donor_ctrl_port.n_channels == 2
-    assert read_out_port.channels[0].cnco_freq != read_out_port.channels[1].cnco_freq
+    assert read_out_port.channels[0].cnco_freq == read_out_port.channels[1].cnco_freq
     assert read_out_port.channels[0].fnco_freq == 0
-    assert read_out_port.channels[1].fnco_freq == 0
+    assert read_out_port.channels[1].fnco_freq is not None
     assert read_in_port.channels[0].cnco_freq == read_out_port.channels[0].cnco_freq
-    assert read_in_port.channels[4].cnco_freq == read_out_port.channels[1].cnco_freq
+    assert read_in_port.channels[4].cnco_freq != read_out_port.channels[1].cnco_freq
+    assert (
+        read_out_port.channels[1].fnco_freq
+        == read_in_port.channels[4].cnco_freq - read_out_port.channels[1].cnco_freq
+    )
+    assert abs(read_out_port.channels[1].fnco_freq) > 500_000_000
     assert read_in_port.channels[0].fnco_freq == 0
     assert read_in_port.channels[4].fnco_freq == 0
 

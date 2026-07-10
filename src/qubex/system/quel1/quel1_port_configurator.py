@@ -221,11 +221,6 @@ def create_readout_port_configuration(
         ssb=ssb,
         cnco_center=cnco_center,
     )
-    port_cnco, _ = MixingUtil.calc_cnco_for_lo(
-        f=f_target,
-        ssb=ssb,
-        lo=lo,
-    )
 
     lanes = split_readout_resonators(resonators, n_lanes=n_lanes)
     channels: dict[int, ReadoutChannelConfig] = {}
@@ -242,7 +237,7 @@ def create_readout_port_configuration(
             "fnco": 0,
             "resonators": [resonator.label for resonator in lane_resonators],
         }
-    return {"lo": lo, "cnco": port_cnco, "channels": channels}
+    return {"lo": lo, "cnco": channels[0]["cnco"], "channels": channels}
 
 
 def split_readout_resonators(

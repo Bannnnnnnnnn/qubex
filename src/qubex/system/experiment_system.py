@@ -39,6 +39,7 @@ from .quel1.quel1_system_constants import (
     DEFAULT_CNCO_FREQUENCY_HZ,
     DEFAULT_FNCO_FREQUENCY_HZ,
     DEFAULT_LO_FREQUENCY_HZ,
+    FNCO_MAX_HZ,
 )
 from .target import CapTarget, Target
 from .target_registry import TargetRegistry
@@ -690,6 +691,18 @@ class ExperimentSystem:
         port.fullscale_current = params.get_readout_fsc(mux.index)
         for idx, gen_channel in enumerate(port.channels):
             channel_config = config["channels"].get(idx, config["channels"][0])
+            if n_lanes > 1:
+                # QuEL-1 dual readout output adds a second FDUC to the readout
+                # DAC, so the two output lanes share one DAC/CDUC CNCO.
+                fnco_freq = channel_config["cnco"] - port.cnco_freq
+                if abs(fnco_freq) > FNCO_MAX_HZ:
+                    raise ValueError(
+                        f"Dual-readout lane center offset {fnco_freq} Hz exceeds "
+                        f"the QuEL-1 FNCO range +/-{FNCO_MAX_HZ} Hz for port {port.id}."
+                    )
+                gen_channel.cnco_freq_override = port.cnco_freq
+                gen_channel.fnco_freq = fnco_freq + channel_config["fnco"]
+                continue
             gen_channel.cnco_freq_override = channel_config["cnco"]
             gen_channel.fnco_freq = channel_config["fnco"]
 

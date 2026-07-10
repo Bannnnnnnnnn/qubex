@@ -32,8 +32,8 @@ def test_get_boxes_to_configure_selects_only_quel1_family_boxes() -> None:
     assert get_boxes_to_configure([quel1_box, quel3_box]) == [quel1_box]
 
 
-def test_dual_readout_port_cnco_covers_all_readout_tones() -> None:
-    """Given 3+1 dual readout, the shared output port CNCO is centered across all tones."""
+def test_dual_readout_port_cnco_uses_primary_lane_center() -> None:
+    """Given 3+1 dual readout, the shared output CNCO is centered on the primary lane."""
     resonators = (
         Resonator(
             index=16,
@@ -75,7 +75,7 @@ def test_dual_readout_port_cnco_covers_all_readout_tones() -> None:
     )
 
     assert config["lo"] == 9_000_000_000
-    assert config["cnco"] == 1_289_062_500
+    assert config["cnco"] == 1_382_812_500
     assert config["channels"][0]["cnco"] == 1_382_812_500
     assert config["channels"][0]["resonators"] == ["RQ16", "RQ18", "RQ17"]
     assert config["channels"][1]["cnco"] == 1_078_125_000
