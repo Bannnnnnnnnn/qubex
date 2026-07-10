@@ -22,6 +22,8 @@ class _FakeBox:
         self.boxtype = boxtype
         self._input_ports = input_ports
         self.config_port_calls: list[dict[str, Any]] = []
+        self.config_channel_calls: list[dict[str, Any]] = []
+        self.config_runit_calls: list[dict[str, Any]] = []
         self.dump_port_calls: list[Port] = []
 
     def get_input_ports(self) -> tuple[Port, ...]:
@@ -32,10 +34,76 @@ class _FakeBox:
         """Record config_port kwargs."""
         self.config_port_calls.append(kwargs)
 
+    def config_channel(self, **kwargs: Any) -> None:
+        """Record config_channel kwargs."""
+        self.config_channel_calls.append(kwargs)
+
+    def config_runit(self, **kwargs: Any) -> None:
+        """Record config_runit kwargs."""
+        self.config_runit_calls.append(kwargs)
+
     def dump_port(self, port: Port) -> dict[str, Any]:
         """Record dump_port calls."""
         self.dump_port_calls.append(port)
         return {}
+
+
+class _FakeAd9082:
+    def __init__(self) -> None:
+        self.adc_cnco_calls: list[tuple[set[int], str]] = []
+
+    def set_adc_cnco(self, adc_indices: set[int], ftw: str) -> None:
+        """Record selected ADC CNCO writes."""
+        self.adc_cnco_calls.append((set(adc_indices), ftw))
+
+
+class _FakeDualReadoutCss:
+    _DUAL_READOUT_SECONDARY_CDDC = 1
+
+    def __init__(self) -> None:
+        self.ad9082 = {0: _FakeAd9082()}
+
+    def get_adc_idx(self, group: int, rline: str) -> tuple[int, int]:
+        """Return the primary CDDC."""
+        assert (group, rline) == (1, "r")
+        return 0, 3
+
+    def is_dual_readout_mode_enabled(self, group: int, rline: str) -> bool:
+        """Return dual-readout status."""
+        assert (group, rline) == (1, "r")
+        return True
+
+    def _validate_frequency_info(
+        self,
+        mxfe_idx: int,
+        freq_type: str,
+        freq_in_hz: int,
+        ftw: None,
+    ) -> tuple[int, str]:
+        """Return a fake FTW for assertions."""
+        assert mxfe_idx == 0
+        assert freq_type == "adc_cnco"
+        assert ftw is None
+        return freq_in_hz, f"ftw:{freq_in_hz}"
+
+
+class _FakeDualReadoutDev:
+    def _get_rchannel_from_runit(self, group: int, rline: str, runit: int) -> int:
+        """Map the 3+1 dual-readout runits to two rchannels."""
+        assert (group, rline) == (1, "r")
+        return 1 if runit == 4 else 0
+
+
+class _FakeDualReadoutBox(_FakeBox):
+    def __init__(self) -> None:
+        super().__init__(boxtype="quel1-a")
+        self.css = _FakeDualReadoutCss()
+        self._dev = _FakeDualReadoutDev()
+
+    def _convert_input_port(self, port: Port) -> tuple[int, str]:
+        """Return group/rline for the dual-readout read-in port."""
+        assert port == 7
+        return 1, "r"
 
 
 class _BoxPoolStub:
@@ -116,4 +184,28 @@ def test_r8_config_port_filters_only_unsupported_mixer_fields(
             "fullscale_current": 16383,
             "rfswitch": "pass",
         }
+    ]
+
+
+def test_config_runit_sets_dual_readout_secondary_adc_cnco() -> None:
+    """Given a 3+1 dual-readout runit, when syncing CNCO, then CDDC1 is configured."""
+    box = _FakeDualReadoutBox()
+    runtime_context = _RuntimeContextStub(box)
+    manager = Quel1ConfigurationManager(
+        runtime_context=cast(Quel1RuntimeContext, runtime_context)
+    )
+
+    manager.config_runit(
+        box_name="B0",
+        port=7,
+        runit=4,
+        cnco_freq_hz=1_078_125_000,
+        fnco_freq_hz=0,
+    )
+
+    assert box.css.ad9082[0].adc_cnco_calls == [
+        ({1}, "ftw:1078125000"),
+    ]
+    assert box.config_runit_calls == [
+        {"port": 7, "runit": 4, "fnco_freq": 0},
     ]

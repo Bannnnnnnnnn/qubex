@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from qubex.system.control_system import Box
-from qubex.system.quantum_system import Qubit
+from qubex.system.quantum_system import Mux, Qubit, Resonator
 from qubex.system.quel1.quel1_port_configurator import (
     MixingUtil,
     create_control_configuration,
+    create_readout_port_configuration,
     get_boxes_to_configure,
 )
 
@@ -29,6 +30,56 @@ def test_get_boxes_to_configure_selects_only_quel1_family_boxes() -> None:
     )
 
     assert get_boxes_to_configure([quel1_box, quel3_box]) == [quel1_box]
+
+
+def test_dual_readout_port_cnco_covers_all_readout_tones() -> None:
+    """Given 3+1 dual readout, the shared output port CNCO is centered across all tones."""
+    resonators = (
+        Resonator(
+            index=16,
+            label="RQ16",
+            chip_id="chip",
+            qubit="Q16",
+            _readout_frequency=10.254,
+        ),
+        Resonator(
+            index=17,
+            label="RQ17",
+            chip_id="chip",
+            qubit="Q17",
+            _readout_frequency=10.512,
+        ),
+        Resonator(
+            index=18,
+            label="RQ18",
+            chip_id="chip",
+            qubit="Q18",
+            _readout_frequency=10.368,
+        ),
+        Resonator(
+            index=19,
+            label="RQ19",
+            chip_id="chip",
+            qubit="Q19",
+            _readout_frequency=10.068,
+        ),
+    )
+    mux = Mux(index=4, label="MUX04", chip_id="chip", resonators=resonators)
+
+    config = create_readout_port_configuration(
+        mux,
+        excluded_targets=[],
+        n_lanes=2,
+        ssb="U",
+        cnco_center=1_500_000_000,
+    )
+
+    assert config["lo"] == 9_000_000_000
+    assert config["cnco"] == 1_289_062_500
+    assert config["channels"][0]["cnco"] == 1_382_812_500
+    assert config["channels"][0]["resonators"] == ["RQ16", "RQ18", "RQ17"]
+    assert config["channels"][1]["cnco"] == 1_078_125_000
+    assert config["channels"][1]["resonators"] == ["RQ19"]
 
 
 def test_ge_ef_fh_two_channel_layout_shares_ef_and_fh_channel() -> None:

@@ -134,6 +134,8 @@ def test_sync_experiment_system_cache_preserves_channel_cnco() -> None:
     class _BackendController:
         def __init__(self) -> None:
             self.box_config_cache: dict[str, dict[str, Any]] = {}
+            self.config_channel_calls: list[dict[str, Any]] = []
+            self.config_runit_calls: list[dict[str, Any]] = []
 
         def get_box(self, _: str) -> Any:
             return SimpleNamespace(is_dual_readout_enabled=lambda _port: True)
@@ -141,11 +143,11 @@ def test_sync_experiment_system_cache_preserves_channel_cnco() -> None:
         def config_port(self, **_: Any) -> None:
             return None
 
-        def config_channel(self, **_: Any) -> None:
-            return None
+        def config_channel(self, **kwargs: Any) -> None:
+            self.config_channel_calls.append(dict(kwargs))
 
-        def config_runit(self, **_: Any) -> None:
-            return None
+        def config_runit(self, **kwargs: Any) -> None:
+            self.config_runit_calls.append(dict(kwargs))
 
         def update_box_config_cache(self, box_configs: dict[str, dict[str, Any]]) -> None:
             self.box_config_cache.update(box_configs)
@@ -191,6 +193,70 @@ def test_sync_experiment_system_cache_preserves_channel_cnco() -> None:
     ports_cache = backend_controller.box_config_cache["B0"]["ports"]
     assert ports_cache[1]["channels"][1]["cnco_freq"] == 2_000_000_000
     assert ports_cache[0]["runits"][4]["cnco_freq"] == 2_000_000_000
+    assert backend_controller.config_channel_calls[1]["cnco_freq_hz"] == 2_000_000_000
+    assert backend_controller.config_runit_calls[4]["cnco_freq_hz"] == 2_000_000_000
+
+
+def test_fetch_backend_settings_overlays_model_runit_cnco() -> None:
+    """Given hardware dumps without runit CNCOs, when fetched, then model CNCOs are retained."""
+
+    class _BackendController:
+        def dump_box(self, box_id: str) -> dict[str, Any]:
+            assert box_id == "B0"
+            return {
+                "ports": {
+                    1: {
+                        "direction": "out",
+                        "cnco_freq": 1_000_000_000,
+                        "channels": {
+                            0: {"fnco_freq": 0},
+                            1: {"fnco_freq": 0},
+                        },
+                    },
+                    0: {
+                        "direction": "in",
+                        "cnco_freq": 1_000_000_000,
+                        "runits": {
+                            0: {"fnco_freq": 0},
+                            4: {"fnco_freq": 0},
+                        },
+                    },
+                }
+            }
+
+    box = Box.new(
+        id="B0",
+        name="BOX0",
+        type="quel1-a",
+        address="127.0.0.1",
+        adapter="A0",
+        port_numbers=[0, 1],
+        options=["dual_readout_group0"],
+    )
+    read_out_port = box.get_port(1)
+    read_in_port = box.get_port(0)
+    assert isinstance(read_out_port, GenPort)
+    assert isinstance(read_in_port, CapPort)
+    read_out_port.cnco_freq = 1_000_000_000
+    read_out_port.channels[0].cnco_freq_override = 1_000_000_000
+    read_out_port.channels[1].cnco_freq_override = 2_000_000_000
+    read_in_port.cnco_freq = 1_000_000_000
+    read_in_port.channels[0].cnco_freq_override = 1_000_000_000
+    read_in_port.channels[4].cnco_freq_override = 2_000_000_000
+
+    synchronizer = Quel1SystemSynchronizer(
+        backend_controller=cast(Any, _BackendController())
+    )
+
+    fetched = synchronizer.fetch_backend_settings_from_hardware(
+        experiment_system=cast(Any, SimpleNamespace(get_box=lambda _box_id: box)),
+        box_ids=["B0"],
+        parallel=False,
+    )
+
+    ports = fetched["B0"]["ports"]
+    assert "cnco_freq" not in ports[1]["channels"][1]
+    assert ports[0]["runits"][4]["cnco_freq"] == 2_000_000_000
 
 
 def test_sync_experiment_system_relinks_dual_readout_before_push() -> None:

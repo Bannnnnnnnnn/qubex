@@ -644,8 +644,10 @@ def test_modified_backend_settings_initializes_shared_read_box_once(
             box_name: str,
             port: int,
             channel: int,
+            cnco_freq_hz: int | None = None,
             fnco_freq_hz: int,
         ) -> None:
+            _ = cnco_freq_hz
             self._cache[box_name]["ports"][port]["channels"][channel]["fnco_freq"] = (
                 fnco_freq_hz
             )
@@ -656,8 +658,10 @@ def test_modified_backend_settings_initializes_shared_read_box_once(
             box_name: str,
             port: int,
             runit: int,
+            cnco_freq_hz: int | None = None,
             fnco_freq_hz: int,
         ) -> None:
+            _ = cnco_freq_hz
             self._cache[box_name]["ports"][port]["runits"][runit]["fnco_freq"] = (
                 fnco_freq_hz
             )

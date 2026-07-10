@@ -248,6 +248,7 @@ class Quel1SystemSynchronizer:
                 box_config = self._backend_controller.dump_box(box.id)
                 if self._is_valid_dumped_box_config(box.id, box_config):
                     result[box.id] = box_config
+            self._overlay_channel_cnco_from_model(boxes=boxes, box_configs=result)
             return result
 
         raw_result = run_parallel_map(
@@ -257,11 +258,13 @@ class Quel1SystemSynchronizer:
             as_completed_order=True,
             on_error=self._fallback_dump_box_result,
         )
-        return {
+        result = {
             box_id: box_config
             for box_id, box_config in raw_result.items()
             if self._is_valid_dumped_box_config(box_id, box_config)
         }
+        self._overlay_channel_cnco_from_model(boxes=boxes, box_configs=result)
+        return result
 
     def sync_backend_settings_to_backend_controller(
         self,
@@ -410,6 +413,7 @@ class Quel1SystemSynchronizer:
                     box_name=box.id,
                     port=port.number,
                     channel=gen_channel.number,
+                    cnco_freq_hz=gen_channel.cnco_freq,
                     fnco_freq_hz=gen_channel.fnco_freq,
                 )
         except Exception:
@@ -433,6 +437,7 @@ class Quel1SystemSynchronizer:
                     box_name=box.id,
                     port=port.number,
                     runit=cap_channel.number,
+                    cnco_freq_hz=cap_channel.cnco_freq,
                     fnco_freq_hz=cap_channel.fnco_freq,
                 )
         except Exception:
@@ -512,6 +517,64 @@ class Quel1SystemSynchronizer:
         if port.rfswitch is not None:
             port_cache["rfswitch"] = port.rfswitch
         return port_cache
+
+    def _overlay_channel_cnco_from_model(
+        self,
+        *,
+        boxes: Sequence[Box],
+        box_configs: dict[str, dict],
+    ) -> None:
+        """Overlay model channel CNCOs onto hardware dumps that omit them."""
+        model_ports_by_box = {
+            box.id: {
+                port.number: port
+                for port in box.ports
+                if isinstance(port.number, int)
+            }
+            for box in boxes
+        }
+        for box_id, box_config in box_configs.items():
+            ports_config = box_config.get("ports")
+            model_ports = model_ports_by_box.get(box_id, {})
+            if not isinstance(ports_config, dict):
+                continue
+            for port_number, port_config in ports_config.items():
+                if not isinstance(port_config, dict):
+                    continue
+                model_port = model_ports.get(port_number)
+                if model_port is None:
+                    continue
+                if port_config.get("direction") == "in":
+                    self._overlay_channel_cnco_for_key(
+                        port_config=port_config,
+                        model_port=model_port,
+                        channel_key="runits",
+                    )
+
+    @staticmethod
+    def _overlay_channel_cnco_for_key(
+        *,
+        port_config: dict[str, Any],
+        model_port: Any,
+        channel_key: str,
+    ) -> None:
+        channel_configs = port_config.get(channel_key)
+        if not isinstance(channel_configs, dict):
+            return
+        model_channels = {
+            channel.number: channel
+            for channel in getattr(model_port, "channels", ())
+            if isinstance(getattr(channel, "number", None), int)
+        }
+        for channel_number, channel_config in channel_configs.items():
+            if not isinstance(channel_config, dict):
+                continue
+            model_channel = model_channels.get(channel_number)
+            if model_channel is None:
+                continue
+            cnco_freq = Quel1SystemSynchronizer._optional_channel_cnco(model_channel)
+            if cnco_freq is not None:
+                channel_config["cnco_freq"] = cnco_freq
 
     @staticmethod
     def _optional_channel_cnco(channel: Any) -> int | None:

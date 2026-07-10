@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from qubex.backend.quel1.quel1_backend_constants import (
     DEFAULT_BACKGROUND_NOISE_THRESHOLD_AT_RECONNECT,
@@ -103,6 +103,7 @@ class Quel1ConfigurationManager:
         box_name: str,
         port: int | tuple[int, int],
         channel: int,
+        cnco_freq_hz: int | None,
         fnco_freq_hz: int | None,
     ) -> None:
         """Configure one box channel."""
@@ -110,6 +111,13 @@ class Quel1ConfigurationManager:
             box_name=box_name,
             reconnect=True,
         )
+        if cnco_freq_hz is not None:
+            self._config_channel_cnco(
+                box=box,
+                port=port,
+                channel=channel,
+                cnco_freq_hz=cnco_freq_hz,
+            )
         box.config_channel(
             port=port,
             channel=channel,
@@ -122,6 +130,7 @@ class Quel1ConfigurationManager:
         box_name: str,
         port: int | tuple[int, int],
         runit: int,
+        cnco_freq_hz: int | None,
         fnco_freq_hz: int | None,
     ) -> None:
         """Configure one box runit."""
@@ -129,6 +138,13 @@ class Quel1ConfigurationManager:
             box_name=box_name,
             reconnect=True,
         )
+        if cnco_freq_hz is not None:
+            self._config_runit_cnco(
+                box=box,
+                port=port,
+                runit=runit,
+                cnco_freq_hz=cnco_freq_hz,
+            )
         box.config_runit(
             port=port,
             runit=runit,
@@ -260,6 +276,163 @@ class Quel1ConfigurationManager:
     def clear_command_queue(self) -> None:
         """Clear qubecalib command queue."""
         self._runtime_context.qubecalib.clear_command_queue()
+
+    def _config_channel_cnco(
+        self,
+        *,
+        box: Quel1Box,
+        port: int | tuple[int, int],
+        channel: int,
+        cnco_freq_hz: int,
+    ) -> None:
+        """Apply channel CNCO when the underlying DAC CNCO is uniquely addressable."""
+        css = getattr(box, "css", None)
+        convert_output_port = getattr(box, "_convert_output_port", None)
+        if css is None or not callable(convert_output_port):
+            return
+        try:
+            group, line = convert_output_port(port)
+            mxfe_idx, fduc_idx = css.get_fduc_idx(group, line, channel)
+            dac_idx = self._find_dac_for_fduc(css=css, mxfe_idx=mxfe_idx, fduc_idx=fduc_idx)
+        except Exception:
+            logger.debug(
+                "Could not resolve DAC CNCO for port %s channel %s; skipping channel CNCO.",
+                port,
+                channel,
+                exc_info=True,
+            )
+            return
+
+        fducs_on_dac = tuple(css.ad9082[mxfe_idx].get_fduc_of_dac(dac_idx))
+        if len(fducs_on_dac) > 1:
+            logger.debug(
+                "Skipping channel CNCO for port %s channel %s because MxFE%s DAC-CNCO%s "
+                "is shared by FDUCs %s.",
+                port,
+                channel,
+                mxfe_idx,
+                dac_idx,
+                fducs_on_dac,
+            )
+            return
+
+        self._set_dac_cnco_indices(
+            css=css,
+            mxfe_idx=mxfe_idx,
+            dac_indices={dac_idx},
+            cnco_freq_hz=cnco_freq_hz,
+        )
+
+    def _config_runit_cnco(
+        self,
+        *,
+        box: Quel1Box,
+        port: int | tuple[int, int],
+        runit: int,
+        cnco_freq_hz: int,
+    ) -> None:
+        """Apply runit CNCO, including the secondary CDDC in dual-readout mode."""
+        css = getattr(box, "css", None)
+        dev = getattr(box, "_dev", None)
+        convert_input_port = getattr(box, "_convert_input_port", None)
+        if css is None or dev is None or not callable(convert_input_port):
+            return
+        try:
+            group, rline = convert_input_port(port)
+            rchannel = dev._get_rchannel_from_runit(group, rline, runit)
+            mxfe_idx, adc_idx = self._resolve_adc_cnco_index(
+                css=css,
+                group=group,
+                rline=rline,
+                rchannel=rchannel,
+            )
+        except Exception:
+            logger.debug(
+                "Could not resolve ADC CNCO for port %s runit %s; skipping runit CNCO.",
+                port,
+                runit,
+                exc_info=True,
+            )
+            return
+
+        self._set_adc_cnco_indices(
+            css=css,
+            mxfe_idx=mxfe_idx,
+            adc_indices={adc_idx},
+            cnco_freq_hz=cnco_freq_hz,
+        )
+
+    @staticmethod
+    def _find_dac_for_fduc(*, css: Any, mxfe_idx: int, fduc_idx: int) -> int:
+        """Return the DAC/CDUC containing one FDUC."""
+        for dac_idx in range(4):
+            if fduc_idx in css.ad9082[mxfe_idx].get_fduc_of_dac(dac_idx):
+                return dac_idx
+        raise ValueError(f"FDUC{fduc_idx} is not assigned to any DAC on MxFE{mxfe_idx}.")
+
+    @staticmethod
+    def _resolve_adc_cnco_index(
+        *,
+        css: Any,
+        group: int,
+        rline: str,
+        rchannel: int,
+    ) -> tuple[int, int]:
+        """Return the CDDC index for one capture rchannel."""
+        mxfe_idx, primary_adc_idx = css.get_adc_idx(group, rline)
+        if not css.is_dual_readout_mode_enabled(group, rline):
+            return mxfe_idx, primary_adc_idx
+        if rchannel == 0:
+            return mxfe_idx, primary_adc_idx
+        if rchannel == 1:
+            return mxfe_idx, int(css._DUAL_READOUT_SECONDARY_CDDC)
+        return mxfe_idx, primary_adc_idx
+
+    @staticmethod
+    def _set_dac_cnco_indices(
+        *,
+        css: Any,
+        mxfe_idx: int,
+        dac_indices: set[int],
+        cnco_freq_hz: int,
+    ) -> None:
+        """Set selected DAC/CDUC CNCO indices."""
+        freq_hz, ftw = css._validate_frequency_info(
+            mxfe_idx,
+            "dac_cnco",
+            cnco_freq_hz,
+            None,
+        )
+        logger.info(
+            "DAC-CNCO%s of MxFE%s is set to %sHz via channel override.",
+            sorted(dac_indices),
+            mxfe_idx,
+            freq_hz,
+        )
+        css.ad9082[mxfe_idx].set_dac_cnco(dac_indices, ftw)
+
+    @staticmethod
+    def _set_adc_cnco_indices(
+        *,
+        css: Any,
+        mxfe_idx: int,
+        adc_indices: set[int],
+        cnco_freq_hz: int,
+    ) -> None:
+        """Set selected ADC/CDDC CNCO indices."""
+        freq_hz, ftw = css._validate_frequency_info(
+            mxfe_idx,
+            "adc_cnco",
+            cnco_freq_hz,
+            None,
+        )
+        logger.info(
+            "ADC-CNCO%s of MxFE%s is set to %sHz via runit override.",
+            sorted(adc_indices),
+            mxfe_idx,
+            freq_hz,
+        )
+        css.ad9082[mxfe_idx].set_adc_cnco(adc_indices, ftw)
 
     def get_resource_map(self, *, targets: list[str]) -> dict[str, list[dict]]:
         """Build a resource map for selected targets from system config database."""

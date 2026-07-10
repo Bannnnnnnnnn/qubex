@@ -893,6 +893,7 @@ This operation will overwrite the existing backend settings. Do you want to cont
             box_name=port.box_id,
             port=port.number,
             channel=channel.number,
+            cnco_freq_hz=cnco_freq,
             fnco_freq_hz=fnco_freq,
         )
         port_cache = box_cache[port.box_id]["ports"][port.number]
@@ -917,6 +918,7 @@ This operation will overwrite the existing backend settings. Do you want to cont
                 box_name=cap_port.box_id,
                 port=cap_port.number,
                 runit=cap_channel.number,
+                cnco_freq_hz=cnco_freq,
                 fnco_freq_hz=fnco_freq,
             )
             cap_port_cache = box_cache[cap_port.box_id]["ports"][cap_port.number]
@@ -956,6 +958,7 @@ This operation will overwrite the existing backend settings. Do you want to cont
                 box_name=port.box_id,
                 port=port.number,
                 channel=channel.number,
+                cnco_freq_hz=original_cnco_freq,
                 fnco_freq_hz=original_fnco_freq,
             )
             if target.is_read:
@@ -969,6 +972,7 @@ This operation will overwrite the existing backend settings. Do you want to cont
                     box_name=cap_port.box_id,
                     port=cap_port.number,
                     runit=cap_channel.number,
+                    cnco_freq_hz=original_cnco_freq,
                     fnco_freq_hz=original_fnco_freq,
                 )
 
