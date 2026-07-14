@@ -51,6 +51,87 @@ class _FakeBox:
         return {"box": self.name}
 
 
+_BASE_ADC_MAPPING = [0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 8, 9, 12, 13, 14, 15]
+_DUAL_ADC_MAPPING = [0, 1, 2, 3, 4, 5, 6, 7, 2, 3, 10, 11, 12, 13, 14, 15]
+_DUAL_DAC_ASSIGNMENT = ((2, 0), (1,), (4, 3), (7, 6, 5))
+
+
+class _FakeAd9082:
+    _DUAL_READOUT_PRIMARY_FDDC = 5
+    _DUAL_READOUT_SECONDARY_FDDC = 1
+    _DUAL_READOUT_PRIMARY_VC_PAIR = 5
+    _DUAL_READOUT_SECONDARY_VC_PAIR = 4
+
+    def __init__(self, dac_assignment: tuple[tuple[int, ...], ...]) -> None:
+        self._dac_assignment = dac_assignment
+
+    def get_fduc_of_dac(self, dac: int) -> tuple[int, ...]:
+        """Return the configured FDUCs for one DAC."""
+        return self._dac_assignment[dac]
+
+
+class _FakeCss:
+    def __init__(
+        self,
+        *,
+        dac_assignment: tuple[tuple[int, ...], ...],
+        adc_mapping: list[int],
+    ) -> None:
+        self.ad9082 = [_FakeAd9082(dac_assignment)]
+        self._adc_mapping = adc_mapping
+
+    def get_adc_idx(self, group: int, rline: str) -> tuple[int, int]:
+        """Map the fake readout group to its only MxFE."""
+        assert group == 0
+        assert rline == "r"
+        return 0, 0
+
+    def get_virtual_adc_select(self, mxfe_idx: int) -> list[int]:
+        """Return the configured virtual ADC mapping."""
+        assert mxfe_idx == 0
+        return list(self._adc_mapping)
+
+
+class _FakeIntrinsic:
+    def _load_config_parameter(self, **_kwargs: Any) -> dict[str, Any]:
+        """Return the expected relinkup configuration."""
+        return {
+            "ad9082": [
+                {
+                    "dac": {
+                        "channel_assign": {
+                            f"dac{dac}": list(channels)
+                            for dac, channels in enumerate(_DUAL_DAC_ASSIGNMENT)
+                        }
+                    },
+                    "adc": {"converter_mappings": [list(_BASE_ADC_MAPPING)]},
+                }
+            ]
+        }
+
+
+class _InspectableFakeBox(_FakeBox):
+    def __init__(
+        self,
+        name: str,
+        *,
+        link_ok: bool = True,
+        dac_assignment: tuple[tuple[int, ...], ...] = _DUAL_DAC_ASSIGNMENT,
+        adc_mapping: list[int] | None = None,
+    ) -> None:
+        super().__init__(name)
+        self._link_ok = link_ok
+        self.css = _FakeCss(
+            dac_assignment=dac_assignment,
+            adc_mapping=adc_mapping or _DUAL_ADC_MAPPING,
+        )
+        self._dev = _FakeIntrinsic()
+
+    def link_status(self) -> dict[int, bool]:
+        """Return the configured link state."""
+        return {0: self._link_ok}
+
+
 class _FakeBoxPool:
     def __init__(self) -> None:
         self._boxes: dict[str, tuple[_FakeBox, object]] = {}
@@ -353,3 +434,81 @@ def test_connect_relinks_dual_readout_boxes_before_building_system(monkeypatch) 
     ]
     assert len(box.reconnect_calls) == 2
     assert events == ["create_system:['A']", "resource:cap", "resource:gen"]
+
+
+def test_connect_skips_relink_for_matching_dual_readout_hardware(monkeypatch) -> None:
+    """Given matching dual-readout hardware, connect preserves the existing link."""
+    controller = _make_controller()
+    box = _InspectableFakeBox("A")
+    boxpool = _FakeBoxPool()
+    boxpool._boxes["A"] = (box, object())
+    controller.set_box_options({"A": ("dual_readout_group0",)})
+    monkeypatch.setattr(
+        controller._runtime_context, "validate_box_availability", lambda _: None
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "create_boxpool",
+        lambda *_args, **_kwargs: boxpool,
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_create_quel1system_from_boxpool",
+        lambda _box_names: object(),
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_create_resource_map",
+        lambda _kind: {},
+    )
+
+    controller.connect(["A"])
+
+    assert box.relinkup_calls == []
+    assert box.reconnect_calls == []
+
+
+@pytest.mark.parametrize(
+    ("box"),
+    [
+        _InspectableFakeBox("A", link_ok=False),
+        _InspectableFakeBox(
+            "A",
+            dac_assignment=((0,), (1,), (4, 3), (7, 6, 5)),
+        ),
+        _InspectableFakeBox("A", adc_mapping=_BASE_ADC_MAPPING),
+    ],
+    ids=["link-down", "dac-mismatch", "adc-mismatch"],
+)
+def test_connect_relinks_for_invalid_dual_readout_hardware(
+    monkeypatch,
+    box: _InspectableFakeBox,
+) -> None:
+    """Given invalid dual-readout hardware, connect repairs it with relinkup."""
+    controller = _make_controller()
+    boxpool = _FakeBoxPool()
+    boxpool._boxes["A"] = (box, object())
+    controller.set_box_options({"A": ("dual_readout_group0",)})
+    monkeypatch.setattr(
+        controller._runtime_context, "validate_box_availability", lambda _: None
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "create_boxpool",
+        lambda *_args, **_kwargs: boxpool,
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_create_quel1system_from_boxpool",
+        lambda _box_names: object(),
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_create_resource_map",
+        lambda _kind: {},
+    )
+
+    controller.connect(["A"])
+
+    assert len(box.relinkup_calls) == 1
+    assert len(box.reconnect_calls) == 1

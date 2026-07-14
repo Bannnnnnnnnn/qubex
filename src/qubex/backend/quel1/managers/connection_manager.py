@@ -269,25 +269,162 @@ class Quel1ConnectionManager:
         *,
         box_names: list[str],
     ) -> None:
-        dual_readout_box_names = [
-            box_name
+        dual_readout_groups_by_box = {
+            box_name: groups
             for box_name in box_names
-            if resolve_dual_readout_groups_from_labels(
-                self._runtime_context.box_options.get(box_name, ())
+            if (
+                groups := resolve_dual_readout_groups_from_labels(
+                    self._runtime_context.box_options.get(box_name, ())
+                )
             )
-        ]
-        if not dual_readout_box_names:
+        }
+        if not dual_readout_groups_by_box:
+            return
+
+        relink_box_names: list[str] = []
+        preserved_box_names: list[str] = []
+        for box_name, groups in dual_readout_groups_by_box.items():
+            if self._is_dual_readout_hardware_ready(
+                box_name=box_name,
+                groups=groups,
+            ):
+                preserved_box_names.append(box_name)
+            else:
+                relink_box_names.append(box_name)
+
+        if preserved_box_names:
+            logger.info(
+                "Preserving existing dual-readout links during connect: %s",
+                preserved_box_names,
+            )
+        if not relink_box_names:
             return
 
         logger.info(
             "Relinking dual-readout boxes during connect: %s",
-            dual_readout_box_names,
+            relink_box_names,
         )
         self.relinkup_boxes(
-            box_list=dual_readout_box_names,
+            box_list=relink_box_names,
             noise_threshold=None,
             parallel=False,
         )
+
+    def _is_dual_readout_hardware_ready(
+        self,
+        *,
+        box_name: str,
+        groups: Collection[int],
+    ) -> bool:
+        """Return whether hardware already has the requested dual-readout links."""
+        try:
+            return self._inspect_dual_readout_hardware(
+                box_name=box_name,
+                groups=groups,
+            )
+        except Exception:
+            logger.warning(
+                "Could not verify dual-readout hardware for box %s; "
+                "falling back to relinkup.",
+                box_name,
+                exc_info=True,
+            )
+            return False
+
+    def _inspect_dual_readout_hardware(
+        self,
+        *,
+        box_name: str,
+        groups: Collection[int],
+    ) -> bool:
+        """Compare live links and AD9082 routing with the requested box config."""
+        box: Any = self._get_existing_or_create_box(
+            box_name=box_name,
+            reconnect=False,
+        )
+        link_status = box.link_status()
+        if not isinstance(link_status, Mapping) or not link_status:
+            return False
+        if not all(bool(link_ok) for link_ok in link_status.values()):
+            return False
+
+        config_options = self._resolve_config_options(
+            box_name=box_name,
+            boxtype=box.boxtype,
+        )
+        expected_config = box._dev._load_config_parameter(config_options=config_options)
+        if not isinstance(expected_config, Mapping):
+            return False
+        ad9082_configs = expected_config.get("ad9082")
+        if not isinstance(ad9082_configs, list) or not ad9082_configs:
+            return False
+
+        # Quelware applies the requested ADC route while constructing a fresh box,
+        # but the matching DAC/FDUC route is established only by relinkup.  Check
+        # both live mappings so a newly created client cannot mistake a partial
+        # configuration for a reusable dual-readout link.
+        css = box.css
+        ad9082_devices = css.ad9082
+        if len(ad9082_devices) != len(ad9082_configs):
+            return False
+        dual_mxfe_indices = {int(css.get_adc_idx(group, "r")[0]) for group in groups}
+        if not dual_mxfe_indices.issubset(range(len(ad9082_configs))):
+            return False
+
+        for mxfe_idx, mxfe_config in enumerate(ad9082_configs):
+            if not isinstance(mxfe_config, Mapping):
+                return False
+            ad9082 = ad9082_devices[mxfe_idx]
+            expected_dac_assignment = self._expected_dac_assignment(mxfe_config)
+            actual_dac_assignment = tuple(
+                tuple(ad9082.get_fduc_of_dac(dac_idx)) for dac_idx in range(4)
+            )
+            if actual_dac_assignment != expected_dac_assignment:
+                return False
+
+            expected_adc_mapping = self._expected_adc_mapping(
+                mxfe_config=mxfe_config,
+                ad9082=ad9082,
+                dual_readout=mxfe_idx in dual_mxfe_indices,
+            )
+            actual_adc_mapping = list(css.get_virtual_adc_select(mxfe_idx))
+            if actual_adc_mapping != expected_adc_mapping:
+                return False
+        return True
+
+    @staticmethod
+    def _expected_dac_assignment(
+        mxfe_config: Mapping[str, Any],
+    ) -> tuple[tuple[int, ...], ...]:
+        """Extract the expected FDUC assignment for all four DACs."""
+        channel_assign = mxfe_config["dac"]["channel_assign"]
+        return tuple(
+            tuple(int(channel) for channel in channel_assign[f"dac{dac_idx}"])
+            for dac_idx in range(4)
+        )
+
+    @staticmethod
+    def _expected_adc_mapping(
+        *,
+        mxfe_config: Mapping[str, Any],
+        ad9082: Any,
+        dual_readout: bool,
+    ) -> list[int]:
+        """Build the expected virtual ADC mapping for one MxFE."""
+        converter_mappings = mxfe_config["adc"]["converter_mappings"]
+        expected_mapping = [int(value) for value in converter_mappings[0]]
+        if not dual_readout:
+            return expected_mapping
+
+        for pair_attr, fddc_attr in (
+            ("_DUAL_READOUT_SECONDARY_VC_PAIR", "_DUAL_READOUT_SECONDARY_FDDC"),
+            ("_DUAL_READOUT_PRIMARY_VC_PAIR", "_DUAL_READOUT_PRIMARY_FDDC"),
+        ):
+            vc_pair = int(getattr(ad9082, pair_attr))
+            fddc = int(getattr(ad9082, fddc_attr))
+            expected_mapping[2 * vc_pair] = 2 * fddc
+            expected_mapping[2 * vc_pair + 1] = 2 * fddc + 1
+        return expected_mapping
 
     def requires_reconnect(self, box_names: str | list[str] | None) -> bool:
         """Return whether connecting these boxes would rebuild runtime state."""
