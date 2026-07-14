@@ -7,6 +7,7 @@ from typing import Any, cast
 
 import numpy as np
 from numpy.testing import assert_allclose
+from qxdriver_quel1.e7awg import CaptureParamTools
 
 from qubex.backend.quel1 import Quel1BackendExecutionResult
 from qubex.measurement.adapters.backend_adapter import Quel1MeasurementBackendAdapter
@@ -49,7 +50,7 @@ def _make_config(
 
 def test_build_measurement_result_converts_single_mode_to_qubit_labels() -> None:
     """Given QuEL-1 waveform shots, conversion should expose canonical waveform-series data."""
-    norm_factor = 2 ** (-32)
+    norm_factor = 2 ** (-16)
     backend_result = Quel1BackendExecutionResult(
         status={},
         data={
@@ -98,7 +99,7 @@ def test_build_measurement_result_converts_single_mode_to_qubit_labels() -> None
 
 def test_build_measurement_result_converts_avg_mode_with_shot_scaling() -> None:
     """Given QuEL-1 raw shots, avg mode should average waveforms in software."""
-    norm_factor = 2 ** (-32)
+    norm_factor = 2 ** (-16)
     backend_result = Quel1BackendExecutionResult(
         status={},
         data={
@@ -145,7 +146,7 @@ def test_build_measurement_result_keeps_single_point_avg_mode_as_length_one_wave
     None
 ):
     """Given one averaged waveform sample, conversion should keep a length-one waveform axis."""
-    norm_factor = 2 ** (-32)
+    norm_factor = 2 ** (-16)
     backend_result = Quel1BackendExecutionResult(
         status={},
         data={
@@ -188,11 +189,9 @@ def test_build_measurement_result_keeps_single_point_avg_mode_as_length_one_wave
     )
 
 
-def test_build_measurement_result_software_integrates_single_mode_to_1d() -> (
-    None
-):
+def test_build_measurement_result_software_integrates_single_mode_to_1d() -> None:
     """Given raw waveform shots, time integration should sum each shot in software."""
-    norm_factor = 2 ** (-32)
+    norm_factor = 2 ** (-16)
     backend_result = Quel1BackendExecutionResult(
         status={},
         data={
@@ -240,11 +239,11 @@ def test_build_measurement_result_software_integrates_single_mode_to_1d() -> (
 def test_build_measurement_result_software_demodulates_before_summing(
     monkeypatch,
 ) -> None:
-    """Given raw carrier shots, conversion should demodulate before integration."""
-    norm_factor = 2 ** (-32)
-    frequency = 0.25
-    sample_index = np.arange(4, dtype=np.float64)
-    carrier = np.exp(1j * 2.0 * np.pi * frequency * sample_index)
+    """Given raw carrier shots, conversion should emulate QuEL-1 capture DSP."""
+    norm_factor = 2 ** (-16)
+    frequency = 0.125
+    sample_index = np.arange(64, dtype=np.float64)
+    carrier = np.exp(1j * 2.0 * np.pi * frequency * 2.0 * sample_index)
     backend_result = Quel1BackendExecutionResult(
         status={},
         data={
@@ -279,14 +278,32 @@ def test_build_measurement_result_software_demodulates_before_summing(
             time_integration=True,
         ),
         device_config={"kind": "quel1"},
-        sampling_period=1.0,
+        sampling_period=2.0,
     )
 
+    fir = (
+        np.asarray(CaptureParamTools.fir_coefficient(frequency), dtype=np.complex128)
+        / 2**15
+    )
+    window = (
+        np.asarray(
+            CaptureParamTools.window_coefficient(frequency),
+            dtype=np.complex128,
+        )
+        / 2**31
+    )
+    demodulated = np.convolve(carrier, fir, mode="full")[: carrier.size][::4]
+    demodulated *= window[: demodulated.size]
     assert_allclose(
         result.data["Q00"][0].data,
-        np.array([4.0 + 0.0j, 8.0 + 0.0j], dtype=np.complex128) * norm_factor,
+        np.array(
+            [np.sum(demodulated), 2.0 * np.sum(demodulated)],
+            dtype=np.complex128,
+        )
+        * norm_factor,
         atol=1e-20,
     )
+    assert result.data["Q00"][0].sampling_period == 8.0
 
 
 def test_build_measurement_result_software_classifies_with_line_params() -> None:
@@ -339,9 +356,6 @@ def test_build_measurement_result_software_classifies_with_line_params() -> None
     capture = result.data["Q00"][0]
     assert_allclose(
         capture.data,
-        np.array(
-            [1.0 + 1.0j, -1.0 + 1.0j, 1.0 - 1.0j, -1.0 - 1.0j]
-        )
-        * 2 ** (-32),
+        np.array([1.0 + 1.0j, -1.0 + 1.0j, 1.0 - 1.0j, -1.0 - 1.0j]) * 2 ** (-16),
     )
     assert_allclose(capture.state_series, np.array([3, 2, 1, 0]))

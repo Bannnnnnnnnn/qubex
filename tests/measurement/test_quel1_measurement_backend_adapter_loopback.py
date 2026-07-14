@@ -109,7 +109,7 @@ def test_validate_schedule_accepts_full_span_captures_without_pulse_ranges() -> 
 
 def test_build_measurement_result_keeps_monitor_labels() -> None:
     """Given monitor targets in backend result, when converting, then non-readout labels are preserved."""
-    norm_factor = 2 ** (-32)
+    norm_factor = 2 ** (-16)
     backend_result = Quel1BackendExecutionResult(
         status={},
         data={

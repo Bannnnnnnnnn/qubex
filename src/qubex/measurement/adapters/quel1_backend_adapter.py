@@ -6,11 +6,14 @@ import math
 from typing import TYPE_CHECKING
 
 import numpy as np
+from qxdriver_quel1.e7awg import CaptureParamTools
 
 from qubex.backend import (
     BackendExecutionRequest,
 )
 from qubex.backend.quel1 import (
+    CAPTURE_DECIMATION_FACTOR,
+    SAMPLING_PERIOD_NS,
     Quel1BackendController,
     Quel1BackendExecutionResult,
     Quel1ExecutionPayload,
@@ -33,6 +36,10 @@ if TYPE_CHECKING:
         CapSampledSequenceProtocol,
         GenSampledSequenceProtocol,
     )
+
+
+_FIR_FIXED_POINT_SCALE = float(1 << 15)
+_WINDOW_FIXED_POINT_SCALE = float(1 << 31)
 
 
 def _as_read_only_array(data: object) -> np.ndarray:
@@ -284,7 +291,10 @@ class Quel1MeasurementBackendAdapter:
             )
 
         skip_extra_capture = self._constraint_profile.require_workaround_capture
-        norm_factor = 2 ** (-32)  # normalization factor for 32-bit data
+        # With every capture DSP unit disabled, e7awghal returns raw I/Q ADC
+        # codes (16 bits per component), not the 32-bit DSP output used here
+        # previously.
+        norm_factor = 2 ** (-16)
         target_registry = getattr(self._experiment_system, "target_registry", None)
         software_demodulation = (
             True
@@ -326,6 +336,7 @@ class Quel1MeasurementBackendAdapter:
             for index, iq in enumerate(iqs):
                 if skip_extra_capture and index == 0:
                     continue
+                result_sampling_period = sampling_period
                 waveform_series = self._normalize_raw_waveform_series(
                     iq,
                     n_shots=measurement_config.n_shots,
@@ -337,12 +348,13 @@ class Quel1MeasurementBackendAdapter:
                         frequency=demodulation_frequency,
                         sampling_period=sampling_period,
                     )
+                    result_sampling_period *= CAPTURE_DECIMATION_FACTOR
                 values.append(
                     self._build_capture_data_from_waveform_series(
                         target=qubit,
                         waveform_series=waveform_series,
                         config=measurement_config,
-                        sampling_period=sampling_period,
+                        sampling_period=result_sampling_period,
                         quel1_options=quel1_options,
                     )
                 )
@@ -369,9 +381,7 @@ class Quel1MeasurementBackendAdapter:
 
         match config.primary_return_item:
             case ReturnItem.WAVEFORM_SERIES:
-                payload_kwargs["waveform_series"] = _as_read_only_array(
-                    waveform_series
-                )
+                payload_kwargs["waveform_series"] = _as_read_only_array(waveform_series)
             case ReturnItem.IQ_SERIES:
                 payload_kwargs["iq_series"] = _as_read_only_array(iq_series)
             case ReturnItem.AVERAGED_WAVEFORM:
@@ -439,10 +449,43 @@ class Quel1MeasurementBackendAdapter:
         frequency: float,
         sampling_period: float,
     ) -> np.ndarray:
-        """Software-demodulate waveform shots with a capture-local NCO phase."""
-        sample_index = np.arange(waveform_series.shape[1], dtype=np.float64)
-        phase = np.exp(-1j * 2.0 * np.pi * frequency * sampling_period * sample_index)
-        return waveform_series * phase.reshape(1, -1)
+        """Apply the QuEL-1 hardware-demodulation transfer function in software."""
+        if not math.isclose(sampling_period, SAMPLING_PERIOD_NS):
+            raise ValueError(
+                "QuEL-1 software demodulation requires a sampling period of "
+                f"{SAMPLING_PERIOD_NS} ns."
+            )
+
+        # The capture DSP interprets these coefficient tables as Q1.15 and
+        # Q1.31 values. Reusing the driver tables keeps software results on the
+        # same amplitude and phase convention as hardware demodulation.
+        fir = (
+            np.asarray(
+                CaptureParamTools.fir_coefficient(frequency),
+                dtype=np.complex128,
+            )
+            / _FIR_FIXED_POINT_SCALE
+        )
+        filtered = np.empty_like(waveform_series, dtype=np.complex128)
+        for shot_index, waveform in enumerate(waveform_series):
+            filtered[shot_index] = np.convolve(waveform, fir, mode="full")[
+                : waveform.size
+            ]
+
+        decimated = filtered[:, ::CAPTURE_DECIMATION_FACTOR]
+        window = (
+            np.asarray(
+                CaptureParamTools.window_coefficient(frequency),
+                dtype=np.complex128,
+            )
+            / _WINDOW_FIXED_POINT_SCALE
+        )
+        if decimated.shape[1] > window.size:
+            raise ValueError(
+                "QuEL-1 software-demodulated capture exceeds the hardware "
+                f"window length of {window.size} samples."
+            )
+        return decimated * window[: decimated.shape[1]].reshape(1, -1)
 
     @staticmethod
     def _classify_iq_series(
@@ -452,14 +495,10 @@ class Quel1MeasurementBackendAdapter:
     ) -> np.ndarray:
         """Classify IQ series with QuEL-1 line parameters in software."""
         line_param0 = (
-            None
-            if quel1_options is None
-            else quel1_options.classification_line_param0
+            None if quel1_options is None else quel1_options.classification_line_param0
         )
         line_param1 = (
-            None
-            if quel1_options is None
-            else quel1_options.classification_line_param1
+            None if quel1_options is None else quel1_options.classification_line_param1
         )
         if line_param0 is None:
             line_param0 = (1.0, 0.0, 0.0)
