@@ -81,6 +81,41 @@ cd qubex
 make sync
 ```
 
+### Reproduce the dual-readout development branch
+
+The `feature/dual-readout` branch uses pinned Git submodules for the
+dual-readout-enabled `qxdriver-quel1` and `quelware-internal` sources. Your
+GitHub account must be able to read `toshisumida/quelware-internal`.
+
+For a new checkout, initialize the pinned submodules during cloning and install
+the locked environment:
+
+```bash
+git clone --recurse-submodules \
+  --branch feature/dual-readout \
+  https://github.com/Bannnnnnnnnn/qubex.git
+cd qubex
+make sync
+```
+
+For an existing checkout, synchronize the changed submodule URLs before
+installing:
+
+```bash
+git pull
+git submodule sync --recursive
+make sync
+```
+
+The resulting environment uses editable sources inside the checkout:
+
+- `packages/qxdriver-quel1`
+- `packages/quelware-internal/e7awghal`
+- `packages/quelware-internal/quel_ic_config`
+
+Avoid installing copies from unrelated local directories afterward, because
+that overrides the locked source locations.
+
 ## Next steps
 
 - Start with [Choose where to start](choose-where-to-start.md) to pick the entry point that matches your goal.

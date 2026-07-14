@@ -1,7 +1,11 @@
 [submodule "packages/qxdriver-quel1"]
 	path = packages/qxdriver-quel1
-	url = https://github.com/amachino/qxdriver-quel1.git
-	branch = qubex-quelware-v0.10
+	url = https://github.com/toshisumida/qxdriver-quel1.git
+	branch = dual_readout
+[submodule "packages/quelware-internal"]
+	path = packages/quelware-internal
+	url = https://github.com/toshisumida/quelware-internal.git
+	branch = dual_readout
 [submodule "packages/quelware-client"]
 	path = packages/quelware-client
 	url = https://github.com/quel-inc/quelware-client.git

@@ -74,6 +74,34 @@ cd qubex
 make sync
 ```
 
+### Reproduce the dual-readout development environment
+
+The `feature/dual-readout` branch pins its dual-readout-enabled
+`qxdriver-quel1` and `quelware-internal` sources as Git submodules. Access to
+`toshisumida/quelware-internal` is required.
+
+For a new checkout:
+
+```bash
+git clone --recurse-submodules \
+  --branch feature/dual-readout \
+  https://github.com/Bannnnnnnnnn/qubex.git
+cd qubex
+make sync
+```
+
+For an existing checkout after pulling this branch:
+
+```bash
+git pull
+git submodule sync --recursive
+make sync
+```
+
+`make sync` installs the locked `quel_ic_config`, `e7awghal`, and
+`qxdriver-quel1` submodule sources as editable packages. Do not replace them
+with separate manual editable installs.
+
 ## Documentation
 
 The documentation is available at [https://amachino.github.io/qubex/](https://amachino.github.io/qubex/).

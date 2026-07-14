@@ -80,6 +80,42 @@ cd qubex
 make sync
 ```
 
+### dual-readout 開発ブランチを再現する
+
+`feature/dual-readout` ブランチでは、dual-readout 対応版の
+`qxdriver-quel1` と `quelware-internal` を Git submodule のコミットとして
+固定しています。`toshisumida/quelware-internal` を読み取れる GitHub 権限が
+必要です。
+
+新規に取得する場合は、固定済み submodule を同時に初期化してから lockfile
+どおりに環境を構築します。
+
+```bash
+git clone --recurse-submodules \
+  --branch feature/dual-readout \
+  https://github.com/Bannnnnnnnnn/qubex.git
+cd qubex
+make sync
+```
+
+既存の checkout を更新する場合は、変更された submodule URL を同期してから
+環境を更新します。
+
+```bash
+git pull
+git submodule sync --recursive
+make sync
+```
+
+構築後は、次の checkout 内ソースが editable install されます。
+
+- `packages/qxdriver-quel1`
+- `packages/quelware-internal/e7awghal`
+- `packages/quelware-internal/quel_ic_config`
+
+この後に別ディレクトリのコピーを手動で editable install すると、固定した
+ソースが上書きされるため避けてください。
+
 ## 次のステップ
 
 - まず [始め方を選ぶ](choose-where-to-start.md) で、自分の目的に合う入口を確認してください。

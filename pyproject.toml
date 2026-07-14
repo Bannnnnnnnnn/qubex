@@ -81,6 +81,8 @@ qubex = ["py.typed", "*.pyi", "clifford/**/*.json"]
 cache-dir = ".cache/uv"
 
 [tool.uv.sources]
+e7awghal = { path = "packages/quelware-internal/e7awghal", editable = true }
+quel_ic_config = { path = "packages/quelware-internal/quel_ic_config", editable = true }
 quelware_client = { workspace = true }
 qxdriver_quel1 = { workspace = true }
 qxcore = { workspace = true }
@@ -117,6 +119,7 @@ exclude = [
     "lib",
     "packages/qube-calib",
     "packages/quelware-client",
+    "packages/quelware-internal",
     "packages/qxdriver-quel1",
 ]
 typeCheckingMode = "basic"
@@ -126,6 +129,7 @@ extend-exclude = [
     "lib",
     "packages/qube-calib",
     "packages/quelware-client",
+    "packages/quelware-internal",
     "packages/qxdriver-quel1",
 ]
 
