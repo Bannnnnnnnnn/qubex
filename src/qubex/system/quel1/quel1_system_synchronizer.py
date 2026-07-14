@@ -445,7 +445,9 @@ class Quel1SystemSynchronizer:
 
     def _update_backend_cache_from_model(self, boxes: Sequence[Box]) -> None:
         """Best-effort update of backend dump cache from the in-memory model."""
-        update_cache = getattr(self._backend_controller, "update_box_config_cache", None)
+        update_cache = getattr(
+            self._backend_controller, "update_box_config_cache", None
+        )
         if not callable(update_cache):
             return
         box_configs = self._build_box_config_cache_from_model(boxes)
@@ -454,9 +456,13 @@ class Quel1SystemSynchronizer:
         try:
             update_cache(box_configs)
         except Exception:
-            logger.debug("Failed to update backend box-config cache from model.", exc_info=True)
+            logger.debug(
+                "Failed to update backend box-config cache from model.", exc_info=True
+            )
 
-    def _build_box_config_cache_from_model(self, boxes: Sequence[Box]) -> dict[str, dict]:
+    def _build_box_config_cache_from_model(
+        self, boxes: Sequence[Box]
+    ) -> dict[str, dict]:
         """Build a dump-box-like cache snapshot from configured model state."""
         box_configs: dict[str, dict] = {}
         for box in boxes:
@@ -479,7 +485,9 @@ class Quel1SystemSynchronizer:
             "direction": "out",
             "channels": {
                 channel.number: {
-                    "cnco_freq": Quel1SystemSynchronizer._optional_channel_cnco(channel),
+                    "cnco_freq": Quel1SystemSynchronizer._optional_channel_cnco(
+                        channel
+                    ),
                     "fnco_freq": channel.fnco_freq,
                 }
                 for channel in port.channels
@@ -505,7 +513,9 @@ class Quel1SystemSynchronizer:
             "direction": "in",
             "runits": {
                 channel.number: {
-                    "cnco_freq": Quel1SystemSynchronizer._optional_channel_cnco(channel),
+                    "cnco_freq": Quel1SystemSynchronizer._optional_channel_cnco(
+                        channel
+                    ),
                     "fnco_freq": channel.fnco_freq,
                 }
                 for channel in port.channels
@@ -527,9 +537,7 @@ class Quel1SystemSynchronizer:
         """Overlay model channel CNCOs onto hardware dumps that omit them."""
         model_ports_by_box = {
             box.id: {
-                port.number: port
-                for port in box.ports
-                if isinstance(port.number, int)
+                port.number: port for port in box.ports if isinstance(port.number, int)
             }
             for box in boxes
         }

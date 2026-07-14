@@ -149,7 +149,9 @@ def test_sync_experiment_system_cache_preserves_channel_cnco() -> None:
         def config_runit(self, **kwargs: Any) -> None:
             self.config_runit_calls.append(dict(kwargs))
 
-        def update_box_config_cache(self, box_configs: dict[str, dict[str, Any]]) -> None:
+        def update_box_config_cache(
+            self, box_configs: dict[str, dict[str, Any]]
+        ) -> None:
             self.box_config_cache.update(box_configs)
 
     backend_controller = _BackendController()

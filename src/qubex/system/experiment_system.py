@@ -464,7 +464,9 @@ class ExperimentSystem:
             gen_channel.cnco_freq_override,
             gen_channel.fnco_freq,
         )
-        cap_original_values: tuple[int | None, int | None, int | None, int | None] | None = None
+        cap_original_values: (
+            tuple[int | None, int | None, int | None, int | None] | None
+        ) = None
         try:
             gen_channel.port.lo_freq = lo_freq
             gen_channel.port.cnco_freq = cnco_freq
@@ -1078,7 +1080,9 @@ class ExperimentSystem:
         mux = self.get_mux_by_readout_port(port)
         if mux is None or mux.is_not_available:
             return
-        resonators = tuple(resonator for resonator in mux.resonators if resonator.is_valid)
+        resonators = tuple(
+            resonator for resonator in mux.resonators if resonator.is_valid
+        )
         box = self.get_box(port.box_id)
         n_lanes = self._get_readout_lane_count(box=box, port=port)
         if n_lanes > 1:
@@ -1112,7 +1116,9 @@ class ExperimentSystem:
         mux = self.get_mux_by_readout_port(port)
         if mux is None or mux.is_not_available:
             return
-        resonators = tuple(resonator for resonator in mux.resonators if resonator.is_valid)
+        resonators = tuple(
+            resonator for resonator in mux.resonators if resonator.is_valid
+        )
         box = self.get_box(port.box_id)
         n_lanes = self._get_readout_lane_count(box=box, port=port)
         if n_lanes > 1 and port.n_channels >= 2:

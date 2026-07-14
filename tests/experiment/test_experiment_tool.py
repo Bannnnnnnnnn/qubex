@@ -39,7 +39,7 @@ class FakeBox:
     """Box stub for box info tests."""
 
     id: str
-    ports: tuple[FakePort, ...]
+    ports: tuple[FakePort | GenPort | CapPort, ...]
 
 
 class FakeExperimentSystem:

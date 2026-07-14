@@ -189,8 +189,16 @@ def test_execute_async_uses_json_safe_box_config() -> None:
             measurement_config: MeasurementConfig,
             device_config: dict[str, object],
             sampling_period: float,
+            schedule: MeasurementSchedule | None = None,
+            quel1_options: object | None = None,
         ) -> MeasurementResult:
-            _ = (backend_result, measurement_config, sampling_period)
+            _ = (
+                backend_result,
+                measurement_config,
+                sampling_period,
+                schedule,
+                quel1_options,
+            )
             called["device_config"] = device_config
             return expected
 

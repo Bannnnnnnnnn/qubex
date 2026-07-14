@@ -832,7 +832,7 @@ def print_box_info(box_id: str, fetch: bool | None = None) -> None:
     table2.add_column("FNCO", justify="right")
     table2.add_column("NCO", justify="right")
 
-    def _fmt_freq_hz(value: object) -> str:
+    def _fmt_freq_hz(value: Any) -> str:
         if value is None:
             return ""
         try:
@@ -840,7 +840,7 @@ def print_box_info(box_id: str, fetch: bool | None = None) -> None:
         except (TypeError, ValueError):
             return ""
 
-    def _fmt_nco_hz(cnco: object, fnco: object) -> str:
+    def _fmt_nco_hz(cnco: Any, fnco: Any) -> str:
         if cnco is None or fnco is None:
             return ""
         try:

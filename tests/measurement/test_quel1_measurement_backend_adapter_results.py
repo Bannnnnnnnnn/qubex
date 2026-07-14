@@ -358,4 +358,5 @@ def test_build_measurement_result_software_classifies_with_line_params() -> None
         capture.data,
         np.array([1.0 + 1.0j, -1.0 + 1.0j, 1.0 - 1.0j, -1.0 - 1.0j]) * 2 ** (-16),
     )
+    assert capture.state_series is not None
     assert_allclose(capture.state_series, np.array([3, 2, 1, 0]))

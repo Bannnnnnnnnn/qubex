@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 from qubex.backend.quel1.quel1_backend_constants import (
     DEFAULT_BACKGROUND_NOISE_THRESHOLD_AT_RECONNECT,
@@ -176,14 +176,19 @@ class Quel1ConfigurationManager:
             box_name=box_name,
             option_labels=self._runtime_context.box_options.get(box_name, ()),
         )
-        define_box_kwargs: dict[str, object] = {
-            "box_name": box_name,
-            "ipaddr_wss": ipaddr_wss,
-            "boxtype": boxtype,
-        }
-        if config_options is not None:
-            define_box_kwargs["config_options"] = config_options
-        self._runtime_context.qubecalib.define_box(**define_box_kwargs)
+        if config_options is None:
+            self._runtime_context.qubecalib.define_box(
+                box_name=box_name,
+                ipaddr_wss=ipaddr_wss,
+                boxtype=boxtype,
+            )
+            return
+        self._runtime_context.qubecalib.define_box(
+            box_name=box_name,
+            ipaddr_wss=ipaddr_wss,
+            boxtype=boxtype,
+            config_options=config_options,
+        )
 
     def define_port(
         self,
@@ -291,9 +296,11 @@ class Quel1ConfigurationManager:
         if css is None or not callable(convert_output_port):
             return
         try:
-            group, line = convert_output_port(port)
+            group, line = cast(tuple[int, int], convert_output_port(port))
             mxfe_idx, fduc_idx = css.get_fduc_idx(group, line, channel)
-            dac_idx = self._find_dac_for_fduc(css=css, mxfe_idx=mxfe_idx, fduc_idx=fduc_idx)
+            dac_idx = self._find_dac_for_fduc(
+                css=css, mxfe_idx=mxfe_idx, fduc_idx=fduc_idx
+            )
         except Exception:
             logger.debug(
                 "Could not resolve DAC CNCO for port %s channel %s; skipping channel CNCO.",
@@ -338,7 +345,7 @@ class Quel1ConfigurationManager:
         if css is None or dev is None or not callable(convert_input_port):
             return
         try:
-            group, rline = convert_input_port(port)
+            group, rline = cast(tuple[int, str], convert_input_port(port))
             rchannel = dev._get_rchannel_from_runit(group, rline, runit)
             mxfe_idx, adc_idx = self._resolve_adc_cnco_index(
                 css=css,
@@ -368,7 +375,9 @@ class Quel1ConfigurationManager:
         for dac_idx in range(4):
             if fduc_idx in css.ad9082[mxfe_idx].get_fduc_of_dac(dac_idx):
                 return dac_idx
-        raise ValueError(f"FDUC{fduc_idx} is not assigned to any DAC on MxFE{mxfe_idx}.")
+        raise ValueError(
+            f"FDUC{fduc_idx} is not assigned to any DAC on MxFE{mxfe_idx}."
+        )
 
     @staticmethod
     def _resolve_adc_cnco_index(
