@@ -114,6 +114,7 @@ class BoxPoolProtocol(Protocol):
         ipaddr_css: str,
         boxtype: str,
         config_options: Sequence[object] | None = None,
+        dual_readout_routes: Sequence[object] | None = None,
     ) -> Quel1BoxCommonProtocol:
         """Create and register one box instance."""
         ...
@@ -151,6 +152,7 @@ class BoxSettingProtocol(Protocol):
     ipaddr_wss: Any
     ipaddr_sss: Any
     ipaddr_css: Any
+    dual_readout_routes: Sequence[object]
 
 
 class CapSampledSequenceProtocol(Protocol):
@@ -459,6 +461,7 @@ class QubeCalibProtocol(Protocol):
         ipaddr_css: str | None = None,
         config_root: str | None = None,
         config_options: Sequence[object] | None = None,
+        dual_readout_routes: Sequence[object] | None = None,
     ) -> Any:
         """Define one box entry."""
         ...
@@ -529,6 +532,10 @@ class Quel1BoxCommonProtocol(Protocol):
 
     def relinkup(self, *args: Any, **kwargs: Any) -> Any:
         """Relink box JESD links with optional config options."""
+        ...
+
+    def get_relinkup_config(self, *args: Any, **kwargs: Any) -> Mapping[str, Any]:
+        """Return the resolved configuration that relinkup would apply."""
         ...
 
     def link_status(self) -> dict[int, bool]:

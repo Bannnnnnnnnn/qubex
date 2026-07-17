@@ -93,6 +93,7 @@ class Quel1SystemLoader:
                 ),
                 port_numbers=box_ports[id],
                 options=box.get("options"),
+                dual_readout_routes=box.get("dual_readout_routes"),
             )
             for id, box in box_dict.items()
             if id in box_ports

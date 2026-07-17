@@ -132,6 +132,28 @@ def test_define_helpers_delegate_to_qubecalib() -> None:
     ]
 
 
+def test_define_box_delegates_dual_readout_routes() -> None:
+    """Given configured routes, define_box stores driver-facing donor-port mappings."""
+    controller = _make_controller()
+
+    controller.define_box(
+        box_name="Q00",
+        ipaddr_wss="192.0.2.21",
+        boxtype="quel1-a",
+        dual_readout_routes=[{"group": 0, "donor_ctrl_port": 4}],
+    )
+
+    qubecalib = cast(_FakeQubeCalib, controller.qubecalib)
+    assert qubecalib.define_box_calls == [
+        {
+            "box_name": "Q00",
+            "ipaddr_wss": "192.0.2.21",
+            "boxtype": "quel1-a",
+            "dual_readout_routes": [{"group": 0, "donor_port": 4}],
+        }
+    ]
+
+
 def test_load_skew_yaml_delegates_to_sysdb(tmp_path: Path) -> None:
     """Given a path, when loading skew yaml, then sysdb.load_skew_yaml is called once."""
     controller = _make_controller()

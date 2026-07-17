@@ -37,6 +37,8 @@ from .quel1_runtime_context import Quel1RuntimeContext
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from qubex.system.control_system import DualReadoutRouteConfig
+
     from .compat.qubecalib_protocols import (
         BoxPoolProtocol as BoxPool,
         PortType,
@@ -436,6 +438,8 @@ class Quel1BackendController(BackendController):
         box_name: str,
         ipaddr_wss: str,
         boxtype: str,
+        dual_readout_routes: Sequence[DualReadoutRouteConfig | Mapping[str, int]]
+        | None = None,
     ) -> None:
         """
         Define a box in qube-calib.
@@ -453,6 +457,7 @@ class Quel1BackendController(BackendController):
             box_name=box_name,
             ipaddr_wss=ipaddr_wss,
             boxtype=boxtype,
+            dual_readout_routes=dual_readout_routes,
         )
 
     def define_port(

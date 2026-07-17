@@ -102,6 +102,26 @@ For example, `quel1se-riken8` accepts an AWG profile label such as
 `se8_mxfe1_awg1331`, `se8_mxfe1_awg2222`, or `se8_mxfe1_awg3113`. When no AWG
 profile is specified, Qubex uses `se8_mxfe1_awg2222`.
 
+For dual-readout, use `dual_readout_routes` to select the CTRL port whose AWG
+is reassigned to the readout output. The donor must be on the same MxFE as the
+enabled group. Omitting the route uses the box-type default donor port.
+
+```yaml
+R20A:
+  name: "QuBE Riken #1-02"
+  type: "qube-riken-a"
+  address: "10.1.0.20"
+  adapter: "500202A500IAA"
+  options:
+    - "dual_readout_group1"
+  dual_readout_routes:
+    - group: 1
+      donor_ctrl_port: 7
+```
+
+A group may have only one route. Routes for disabled groups and donor CTRL
+ports on another MxFE are rejected.
+
 ### Control Layout Resolution
 
 `configuration_mode` is a priority-ordered request, not a fixed channel-count

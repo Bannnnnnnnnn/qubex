@@ -92,6 +92,23 @@ QuEL-3 のエントリでは `address` と `adapter` は任意です。QuBE と 
 
 例えば `quel1se-riken8` は `se8_mxfe1_awg1331`、`se8_mxfe1_awg2222`、`se8_mxfe1_awg3113` のような AWG プロファイルラベルを受け取れます。AWG プロファイルが指定されない場合、Qubex は `se8_mxfe1_awg2222` を使います。
 
+dual-readout で読み出し出力へ移す AWG を明示する場合は、有効化する group と同じ MxFE 上の CTRL port を `dual_readout_routes` に指定します。省略時は box type ごとの既定 donor port が使われます。
+
+```yaml
+R20A:
+  name: "QuBE Riken #1-02"
+  type: "qube-riken-a"
+  address: "10.1.0.20"
+  adapter: "500202A500IAA"
+  options:
+    - "dual_readout_group1"
+  dual_readout_routes:
+    - group: 1
+      donor_ctrl_port: 7
+```
+
+同じ group に複数 route を指定すること、無効な group を指定すること、別の MxFE の CTRL port を donor にすることはできません。
+
 ### 制御レイアウトの解決規則
 
 `configuration_mode` は固定の channel 数を保証する指定ではなく、優先順を表します。

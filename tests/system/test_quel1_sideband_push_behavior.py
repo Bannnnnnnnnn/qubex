@@ -128,6 +128,54 @@ def test_sync_read_out_port_passes_sideband_to_backend() -> None:
     assert read_out_call["sideband"] == "U"
 
 
+def test_sync_unwired_pump_blocks_port_without_configuring_channel() -> None:
+    """Given an unwired pump, push blocks its port without resolving channel CNCO."""
+
+    class _BackendController:
+        def __init__(self) -> None:
+            self.config_port_calls: list[dict[str, Any]] = []
+            self.config_channel_calls: list[dict[str, Any]] = []
+
+        def config_port(self, **kwargs: Any) -> None:
+            self.config_port_calls.append(dict(kwargs))
+
+        def config_channel(self, **kwargs: Any) -> None:
+            self.config_channel_calls.append(dict(kwargs))
+
+    backend_controller = _BackendController()
+    synchronizer = Quel1SystemSynchronizer(
+        backend_controller=cast(Any, backend_controller)
+    )
+    box = Box.new(
+        id="B0",
+        name="BOX0",
+        type="quel1-a",
+        address="127.0.0.1",
+        adapter="A0",
+        port_numbers=[],
+    )
+    pump = next(port for port in box.ports if port.type == PortType.PUMP)
+    assert isinstance(pump, GenPort)
+    assert pump.cnco_freq is None
+    box.ports = (pump,)
+
+    synchronizer.sync_box_to_hardware(box)
+
+    assert backend_controller.config_port_calls == [
+        {
+            "box_name": "B0",
+            "port": pump.number,
+            "lo_freq_hz": None,
+            "cnco_freq_hz": None,
+            "vatt": None,
+            "sideband": None,
+            "fullscale_current": None,
+            "rfswitch": "block",
+        }
+    ]
+    assert backend_controller.config_channel_calls == []
+
+
 def test_sync_experiment_system_cache_preserves_channel_cnco() -> None:
     """Given channel-level CNCO, when syncing, then backend cache includes it."""
 
@@ -543,6 +591,71 @@ def test_sync_model_skips_clockmaster_for_single_box_without_address() -> None:
     )
 
     assert backend_controller.define_clockmaster_calls == []
+
+
+def test_sync_model_forwards_dual_readout_routes() -> None:
+    """Given a routed dual-readout box, model sync forwards its route to the backend."""
+
+    class _BackendController:
+        def __init__(self) -> None:
+            self.define_box_calls: list[dict[str, Any]] = []
+
+        def set_box_options(self, *_: Any, **__: Any) -> None:
+            return None
+
+        def define_box(self, **kwargs: Any) -> None:
+            self.define_box_calls.append(dict(kwargs))
+
+        def define_port(self, **_: Any) -> None:
+            return None
+
+        def define_channel(self, **_: Any) -> None:
+            return None
+
+        def add_channel_target_relation(self, **_: Any) -> None:
+            return None
+
+        def define_target(self, **_: Any) -> None:
+            return None
+
+        def clear_command_queue(self) -> None:
+            return None
+
+        def clear_cache(self) -> None:
+            return None
+
+    backend_controller = _BackendController()
+    synchronizer = Quel1SystemSynchronizer(
+        backend_controller=cast(Any, backend_controller)
+    )
+    box = Box.new(
+        id="B0",
+        name="BOX0",
+        type="quel1-a",
+        address="127.0.0.1",
+        adapter="A0",
+        port_numbers=[],
+        options=["dual_readout_group0"],
+        dual_readout_routes=[{"group": 0, "donor_ctrl_port": 4}],
+    )
+    experiment_system = SimpleNamespace(
+        control_system=SimpleNamespace(clock_master_address=None, boxes=[box]),
+        control_params=SimpleNamespace(),
+        all_targets=[],
+    )
+
+    synchronizer.sync_experiment_system_to_backend_controller(
+        cast(Any, experiment_system)
+    )
+
+    assert backend_controller.define_box_calls == [
+        {
+            "box_name": "B0",
+            "ipaddr_wss": "127.0.0.1",
+            "boxtype": "quel1-a",
+            "dual_readout_routes": box.dual_readout_routes,
+        }
+    ]
 
 
 def test_sync_model_defines_clockmaster_without_reset_option() -> None:

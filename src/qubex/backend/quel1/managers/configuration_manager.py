@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 from qubex.backend.quel1.quel1_backend_constants import (
@@ -21,6 +22,7 @@ if TYPE_CHECKING:
         Quel1BoxCommonProtocol as Quel1Box,
         SequencerProtocol as Sequencer,
     )
+    from qubex.system.control_system import DualReadoutRouteConfig
 
 
 class Quel1ConfigurationManager:
@@ -168,6 +170,8 @@ class Quel1ConfigurationManager:
         box_name: str,
         ipaddr_wss: str,
         boxtype: str,
+        dual_readout_routes: Sequence[DualReadoutRouteConfig | Mapping[str, int]]
+        | None = None,
     ) -> None:
         """Define one box in qubecalib."""
         option_map = self._runtime_context.driver.Quel1ConfigOption._value2member_map_
@@ -176,18 +180,29 @@ class Quel1ConfigurationManager:
             box_name=box_name,
             option_labels=self._runtime_context.box_options.get(box_name, ()),
         )
-        if config_options is None:
-            self._runtime_context.qubecalib.define_box(
-                box_name=box_name,
-                ipaddr_wss=ipaddr_wss,
-                boxtype=boxtype,
-            )
-            return
+        define_kwargs: dict[str, Any] = {
+            "box_name": box_name,
+            "ipaddr_wss": ipaddr_wss,
+            "boxtype": boxtype,
+        }
+        if config_options is not None:
+            define_kwargs["config_options"] = config_options
+        if dual_readout_routes:
+            define_kwargs["dual_readout_routes"] = [
+                {
+                    "group": int(
+                        route["group"] if isinstance(route, Mapping) else route.group
+                    ),
+                    "donor_port": (
+                        route["donor_ctrl_port"]
+                        if isinstance(route, Mapping)
+                        else route.donor_ctrl_port
+                    ),
+                }
+                for route in dual_readout_routes
+            ]
         self._runtime_context.qubecalib.define_box(
-            box_name=box_name,
-            ipaddr_wss=ipaddr_wss,
-            boxtype=boxtype,
-            config_options=config_options,
+            **define_kwargs,
         )
 
     def define_port(

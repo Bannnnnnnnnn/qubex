@@ -1897,6 +1897,43 @@ def test_dual_readout_group0_splits_edge_resonator_to_second_adc(
     assert read_in_target.channel.number == 4
 
 
+def test_dual_readout_route_selects_configured_donor_ctrl_port(
+    tmp_path: Path,
+) -> None:
+    """Given a route override, loading assigns the donated AWG to its configured CTRL port."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    _write_yaml(
+        config_dir / "box.yaml",
+        {
+            "BOX1": {
+                "name": "Box One",
+                "type": "quel1-a",
+                "address": "10.0.0.2",
+                "adapter": "dummy",
+                "options": ["dual_readout_group0"],
+                "dual_readout_routes": [
+                    {"group": 0, "donor_ctrl_port": 4},
+                ],
+            }
+        },
+    )
+
+    experiment_system = ConfigLoader(
+        system_id=chip_id,
+        config_dir=config_dir,
+        params_dir=params_dir,
+    ).get_experiment_system()
+    box = experiment_system.control_system.get_box("BOX1")
+
+    assert [
+        (route.group, route.donor_ctrl_port) for route in box.dual_readout_routes
+    ] == [(0, 4)]
+    assert box.get_port(0).n_channels == 5
+    assert box.get_port(1).n_channels == 2
+    assert box.get_port(2).n_channels == 3
+    assert box.get_port(4).n_channels == 2
+
+
 def test_dual_readout_group0_with_one_resonator_initializes_added_lane(
     tmp_path: Path,
 ) -> None:
@@ -1967,6 +2004,29 @@ def test_configure_initializes_monitor_ports_for_quel1(tmp_path: Path) -> None:
         channel.ndelay == DEFAULT_CAPTURE_DELAY for channel in monitor_in_port.channels
     )
     assert monitor_in_port.rfswitch == "open"
+
+
+def test_configure_blocks_unwired_pump_port_for_quel1(tmp_path: Path) -> None:
+    """Given one wired pump, loading leaves the other physical pump safely blocked."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    experiment_system = ConfigLoader(
+        system_id=chip_id,
+        config_dir=config_dir,
+        params_dir=params_dir,
+    ).get_experiment_system()
+    box = experiment_system.control_system.get_box("BOX1")
+    wired_pump = box.get_port(3)
+    unwired_pump = box.get_port(10)
+    assert isinstance(wired_pump, GenPort)
+    assert isinstance(unwired_pump, GenPort)
+
+    assert wired_pump.cnco_freq is not None
+    assert wired_pump.channels[0].fnco_freq is not None
+    assert wired_pump.rfswitch == "pass"
+    assert unwired_pump.cnco_freq is None
+    assert unwired_pump.channels[0].cnco_freq_override is None
+    assert unwired_pump.channels[0].fnco_freq is None
+    assert unwired_pump.rfswitch == "block"
 
 
 def test_load_raises_for_system_chip_id_mismatch(tmp_path: Path) -> None:

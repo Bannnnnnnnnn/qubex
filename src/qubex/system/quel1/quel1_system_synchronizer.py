@@ -68,6 +68,7 @@ class Quel1SystemSynchronizer:
                 box_name=box.id,
                 ipaddr_wss=box.address,
                 boxtype=box.type.value,
+                dual_readout_routes=box.dual_readout_routes,
             )
 
             for port in box.ports:
@@ -398,6 +399,21 @@ class Quel1SystemSynchronizer:
     def _sync_generator_port(self, *, box: Box, port: GenPort) -> None:
         """Apply one output-like port configuration."""
         try:
+            if port.type == PortType.PUMP and port.cnco_freq is None:
+                # An unwired pump has no logical frequency configuration.  Do
+                # not resolve its channel CNCO/FNCO; only force the physical
+                # output into the safe blocked state.
+                self._backend_controller.config_port(
+                    box_name=box.id,
+                    port=port.number,
+                    lo_freq_hz=None,
+                    cnco_freq_hz=None,
+                    vatt=None,
+                    sideband=None,
+                    fullscale_current=None,
+                    rfswitch="block",
+                )
+                return
             self._backend_controller.config_port(
                 box_name=box.id,
                 port=port.number,

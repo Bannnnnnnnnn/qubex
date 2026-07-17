@@ -607,6 +607,19 @@ class ExperimentSystem:
     ) -> None:
         mux = self.get_mux_by_pump_port(port)
         if mux is None:
+            # Keep physical pump ports that are absent from wiring in a safe,
+            # explicitly inactive state.  Their frequency fields must remain
+            # unset because there is no logical mux configuration to derive
+            # them from.
+            port.lo_freq = None
+            port.cnco_freq = None
+            port.sideband = None
+            port.vatt = None
+            port.fullscale_current = None
+            port.rfswitch = "block"
+            for channel in port.channels:
+                channel.cnco_freq_override = None
+                channel.fnco_freq = None
             return
         frequency = params.get_pump_frequency(mux.index)
         lo, cnco, _ = MixingUtil.calc_lo_cnco(

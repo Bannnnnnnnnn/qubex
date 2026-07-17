@@ -103,3 +103,40 @@ def test_new_ports_start_with_unset_lo_and_cnco() -> None:
             assert port.vatt is None
             assert port.fullscale_current is None
             assert port.rfswitch is None
+
+
+@pytest.mark.parametrize(
+    ("routes", "match"),
+    [
+        (
+            [
+                {"group": 1, "donor_ctrl_port": 7},
+                {"group": 1, "donor_ctrl_port": 8},
+            ],
+            "Only one dual-readout route",
+        ),
+        (
+            [{"group": 0, "donor_ctrl_port": 5}],
+            "group 0 is not enabled",
+        ),
+        (
+            [{"group": 1, "donor_ctrl_port": 5}],
+            "Expected one of.*7, 8",
+        ),
+    ],
+)
+def test_dual_readout_route_rejects_invalid_box_configuration(
+    routes: list[dict[str, int]],
+    match: str,
+) -> None:
+    """Given an invalid route, box construction rejects it before backend setup."""
+    with pytest.raises(ValueError, match=match):
+        Box.new(
+            id="R20A",
+            name="QuBE Riken #1-02",
+            type="qube-riken-a",
+            address="10.1.0.20",
+            adapter="500202A500IAA",
+            options=("dual_readout_group1",),
+            dual_readout_routes=routes,
+        )
