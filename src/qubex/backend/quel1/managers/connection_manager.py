@@ -352,7 +352,7 @@ class Quel1ConnectionManager:
             box_name=box_name,
             boxtype=box.boxtype,
         )
-        expected_config = box._dev._load_config_parameter(config_options=config_options)
+        expected_config = box.get_relinkup_config(config_options=config_options)
         if not isinstance(expected_config, Mapping):
             return False
         ad9082_configs = expected_config.get("ad9082")
@@ -724,6 +724,9 @@ class Quel1ConnectionManager:
                 config_options = getattr(setting, "config_options", None)
                 if config_options:
                     create_kwargs["config_options"] = config_options
+                dual_readout_routes = getattr(setting, "dual_readout_routes", None)
+                if dual_readout_routes:
+                    create_kwargs["dual_readout_routes"] = dual_readout_routes
                 box = boxpool.create(box_name, **create_kwargs)
                 boxes_to_reconnect.append(box)
 

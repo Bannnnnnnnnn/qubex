@@ -545,6 +545,71 @@ def test_sync_model_skips_clockmaster_for_single_box_without_address() -> None:
     assert backend_controller.define_clockmaster_calls == []
 
 
+def test_sync_model_forwards_dual_readout_routes() -> None:
+    """Given a routed dual-readout box, model sync forwards its route to the backend."""
+
+    class _BackendController:
+        def __init__(self) -> None:
+            self.define_box_calls: list[dict[str, Any]] = []
+
+        def set_box_options(self, *_: Any, **__: Any) -> None:
+            return None
+
+        def define_box(self, **kwargs: Any) -> None:
+            self.define_box_calls.append(dict(kwargs))
+
+        def define_port(self, **_: Any) -> None:
+            return None
+
+        def define_channel(self, **_: Any) -> None:
+            return None
+
+        def add_channel_target_relation(self, **_: Any) -> None:
+            return None
+
+        def define_target(self, **_: Any) -> None:
+            return None
+
+        def clear_command_queue(self) -> None:
+            return None
+
+        def clear_cache(self) -> None:
+            return None
+
+    backend_controller = _BackendController()
+    synchronizer = Quel1SystemSynchronizer(
+        backend_controller=cast(Any, backend_controller)
+    )
+    box = Box.new(
+        id="B0",
+        name="BOX0",
+        type="quel1-a",
+        address="127.0.0.1",
+        adapter="A0",
+        port_numbers=[],
+        options=["dual_readout_group0"],
+        dual_readout_routes=[{"group": 0, "donor_ctrl_port": 4}],
+    )
+    experiment_system = SimpleNamespace(
+        control_system=SimpleNamespace(clock_master_address=None, boxes=[box]),
+        control_params=SimpleNamespace(),
+        all_targets=[],
+    )
+
+    synchronizer.sync_experiment_system_to_backend_controller(
+        cast(Any, experiment_system)
+    )
+
+    assert backend_controller.define_box_calls == [
+        {
+            "box_name": "B0",
+            "ipaddr_wss": "127.0.0.1",
+            "boxtype": "quel1-a",
+            "dual_readout_routes": box.dual_readout_routes,
+        }
+    ]
+
+
 def test_sync_model_defines_clockmaster_without_reset_option() -> None:
     """Given clock master address, when syncing model, then reset option is not forwarded."""
 

@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import Any, cast
 
 import pytest
@@ -26,6 +26,7 @@ class _BoxSetting:
     ipaddr_sss: str
     ipaddr_css: str
     boxtype: str
+    dual_readout_routes: list[object] = field(default_factory=list)
 
 
 class _FakeBox:
@@ -92,24 +93,6 @@ class _FakeCss:
         return list(self._adc_mapping)
 
 
-class _FakeIntrinsic:
-    def _load_config_parameter(self, **_kwargs: Any) -> dict[str, Any]:
-        """Return the expected relinkup configuration."""
-        return {
-            "ad9082": [
-                {
-                    "dac": {
-                        "channel_assign": {
-                            f"dac{dac}": list(channels)
-                            for dac, channels in enumerate(_DUAL_DAC_ASSIGNMENT)
-                        }
-                    },
-                    "adc": {"converter_mappings": [list(_BASE_ADC_MAPPING)]},
-                }
-            ]
-        }
-
-
 class _InspectableFakeBox(_FakeBox):
     def __init__(
         self,
@@ -125,11 +108,26 @@ class _InspectableFakeBox(_FakeBox):
             dac_assignment=dac_assignment,
             adc_mapping=adc_mapping or _DUAL_ADC_MAPPING,
         )
-        self._dev = _FakeIntrinsic()
 
     def link_status(self) -> dict[int, bool]:
         """Return the configured link state."""
         return {0: self._link_ok}
+
+    def get_relinkup_config(self, **_kwargs: Any) -> dict[str, Any]:
+        """Return the expected relinkup configuration through the public API."""
+        return {
+            "ad9082": [
+                {
+                    "dac": {
+                        "channel_assign": {
+                            f"dac{dac}": list(channels)
+                            for dac, channels in enumerate(_DUAL_DAC_ASSIGNMENT)
+                        }
+                    },
+                    "adc": {"converter_mappings": [list(_BASE_ADC_MAPPING)]},
+                }
+            ]
+        }
 
 
 class _FakeBoxPool:
@@ -137,6 +135,7 @@ class _FakeBoxPool:
         self._boxes: dict[str, tuple[_FakeBox, object]] = {}
         self._linkstatus: dict[str, bool] = {}
         self.clockmaster_ip: str | None = None
+        self.create_calls: list[dict[str, Any]] = []
 
     def create_clock_master(self, *, ipaddr: str) -> None:
         """Store clockmaster IP."""
@@ -150,9 +149,21 @@ class _FakeBoxPool:
         ipaddr_sss: str,
         ipaddr_css: str,
         boxtype: str,
+        config_options: list[object] | None = None,
+        dual_readout_routes: list[object] | None = None,
     ) -> _FakeBox:
         """Create and register a fake box."""
-        _ = (ipaddr_wss, ipaddr_sss, ipaddr_css, boxtype)
+        self.create_calls.append(
+            {
+                "box_name": box_name,
+                "ipaddr_wss": ipaddr_wss,
+                "ipaddr_sss": ipaddr_sss,
+                "ipaddr_css": ipaddr_css,
+                "boxtype": boxtype,
+                "config_options": config_options,
+                "dual_readout_routes": dual_readout_routes,
+            }
+        )
         box = _FakeBox(box_name)
         self._boxes[box_name] = (box, object())
         return box
@@ -285,6 +296,23 @@ def test_create_boxpool_reconnects_all_boxes(monkeypatch) -> None:
     assert boxpool._boxes["B"][0].reconnect_calls == [
         {"background_noise_threshold": DEFAULT_BACKGROUND_NOISE_THRESHOLD_AT_RECONNECT}
     ]
+
+
+def test_create_boxpool_forwards_dual_readout_routes_in_sequential_mode() -> None:
+    """Given stored routes, sequential pool creation forwards them to BoxPool.create."""
+    controller = _make_controller()
+    route = {"group": 0, "donor_port": 4}
+    cast(Any, controller.qubecalib).sysdb._box_settings["A"].dual_readout_routes = [
+        route
+    ]
+    _override_driver_classes(controller, BoxPool=_FakeBoxPool)
+
+    boxpool = cast(
+        _FakeBoxPool,
+        controller._connection_manager.create_boxpool(["A"], parallel=False),
+    )
+
+    assert boxpool.create_calls[0]["dual_readout_routes"] == [route]
 
 
 def test_create_boxpool_raises_for_unknown_box(monkeypatch) -> None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Final, Literal, TypeGuard, TypeVar, cast
@@ -108,6 +108,13 @@ class DualReadoutPortLayout:
     donor_ctrl_port: int
 
 
+class DualReadoutRouteConfig(MutableModel):
+    """Configured AWG donor route for one dual-readout group."""
+
+    group: int
+    donor_ctrl_port: int
+
+
 PORT_DIRECTION: Final = {
     PortType.READ_IN: "in",
     PortType.READ_OUT: "out",
@@ -136,6 +143,21 @@ DUAL_READOUT_PORT_LAYOUTS: Final[dict[BoxType, dict[int, DualReadoutPortLayout]]
     },
 }
 
+DUAL_READOUT_DONOR_CTRL_PORTS: Final[dict[BoxType, dict[int, frozenset[int]]]] = {
+    BoxType.QUEL1_A: {
+        0: frozenset({2, 4}),
+        1: frozenset({9, 11}),
+    },
+    BoxType.QUBE_RIKEN_A: {
+        0: frozenset({5, 6}),
+        1: frozenset({7, 8}),
+    },
+    BoxType.QUBE_OU_A: {
+        0: frozenset({5, 6}),
+        1: frozenset({7, 8}),
+    },
+}
+
 
 def resolve_dual_readout_groups(
     box_type: BoxType,
@@ -158,6 +180,40 @@ def resolve_dual_readout_groups(
         if group in layouts:
             groups.add(group)
     return frozenset(groups)
+
+
+def _normalize_dual_readout_routes(
+    *,
+    box_type: BoxType,
+    options: Sequence[str] | None,
+    routes: Sequence[DualReadoutRouteConfig | Mapping[str, int]] | None,
+) -> tuple[DualReadoutRouteConfig, ...]:
+    """Normalize and validate explicit dual-readout donor routes."""
+    normalized = tuple(
+        route
+        if isinstance(route, DualReadoutRouteConfig)
+        else DualReadoutRouteConfig(**route)
+        for route in routes or ()
+    )
+    groups = [route.group for route in normalized]
+    if len(groups) != len(set(groups)):
+        raise ValueError("Only one dual-readout route may be defined per group.")
+
+    enabled_groups = resolve_dual_readout_groups(box_type, options)
+    eligible_ports_by_group = DUAL_READOUT_DONOR_CTRL_PORTS.get(box_type, {})
+    for route in normalized:
+        if route.group not in enabled_groups:
+            raise ValueError(
+                f"Dual-readout route group {route.group} is not enabled in box options."
+            )
+        eligible_ports = eligible_ports_by_group.get(route.group, frozenset())
+        if route.donor_ctrl_port not in eligible_ports:
+            raise ValueError(
+                f"Port {route.donor_ctrl_port} cannot donate an AWG to dual-readout "
+                f"group {route.group} on box type {box_type.value}. "
+                f"Expected one of {sorted(eligible_ports)}."
+            )
+    return normalized
 
 
 def is_dual_readout_port(
@@ -568,17 +624,22 @@ def _get_number_of_channels(
     box_type: BoxType,
     port_number: int | tuple[int, int],
     options: Sequence[str] | None = None,
+    dual_readout_routes: Sequence[DualReadoutRouteConfig] | None = None,
 ) -> int:
     """Return the number of channels for a box port with optional profile overrides."""
     if isinstance(port_number, int):
         dual_readout_layouts = DUAL_READOUT_PORT_LAYOUTS.get(box_type, {})
+        donor_port_by_group = {
+            route.group: route.donor_ctrl_port for route in dual_readout_routes or ()
+        }
         for group in resolve_dual_readout_groups(box_type, options):
             layout = dual_readout_layouts[group]
             if port_number == layout.read_in_port:
                 return 5
             if port_number == layout.read_out_port:
                 return 2
-            if port_number == layout.donor_ctrl_port:
+            donor_ctrl_port = donor_port_by_group.get(group, layout.donor_ctrl_port)
+            if port_number == donor_ctrl_port:
                 return 2
     if box_type == BoxType.QUEL1SE_R8:
         awg_option = _resolve_quel1se_r8_awg_option(options)
@@ -594,6 +655,7 @@ def _initialize_ports(
     box_type: BoxType,
     port_numbers: Sequence[int] | None = None,
     options: Sequence[str] | None = None,
+    dual_readout_routes: Sequence[DualReadoutRouteConfig] | None = None,
 ) -> tuple[GenPort | CapPort, ...]:
     """Initialize ports for a box based on mapping rules."""
     ports: list[GenPort | CapPort] = []
@@ -632,7 +694,12 @@ def _initialize_ports(
             port_id = f"{box_id}.FOGI{index}"
         else:
             raise ValueError(f"Invalid port type: {port_type}")
-        n_channels = _get_number_of_channels(box_type, port_num, options=options)
+        n_channels = _get_number_of_channels(
+            box_type,
+            port_num,
+            options=options,
+            dual_readout_routes=dual_readout_routes,
+        )
         port: GenPort | CapPort | Port
         if port_type == PortType.NOT_AVAILABLE:
             continue
@@ -751,6 +818,7 @@ class Box(MutableModel):
     address: str
     adapter: str
     options: tuple[str, ...] = ()
+    dual_readout_routes: tuple[DualReadoutRouteConfig, ...] = ()
     ports: tuple[GenPort | CapPort, ...]
 
     @classmethod
@@ -764,10 +832,17 @@ class Box(MutableModel):
         adapter: str,
         port_numbers: Sequence[int] | None = None,
         options: Sequence[str] | None = None,
+        dual_readout_routes: Sequence[DualReadoutRouteConfig | Mapping[str, int]]
+        | None = None,
     ) -> Box:
         """Create a box with ports from settings."""
         type = BoxType(type) if isinstance(type, str) else type
         options_tuple = tuple(options or ())
+        routes_tuple = _normalize_dual_readout_routes(
+            box_type=type,
+            options=options_tuple,
+            routes=dual_readout_routes,
+        )
         return cls(
             id=id,
             name=name,
@@ -775,7 +850,14 @@ class Box(MutableModel):
             address=address,
             adapter=adapter,
             options=options_tuple,
-            ports=_initialize_ports(id, type, port_numbers, options=options_tuple),
+            dual_readout_routes=routes_tuple,
+            ports=_initialize_ports(
+                id,
+                type,
+                port_numbers,
+                options=options_tuple,
+                dual_readout_routes=routes_tuple,
+            ),
         )
 
     @property

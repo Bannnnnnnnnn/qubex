@@ -68,6 +68,7 @@ class Quel1SystemSynchronizer:
                 box_name=box.id,
                 ipaddr_wss=box.address,
                 boxtype=box.type.value,
+                dual_readout_routes=box.dual_readout_routes,
             )
 
             for port in box.ports:
