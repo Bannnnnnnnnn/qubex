@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, Final
@@ -11,24 +12,71 @@ from qubex.third_party.ons61797 import ONS61797
 
 # TODO: Make port configurable
 PORT: Final = "/dev/ttyACM0"
+logger = logging.getLogger(__name__)
 
 
 @contextmanager
 def dc_voltage(voltages: dict[int, float]) -> Iterator[ONS61797]:
-    """Temporarily apply DC voltages and restore originals on exit."""
+    """
+    Temporarily apply DC voltages and restore originals on exit.
+
+    Notes
+    -----
+    Cleanup attempts voltage restoration, output disable, and connection close
+    independently. A setup or context-body exception takes precedence over
+    cleanup errors; otherwise, the first cleanup error is raised.
+    """
+    ons61797: ONS61797 | None = None
+    original_voltages: dict[int, float] = {}
+    touched_channels: list[int] = []
+    primary_error: BaseException | None = None
     try:
         ons61797 = ONS61797(port=PORT)
-        original_voltages = {}
         for channel, voltage in voltages.items():
+            touched_channels.append(channel)
             original_voltages[channel] = ons61797.get_voltage(channel)
             ons61797.set_voltage(channel, voltage)
             ons61797.on(channel)
         yield ons61797
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        for channel, voltage in original_voltages.items():
-            ons61797.set_voltage(channel, voltage)
-            ons61797.off(channel)
-        ons61797.close()
+        cleanup_errors: list[tuple[str, BaseException]] = []
+        if ons61797 is not None:
+            for channel in touched_channels:
+                if channel in original_voltages:
+                    try:
+                        ons61797.set_voltage(
+                            channel,
+                            original_voltages[channel],
+                        )
+                    except BaseException as exc:
+                        cleanup_errors.append(
+                            (f"restoring channel {channel} voltage", exc)
+                        )
+                try:
+                    ons61797.off(channel)
+                except BaseException as exc:
+                    cleanup_errors.append((f"disabling channel {channel}", exc))
+            try:
+                ons61797.close()
+            except BaseException as exc:
+                cleanup_errors.append(("closing the DC supply connection", exc))
+
+        if cleanup_errors:
+            if primary_error is not None:
+                errors_to_log = cleanup_errors
+            else:
+                errors_to_log = cleanup_errors[1:]
+            for operation, error in errors_to_log:
+                logger.error(
+                    "DC voltage cleanup failed while %s.",
+                    operation,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+            if primary_error is None:
+                raise cleanup_errors[0][1]
 
 
 def with_connection(func: Callable[..., Any]) -> Callable[..., Any]:

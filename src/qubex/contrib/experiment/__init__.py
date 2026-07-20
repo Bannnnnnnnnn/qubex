@@ -33,6 +33,7 @@ from .gf_calibration import (
     gf_ramsey_experiment,
     obtain_gf_rabi_params,
 )
+from .jpa_calibration import JPAConstraintError, calibrate_jpa
 from .measure_efh_chevron_pattern import (
     estimate_ef_frequency_from_chevron,
     estimate_ef_frequency_from_chevron_adaptive,
@@ -96,11 +97,13 @@ from .thermal_excitation_characterization import (
 )
 
 __all__ = [
+    "JPAConstraintError",
     "analyze_chevron_matched_transform",
     "calibrate_cr_pi_pulse",
     "calibrate_gf_hpi_pulse",
     "calibrate_gf_pi_pulse",
     "calibrate_gf_pulse",
+    "calibrate_jpa",
     "characterize_coarse_readout_parameters",
     "characterize_readout_parameters",
     "ckp_measurement_v2",
