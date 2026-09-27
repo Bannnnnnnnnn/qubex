@@ -208,6 +208,47 @@ def test_get_quel1_box_reconnects_box_with_default_threshold(monkeypatch) -> Non
     ]
 
 
+def test_reboot_fpga_uses_command_from_current_python_environment(
+    monkeypatch, tmp_path
+) -> None:
+    """Given no PATH command, reboot should use the current environment's script."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    python_executable = bin_dir / "python"
+    reboot_executable = bin_dir / "quel_reboot_fpga"
+    reboot_executable.touch()
+    calls: list[tuple[list[str], bool]] = []
+    fake_manager = FakeSystemManager(
+        experiment_system=SimpleNamespace(
+            get_box=lambda box_id: SimpleNamespace(adapter=f"{box_id}-adapter")
+        ),
+        backend_controller=FakeBackendController(),
+    )
+
+    def _record_run(command: list[str], *, check: bool) -> None:
+        calls.append((command, check))
+
+    monkeypatch.setattr(experiment_tool, "system_manager", fake_manager)
+    monkeypatch.setattr(experiment_tool.shutil, "which", lambda _: None)
+    monkeypatch.setattr(experiment_tool.sys, "executable", str(python_executable))
+    monkeypatch.setattr(experiment_tool.subprocess, "run", _record_run)
+
+    experiment_tool.reboot_fpga("Q2A")
+
+    assert calls == [
+        (
+            [
+                str(reboot_executable),
+                "--port",
+                "3121",
+                "--adapter",
+                "Q2A-adapter",
+            ],
+            True,
+        )
+    ]
+
+
 def test_print_chip_info_uses_active_system_id_for_chip_summary(
     monkeypatch, tmp_path
 ) -> None:

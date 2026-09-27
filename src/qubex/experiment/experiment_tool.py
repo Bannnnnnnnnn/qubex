@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import math
+import shutil
 import subprocess
+import sys
 from collections import defaultdict
 from collections.abc import Collection
 from pathlib import Path
@@ -210,7 +212,18 @@ def reboot_fpga(box_id: str) -> None:
     experiment_system = system_manager.experiment_system
     box = experiment_system.get_box(box_id)
     adapter = box.adapter
-    reboot_command = ["quel_reboot_fpga", "--port", "3121", "--adapter", adapter]
+    executable = shutil.which("quel_reboot_fpga")
+    if executable is None:
+        environment_executable = Path(sys.executable).parent / "quel_reboot_fpga"
+        if environment_executable.is_file():
+            executable = str(environment_executable)
+        else:
+            raise FileNotFoundError(
+                "quel_reboot_fpga is not installed in the current Python "
+                "environment or available on PATH. Install quel_staging_tool "
+                "in the environment used to run qubex."
+            )
+    reboot_command = [executable, "--port", "3121", "--adapter", adapter]
     subprocess.run(reboot_command, check=True)  # noqa: S603
 
 
