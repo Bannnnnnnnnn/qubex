@@ -1,0 +1,73 @@
+{
+  "notes": [
+    "Verify the inferred symbolic qubit mapping before use.",
+    "Do not increase calibration_valid_days merely to bypass stale data.",
+    "Calibrate all eight directed data-to-ancilla CR edges first.",
+    "Set acknowledge_native_frame_calibration only after serial-context validation.",
+    "Set shot_interval_ns from repetition/recovery calibration. acknowledge_initial_ground_state is required only when initial_ground_postselection is disabled.",
+    "Set initial_readout_recovery_delay_ns and acknowledge_initial_readout_calibration only after validating simultaneous seven-qubit herald readout and resonator recovery."
+  ],
+  "qubex": {
+    "system_id": "64Qv3",
+    "config_dir": "/home/ban/workspace_2026/qubex-config-local-dual-readout/64Qv3/config",
+    "params_dir": "/home/ban/workspace_2026/qubex-config-local-dual-readout/64Qv3/params",
+    "calib_note_path": "/home/ban/workspace_2026/.calibration/64Qv3.json",
+    "configuration_mode": "ge-ef-cr",
+    "calibration_valid_days": null
+  },
+  "surface_code": {
+    "qubit_map": {
+      "D1": "Q36",
+      "D2": "Q23",
+      "D3": "Q39",
+      "D4": "Q40",
+      "A1": "Q22",
+      "A2": "Q37",
+      "A3": "Q42"
+    },
+    "logical_state": "0L",
+    "custom_bitstring": null,
+    "initial_basis": null,
+    "n_stabilizer_rounds": 1,
+    "final_basis": "Z",
+    "final_measurement_axes": null,
+    "syndrome_mode": "postselect",
+    "postselect_syndrome": [
+      0,
+      0,
+      0
+    ],
+    "n_shots": 10000,
+    "shot_interval_ns": 307200,
+    "use_simultaneous_cr": false,
+    "reset_strategy": "shot_boundary",
+    "passive_reset_delay_ns": null,
+    "hadamard_decomposition": "Y90-X180",
+    "readout_inversion": {
+      "A1": false,
+      "A2": false,
+      "A3": false
+    },
+    "data_readout_inversion": {
+      "D1": false,
+      "D2": false,
+      "D3": false,
+      "D4": false
+    },
+    "dd": {
+      "enabled": false,
+      "pulse_axes": [],
+      "repeat_count": 1,
+      "during_syndrome_readout": true,
+      "during_reset": true
+    },
+    "cr_overrides": {},
+    "classifier_threshold": null,
+    "initial_ground_postselection": true,
+    "initial_readout_recovery_delay_ns": 128,
+    "acknowledge_native_frame_calibration": true,
+    "acknowledge_initial_ground_state": true,
+    "acknowledge_initial_readout_calibration": true,
+    "max_waveform_amplitude": null
+  }
+}
