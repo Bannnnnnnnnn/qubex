@@ -76,14 +76,14 @@ class ExperimentSystem:
     ):
         self._quantum_system: Final = quantum_system
         self._control_system: Final = control_system
-        self._wiring_info: Final = wiring_info
+        self._wiring_info = wiring_info
         self._control_params: Final = control_params
         self._measurement_defaults: Final = (
             measurement_defaults or MeasurementDefaults()
         )
         self._targets_to_exclude: Final = targets_to_exclude or []
         self._configuration_mode: ConfigurationMode = configuration_mode
-        self._qubit_port_set_map: Final = self._create_qubit_port_set_map()
+        self._qubit_port_set_map = self._create_qubit_port_set_map()
         self._rebuild_configuration(mode=self._configuration_mode)
 
     @property
@@ -113,6 +113,34 @@ class ExperimentSystem:
     def wiring_info(self) -> WiringInfo:
         """Return wiring information for the system."""
         return self._wiring_info
+
+    def copy_wiring_info(self) -> WiringInfo:
+        """Return a shallow copy of wiring relationships."""
+        return WiringInfo(
+            ctrl=list(self.wiring_info.ctrl),
+            read_out=list(self.wiring_info.read_out),
+            read_in=list(self.wiring_info.read_in),
+            pump=list(self.wiring_info.pump),
+        )
+
+    def replace_wiring_info(
+        self,
+        wiring_info: WiringInfo,
+        *,
+        mode: ConfigurationMode | None = None,
+    ) -> None:
+        """Replace wiring relationships and rebuild runtime target mappings."""
+        previous_wiring_info = self._wiring_info
+        previous_mode = self._configuration_mode
+        if mode is None:
+            mode = previous_mode
+        self._wiring_info = wiring_info
+        try:
+            self._rebuild_configuration(mode=mode)
+        except Exception:
+            self._wiring_info = previous_wiring_info
+            self._rebuild_configuration(mode=previous_mode)
+            raise
 
     @property
     def control_params(self) -> ControlParameters:
@@ -497,6 +525,7 @@ class ExperimentSystem:
     ) -> None:
         """Recompute port settings and target mappings for one configuration mode."""
         self._configuration_mode = mode
+        self._qubit_port_set_map = self._create_qubit_port_set_map()
         self._configure_ports(mode=mode)
         self._target_registry = self._build_target_registry()
 

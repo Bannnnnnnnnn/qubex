@@ -51,6 +51,13 @@ class Quel1SystemSynchronizer:
             raise ValueError(
                 "Clock master address is required for multi-box QuEL-1 synchronization."
             )
+        reset_system_config_database = getattr(
+            self._backend_controller,
+            "reset_system_config_database",
+            None,
+        )
+        if callable(reset_system_config_database):
+            reset_system_config_database()
         if clock_master_address is not None:
             self._backend_controller.define_clockmaster(
                 ipaddr=clock_master_address,

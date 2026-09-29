@@ -756,6 +756,10 @@ class Quel1BackendController(BackendController):
         """Clear cached box configuration data."""
         self._connection_manager.clear_cache()
 
+    def reset_system_config_database(self) -> None:
+        """Clear generated qubecalib system database entries."""
+        self._configuration_manager.reset_system_config_database()
+
     def get_box_config_cache(self) -> dict[str, Any]:
         """Return a snapshot of the box-config cache."""
         return deepcopy(self.box_config)

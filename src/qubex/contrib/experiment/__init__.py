@@ -80,6 +80,11 @@ from .readout_parameters_characterization import (
 )
 from .repeated_coherence_measurement import repeated_coherence_measurement
 from .rzx_gate import rzx, rzx_gate_property
+from .s159a_mux_measurement import (
+    disable_s159a_mux_measurement,
+    enable_s159a_mux_measurement,
+    s159a_mux_measurement,
+)
 from .simultaneous_coherence_measurement import simultaneous_coherence_measurement
 from .simultaneous_qubit_spectroscopy import simultaneous_qubit_spectroscopy
 from .stark_characterization import stark_ramsey_experiment, stark_t1_experiment
@@ -112,6 +117,8 @@ __all__ = [
     "create_measurement_rounds",
     "create_mqc_sequence",
     "decompose_cr_crosstalk",
+    "disable_s159a_mux_measurement",
+    "enable_s159a_mux_measurement",
     "estimate_qubit_frequency_from_chevron",
     "estimate_qubit_frequency_from_chevron_adaptive",
     "filtered_ckp_experiment",
@@ -150,6 +157,7 @@ __all__ = [
     "repeated_coherence_measurement",
     "rzx",
     "rzx_gate_property",
+    "s159a_mux_measurement",
     "simultaneous_coherence_measurement",
     "simultaneous_qubit_spectroscopy",
     "stark_ramsey_experiment",

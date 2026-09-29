@@ -390,3 +390,86 @@ def test_sync_model_requires_clockmaster_for_multiple_boxes() -> None:
         synchronizer.sync_experiment_system_to_backend_controller(
             cast(Any, experiment_system)
         )
+
+
+def test_sync_model_resets_generated_target_relations_before_rebuild() -> None:
+    """Given stale target relations, when syncing model, then only rebuilt relations remain."""
+
+    class _BackendController:
+        def __init__(self) -> None:
+            self.reset_calls = 0
+            self.relation_channel_target = [("R20A-5-0", "Q10")]
+            self.target_settings: dict[str, dict[str, float]] = {
+                "Q10": {"frequency": 6.5}
+            }
+
+        def reset_system_config_database(self) -> None:
+            self.reset_calls += 1
+            self.relation_channel_target.clear()
+            self.target_settings.clear()
+
+        def define_clockmaster(self, **_: Any) -> None:
+            return None
+
+        def set_box_options(self, *_: Any, **__: Any) -> None:
+            return None
+
+        def define_box(self, **_: Any) -> None:
+            return None
+
+        def define_port(self, **_: Any) -> None:
+            return None
+
+        def define_channel(self, **_: Any) -> None:
+            return None
+
+        def add_channel_target_relation(self, **kwargs: Any) -> None:
+            self.relation_channel_target.append(
+                (kwargs["channel_name"], kwargs["target_name"])
+            )
+
+        def define_target(self, **kwargs: Any) -> None:
+            self.target_settings[kwargs["target_name"]] = {
+                "frequency": kwargs["target_frequency_ghz"]
+            }
+            self.relation_channel_target.append(
+                (kwargs["channel_name"], kwargs["target_name"])
+            )
+
+        def clear_command_queue(self) -> None:
+            return None
+
+        def clear_cache(self) -> None:
+            return None
+
+    backend_controller = _BackendController()
+    synchronizer = Quel1SystemSynchronizer(
+        backend_controller=cast(Any, backend_controller)
+    )
+    box = Box.new(
+        id="S159A",
+        name="S159A",
+        type="quel1se-riken8",
+        address="127.0.0.1",
+        adapter="A0",
+        port_numbers=[],
+    )
+    target = SimpleNamespace(
+        label="Q10",
+        channel=SimpleNamespace(id="S159A-2-0"),
+        frequency=6.7,
+    )
+    experiment_system = SimpleNamespace(
+        control_system=SimpleNamespace(clock_master_address=None, boxes=[box]),
+        control_params=SimpleNamespace(),
+        all_targets=[target],
+    )
+
+    synchronizer.sync_experiment_system_to_backend_controller(
+        cast(Any, experiment_system)
+    )
+
+    assert backend_controller.reset_calls == 1
+    assert ("R20A-5-0", "Q10") not in backend_controller.relation_channel_target
+    assert ("S159A-2-0", "Q10") in backend_controller.relation_channel_target
+    assert backend_controller.target_settings["Q10"] == {"frequency": 6.7}

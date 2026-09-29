@@ -144,6 +144,16 @@ class Quel1ConfigurationManager:
             reset=False,
         )
 
+    def reset_system_config_database(self) -> None:
+        """Clear generated system config while preserving skew calibration state."""
+        sysdb = self._runtime_context.qubecalib.sysdb
+        sysdb._clockmaster_setting = None
+        sysdb._box_settings.clear()
+        sysdb._port_settings.clear()
+        sysdb._relation_channel_target.clear()
+        sysdb._target_settings.clear()
+        sysdb._relation_channel_port.clear()
+
     def define_box(
         self,
         *,

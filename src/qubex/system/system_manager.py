@@ -767,6 +767,10 @@ This operation will overwrite the existing backend settings. Do you want to cont
             backend_settings=backend_settings,
         )
 
+    def sync_experiment_system_to_backend_controller(self) -> None:
+        """Rebuild backend controller state from the current experiment system."""
+        self._sync_experiment_system_to_backend_controller()
+
     def _sync_experiment_system_to_backend_controller(self) -> None:
         """Rebuild backend controller state via backend-specific synchronizer."""
         system_synchronizer = self._resolve_system_synchronizer()
