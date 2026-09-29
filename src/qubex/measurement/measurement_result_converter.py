@@ -112,8 +112,11 @@ class MeasurementResultConverter:
         else:
             resolved_config = config
         classifier_map = {} if classifiers is None else classifiers
+        classifier_lookup_labels = result.classifier_lookup_labels or {}
         resolved_classifiers: dict[str, StateClassifier | None] = {
-            target: classifier_map.get(target) for target in result.data
+            target: classifier_map.get(target)
+            or classifier_map.get(classifier_lookup_labels.get(target, target))
+            for target in result.data
         }
         legacy_data: dict[str, list[MeasureData]] = {}
         for target, captures in result.data.items():
@@ -180,8 +183,11 @@ class MeasurementResultConverter:
             If `index` is out of range for any target.
         """
         classifier_map = {} if classifiers is None else classifiers
+        classifier_lookup_labels = result.classifier_lookup_labels or {}
         resolved_classifiers: dict[str, StateClassifier | None] = {
-            target: classifier_map.get(target) for target in result.data
+            target: classifier_map.get(target)
+            or classifier_map.get(classifier_lookup_labels.get(target, target))
+            for target in result.data
         }
         single_data: dict[str, MeasureData] = {}
         resolved_mode: MeasureMode | None = None

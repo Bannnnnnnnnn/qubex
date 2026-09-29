@@ -82,6 +82,13 @@ class CalibrationService:
         sampling_period = getattr(measurement, "sampling_period", None)
         return ExperimentUtil.resolve_sampling_period(sampling_period)
 
+    def _target_qubit_label(self, target: str) -> str:
+        """Resolve a target label to its physical qubit label when possible."""
+        try:
+            return self.ctx.resolve_qubit_label(target)
+        except (AttributeError, KeyError, ValueError):
+            return target
+
     def correct_rabi_params(
         self,
         targets: Collection[str] | str | None = None,
@@ -790,13 +797,14 @@ class CalibrationService:
         sampling_period_ns = self._measurement_sampling_period_ns()
 
         def calibrate(target: str) -> FitResult:
+            qubit_label = self._target_qubit_label(target)
             # hpi
             if pulse_type == "hpi":
                 hpi_param = self.ctx.calib_note.get_drag_hpi_param(target)
                 if hpi_param is not None and use_stored_beta:
                     beta = hpi_param["beta"]
                 else:
-                    beta = -drag_coeff / self.ctx.qubits[target].alpha
+                    beta = -drag_coeff / self.ctx.qubits[qubit_label].alpha
 
                 pulse = Drag(
                     duration=duration if duration is not None else DRAG_HPI_DURATION,
@@ -816,7 +824,7 @@ class CalibrationService:
                 if pi_param is not None and use_stored_beta:
                     beta = pi_param["beta"]
                 else:
-                    beta = -drag_coeff / self.ctx.qubits[target].alpha
+                    beta = -drag_coeff / self.ctx.qubits[qubit_label].alpha
 
                 pulse = Drag(
                     duration=duration if duration is not None else DRAG_PI_DURATION,
@@ -1190,7 +1198,8 @@ class CalibrationService:
                 )
             else:
                 beta = {
-                    target: -drag_coeff / self.ctx.qubits[target].alpha
+                    target: -drag_coeff
+                    / self.ctx.qubits[self._target_qubit_label(target)].alpha
                     for target in targets
                 }
 
@@ -1314,7 +1323,8 @@ class CalibrationService:
                 )
             else:
                 beta = {
-                    target: -drag_coeff / self.ctx.qubits[target].alpha
+                    target: -drag_coeff
+                    / self.ctx.qubits[self._target_qubit_label(target)].alpha
                     for target in targets
                 }
 

@@ -135,9 +135,23 @@ class ExperimentUtil:
             Subgroups of qubits.
         """
         # TODO: Implement a more general method
-        qubit_labels = list(qubits)
+        target_labels = list(qubits)
         system = SystemManager.shared().experiment_system
-        qubit_objects = [system.get_qubit(qubit) for qubit in qubit_labels]
-        group03 = [qubit.label for qubit in qubit_objects if qubit.index % 4 in [0, 3]]
-        group12 = [qubit.label for qubit in qubit_objects if qubit.index % 4 in [1, 2]]
+        labeled_qubits = []
+        for target_label in target_labels:
+            try:
+                qubit_label = system.resolve_qubit_label(target_label)
+            except (AttributeError, KeyError, ValueError):
+                qubit_label = target_label
+            labeled_qubits.append((target_label, system.get_qubit(qubit_label)))
+        group03 = [
+            target_label
+            for target_label, qubit in labeled_qubits
+            if qubit.index % 4 in [0, 3]
+        ]
+        group12 = [
+            target_label
+            for target_label, qubit in labeled_qubits
+            if qubit.index % 4 in [1, 2]
+        ]
         return [group03, group12]

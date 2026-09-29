@@ -62,6 +62,11 @@ from .experiment.multipartite_entanglement import (
     partial_transpose,
     visualize_graph,
 )
+from .experiment.mux_pulse import (
+    calibrate_drag_mux_pulse,
+    calibrate_mux_pulse,
+    ncopy_randomized_benchmarking,
+)
 from .experiment.purity_benchmarking import (
     interleaved_purity_benchmarking,
     ipb_experiment,
@@ -106,9 +111,11 @@ from .experiment.thermal_excitation_characterization import (
 __all__ = [
     "analyze_chevron_matched_transform",
     "calibrate_cr_pi_pulse",
+    "calibrate_drag_mux_pulse",
     "calibrate_gf_hpi_pulse",
     "calibrate_gf_pi_pulse",
     "calibrate_gf_pulse",
+    "calibrate_mux_pulse",
     "characterize_coarse_readout_parameters",
     "characterize_readout_parameters",
     "ckp_measurement_v2",
@@ -151,6 +158,7 @@ __all__ = [
     "measurement_induced_dephasing",
     "measurement_induced_dephasing_experiment",
     "mqc_experiment",
+    "ncopy_randomized_benchmarking",
     "obtain_anharmonicity_with_cr",
     "obtain_gf_rabi_params",
     "parity_oscillation",

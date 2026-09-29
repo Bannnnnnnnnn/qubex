@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -27,6 +28,9 @@ from qubex.measurement.models.quel1_measurement_options import Quel1MeasurementO
 from qubex.system import ExperimentSystem, TargetRegistry
 
 from ._capture_shape import normalize_shot_averaged_capture_array
+
+_MEASUREMENT_OUTPUT_LABELS_KEY = "measurement_output_labels"
+_CLASSIFIER_LOOKUP_LABELS_KEY = "classifier_lookup_labels"
 
 if TYPE_CHECKING:
     import numpy.typing as npt
@@ -280,6 +284,7 @@ class Quel1MeasurementBackendAdapter:
         )
         return BackendExecutionRequest(
             payload=payload,
+            metadata=self._build_request_metadata(schedule=schedule),
         )
 
     def build_measurement_result(
@@ -289,6 +294,7 @@ class Quel1MeasurementBackendAdapter:
         measurement_config: MeasurementConfig,
         device_config: dict,
         sampling_period: float,
+        request_metadata: Mapping[str, object] | None = None,
     ) -> MeasurementResult:
         """Build canonical result from a QuEL-1 backend result payload."""
         if not isinstance(backend_result, Quel1BackendExecutionResult):
@@ -299,7 +305,14 @@ class Quel1MeasurementBackendAdapter:
         shot_averaging = measurement_config.shot_averaging
         skip_extra_capture = self._constraint_profile.require_workaround_capture
         norm_factor = 2 ** (-32)  # normalization factor for 32-bit data
-        target_registry = getattr(self._experiment_system, "target_registry", None)
+        measurement_output_labels = self._metadata_str_map(
+            request_metadata,
+            _MEASUREMENT_OUTPUT_LABELS_KEY,
+        )
+        classifier_lookup_labels = self._metadata_str_map(
+            request_metadata,
+            _CLASSIFIER_LOOKUP_LABELS_KEY,
+        )
 
         iq_data: dict[str, list[npt.ArrayLike]] = {}
         for target, iqs in sorted(backend_result.data.items()):
@@ -318,15 +331,10 @@ class Quel1MeasurementBackendAdapter:
         measure_data: dict[str, list[CaptureData]] = {}
         if not shot_averaging:
             for target, iqs in iq_data.items():
-                if target_registry is not None and hasattr(
-                    target_registry,
-                    "measurement_output_label",
-                ):
-                    qubit = str(target_registry.measurement_output_label(target))
-                elif target.startswith("R"):
-                    qubit = target[1:]
-                else:
-                    qubit = target
+                output_target = measurement_output_labels.get(
+                    target,
+                    self._default_measurement_output_label(target),
+                )
                 values: list[CaptureData] = []
                 for index, iq in enumerate(iqs):
                     if skip_extra_capture and index == 0:
@@ -334,7 +342,7 @@ class Quel1MeasurementBackendAdapter:
                         continue
                     values.append(
                         CaptureData.from_primary_data(
-                            target=qubit,
+                            target=output_target,
                             data=_as_read_only_array(
                                 np.asarray(iq, dtype=np.complex128) * norm_factor
                             ),
@@ -342,18 +350,13 @@ class Quel1MeasurementBackendAdapter:
                             sampling_period=sampling_period,
                         )
                     )
-                measure_data[qubit] = values
+                measure_data.setdefault(output_target, []).extend(values)
         else:
             for target, iqs in iq_data.items():
-                if target_registry is not None and hasattr(
-                    target_registry,
-                    "measurement_output_label",
-                ):
-                    qubit = str(target_registry.measurement_output_label(target))
-                elif target.startswith("R"):
-                    qubit = target[1:]
-                else:
-                    qubit = target
+                output_target = measurement_output_labels.get(
+                    target,
+                    self._default_measurement_output_label(target),
+                )
                 values: list[CaptureData] = []
                 for index, iq in enumerate(iqs):
                     if skip_extra_capture and index == 0:
@@ -361,7 +364,7 @@ class Quel1MeasurementBackendAdapter:
                         continue
                     values.append(
                         CaptureData.from_primary_data(
-                            target=qubit,
+                            target=output_target,
                             data=_as_read_only_array(
                                 normalize_shot_averaged_capture_array(iq)
                                 * norm_factor
@@ -371,13 +374,124 @@ class Quel1MeasurementBackendAdapter:
                             sampling_period=sampling_period,
                         )
                     )
-                measure_data[qubit] = values
+                measure_data.setdefault(output_target, []).extend(values)
 
         return MeasurementResult(
             data=measure_data,
             device_config=device_config,
             measurement_config=measurement_config,
+            classifier_lookup_labels=classifier_lookup_labels or None,
         )
+
+    @staticmethod
+    def _metadata_str_map(
+        metadata: Mapping[str, object] | None,
+        key: str,
+    ) -> dict[str, str]:
+        """Return one string-to-string metadata map."""
+        if metadata is None:
+            return {}
+        value = metadata.get(key)
+        if not isinstance(value, Mapping):
+            return {}
+        return {
+            str(item_key): str(item_value)
+            for item_key, item_value in value.items()
+        }
+
+    def _build_request_metadata(
+        self,
+        *,
+        schedule: MeasurementSchedule,
+    ) -> dict[str, object] | None:
+        """Build request metadata needed to restore user-facing result labels."""
+        measurement_output_labels = self._build_measurement_output_labels(
+            schedule=schedule
+        )
+        if not measurement_output_labels:
+            return None
+
+        classifier_lookup_labels = {
+            output_label: self._default_measurement_output_label(capture_target)
+            for capture_target, output_label in measurement_output_labels.items()
+            if output_label != self._default_measurement_output_label(capture_target)
+        }
+        metadata: dict[str, object] = {
+            _MEASUREMENT_OUTPUT_LABELS_KEY: measurement_output_labels,
+        }
+        if classifier_lookup_labels:
+            metadata[_CLASSIFIER_LOOKUP_LABELS_KEY] = classifier_lookup_labels
+        return metadata
+
+    def _build_measurement_output_labels(
+        self,
+        *,
+        schedule: MeasurementSchedule,
+    ) -> dict[str, str]:
+        """Map backend capture targets to requested custom target labels."""
+        capture_targets = set(schedule.capture_schedule.channels)
+        alias_outputs_by_capture: dict[str, list[str]] = {}
+        get_target = getattr(self._experiment_system, "get_target", None)
+        resolve_read_label = getattr(self._experiment_system, "resolve_read_label", None)
+        if not callable(get_target) or not callable(resolve_read_label):
+            return {}
+        for source_label in schedule.pulse_schedule.labels:
+            try:
+                source_target = get_target(source_label)
+            except (AttributeError, KeyError):
+                continue
+            if getattr(source_target, "is_read", False) or getattr(
+                source_target,
+                "is_pump",
+                False,
+            ):
+                continue
+            try:
+                capture_target = resolve_read_label(source_label)
+            except (AttributeError, KeyError, ValueError):
+                continue
+            if capture_target not in capture_targets:
+                continue
+            output_label = self._custom_output_label_for_source(source_label)
+            default_label = self._default_measurement_output_label(capture_target)
+            if output_label == default_label:
+                continue
+            alias_outputs_by_capture.setdefault(capture_target, []).append(output_label)
+
+        measurement_output_labels: dict[str, str] = {}
+        for capture_target, output_labels in alias_outputs_by_capture.items():
+            unique_labels = list(dict.fromkeys(output_labels))
+            if len(unique_labels) > 1:
+                labels = ", ".join(unique_labels)
+                raise ValueError(
+                    "Multiple custom targets map to the same measurement capture "
+                    f"target `{capture_target}`: {labels}."
+                )
+            measurement_output_labels[capture_target] = unique_labels[0]
+        return measurement_output_labels
+
+    def _custom_output_label_for_source(self, source_label: str) -> str:
+        """Return alias label for custom GE targets, otherwise physical qubit label."""
+        default_label = self._default_measurement_output_label(source_label)
+        try:
+            source_target = self._experiment_system.get_target(source_label)
+        except (AttributeError, KeyError):
+            return default_label
+        if getattr(source_target, "is_ge", False) and source_label != default_label:
+            return source_label
+        return default_label
+
+    def _default_measurement_output_label(self, target: str) -> str:
+        """Resolve the default qubit-label measurement output for one target."""
+        target_registry = getattr(self._experiment_system, "target_registry", None)
+        if target_registry is not None and hasattr(
+            target_registry,
+            "measurement_output_label",
+        ):
+            return str(target_registry.measurement_output_label(target))
+        if target.startswith("R"):
+            return target[1:]
+        return target
 
     def _resolve_resource_lookup_target(self, target: str) -> str:
         """Resolve target name used to look up QuEL system resource-map entries."""

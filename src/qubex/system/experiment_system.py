@@ -745,7 +745,7 @@ class ExperimentSystem:
         gen_targets: dict[str, Target],
     ) -> None:
         """Build mode-aware control targets for one QuEL-1-family port."""
-        if port.n_channels not in {1, 2, 3}:
+        if port.n_channels < 1:
             return
 
         traits = box.traits

@@ -41,6 +41,7 @@ class BackendExecutionRequest:
     """Backend-neutral execution request."""
 
     payload: Any
+    metadata: dict[str, Any] | None = None
 
 
 BackendExecutionResult: TypeAlias = Any

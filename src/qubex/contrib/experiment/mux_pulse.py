@@ -14,7 +14,6 @@ from scipy.optimize import curve_fit, least_squares
 import qubex.visualization as viz
 from qubex.analysis import fitting
 from qubex.analysis.fit_result import FitResult, FitStatus
-from qubex.clifford import Clifford
 from qubex.experiment import Experiment
 from qubex.experiment.experiment_constants import (
     CALIBRATION_SHOTS,
@@ -35,6 +34,12 @@ from qubex.pulse import Drag, FlatTop, PulseSchedule, Waveform
 from qubex.typing import TargetMap
 
 from ._deprecated_options import resolve_shot_options
+
+__all__ = [
+    "calibrate_drag_mux_pulse",
+    "calibrate_mux_pulse",
+    "ncopy_randomized_benchmarking",
+]
 
 
 def _normalize_targets(
@@ -187,23 +192,6 @@ def _resolve_x90_map(
     return {target: x90[target] for target in targets}
 
 
-def _apply_final_state(
-    ps: PulseSchedule,
-    targets: Sequence[str],
-    x90: Mapping[str, Waveform],
-    final_state: str,
-) -> None:
-    if len(final_state) != len(targets):
-        raise ValueError("final_state length must match the number of targets.")
-    for target, state in zip(targets, final_state):
-        if state == "0":
-            continue
-        if state == "1":
-            ps.add(target, x90[target].repeated(2))
-            continue
-        raise ValueError("Only computational final states containing 0/1 are supported.")
-
-
 def _complete_probabilities(result: Any, targets: Sequence[str]) -> dict[str, float]:
     probabilities = result.get_probabilities(targets)
     return {
@@ -230,6 +218,73 @@ def _per_target_leakage(
         )
         for index, target in enumerate(targets)
     }
+
+
+def _classifier_has_states(
+    exp: Experiment,
+    target: str,
+    required_states: set[int],
+) -> bool:
+    classifier = exp.ctx.classifiers.get(target)
+    if classifier is None:
+        return False
+
+    classifier_states = set(range(int(classifier.n_states)))
+    centers = getattr(classifier, "centers", None)
+    if centers is not None:
+        classifier_states.update(int(state) for state in centers)
+
+    state_param = exp.calib_note.get_state_param(target)
+    note_states: set[int] = set()
+    if state_param is not None:
+        note_states = {int(state) for state in state_param.get("centers", {})}
+
+    return required_states.issubset(classifier_states) and required_states.issubset(
+        note_states
+    )
+
+
+def _validate_three_state_classifiers(
+    exp: Experiment,
+    targets: Sequence[str],
+) -> None:
+    required_states = {0, 1, 2}
+    missing: dict[str, dict[str, object]] = {}
+    for target in targets:
+        classifier = exp.ctx.classifiers.get(target)
+        state_param = exp.calib_note.get_state_param(target)
+        classifier_states: set[int] = set()
+        if classifier is not None:
+            classifier_states = set(range(int(classifier.n_states)))
+            centers = getattr(classifier, "centers", None)
+            if centers is not None:
+                classifier_states.update(int(state) for state in centers)
+        note_states: set[int] = set()
+        if state_param is not None:
+            note_states = {int(state) for state in state_param.get("centers", {})}
+        if not _classifier_has_states(exp, target, required_states):
+            missing[target] = {
+                "classifier_n_states": None
+                if classifier is None
+                else int(classifier.n_states),
+                "classifier_states": sorted(classifier_states),
+                "state_param_states": sorted(note_states),
+            }
+    if missing:
+        details = "; ".join(
+            (
+                f"{target}: classifier_n_states={info['classifier_n_states']}, "
+                f"classifier_states={info['classifier_states']}, "
+                f"state_param_states={info['state_param_states']}"
+            )
+            for target, info in missing.items()
+        )
+        raise ValueError(
+            "n-copy leakage measurement requires active 3-state classifiers "
+            "with states 0, 1, and 2 for all targets. "
+            "Build them with `ex.build_classifier(targets=targets, n_states=3)` "
+            f"before running leakage RB. Missing/invalid: {details}"
+        )
 
 
 def fit_2d_detuning_map(
@@ -1248,11 +1303,10 @@ def calibrate_drag_beta_mux_pulse(
     q0, q1 = targets
     signals = np.zeros((2, len(beta_ranges[q0]), len(beta_ranges[q1])))
 
-    def add_beta_sequence(ps: PulseSchedule, target: str, beta: float) -> None:
+    def add_beta_drive_sequence(ps: PulseSchedule, target: str, beta: float) -> None:
         param = current_params[target]
         drag_duration = float(duration if duration is not None else param["duration"])
         drag_amplitude = float(param["amplitude"])
-        y90m = exp.pulse.get_hpi_pulse(target).shifted(-np.pi / 2)
         if pulse_type == "hpi":
             x90p = Drag(
                 duration=drag_duration,
@@ -1264,7 +1318,6 @@ def calibrate_drag_beta_mux_pulse(
             for _ in range(n_turns):
                 ps.add(target, x90m)
                 ps.add(target, x90p)
-            ps.add(target, y90m)
         elif pulse_type == "pi":
             x180p = Drag(
                 duration=drag_duration,
@@ -1275,15 +1328,18 @@ def calibrate_drag_beta_mux_pulse(
             for _ in range(n_turns):
                 ps.add(target, x180p)
                 ps.add(target, x180m)
-            ps.add(target, y90m)
         else:
             raise ValueError("Invalid pulse type.")
 
     for i, beta0 in enumerate(beta_ranges[q0]):
         for j, beta1 in enumerate(beta_ranges[q1]):
             with PulseSchedule(targets) as sequence:
-                add_beta_sequence(sequence, q0, float(beta0))
-                add_beta_sequence(sequence, q1, float(beta1))
+                add_beta_drive_sequence(sequence, q0, float(beta0))
+                add_beta_drive_sequence(sequence, q1, float(beta1))
+                sequence.barrier(targets)
+                for target in targets:
+                    y90m = exp.pulse.get_hpi_pulse(target).shifted(-np.pi / 2)
+                    sequence.add(target, y90m)
             result = exp.measure(
                 sequence=sequence,
                 mode="avg",
@@ -1414,34 +1470,6 @@ def calibrate_drag_mux_pulse(
     )
 
 
-def calibrate_drag_hpi_mux_pulse(
-    exp: Experiment,
-    targets: Collection[str] | str | None = None,
-    **kwargs: object,
-) -> Result:
-    """Calibrate simultaneous DRAG half-pi pulses for two muxed targets."""
-    return calibrate_drag_mux_pulse(
-        exp,
-        targets=targets,
-        pulse_type="hpi",
-        **kwargs,
-    )
-
-
-def calibrate_drag_pi_mux_pulse(
-    exp: Experiment,
-    targets: Collection[str] | str | None = None,
-    **kwargs: object,
-) -> Result:
-    """Calibrate simultaneous DRAG pi pulses for two muxed targets."""
-    return calibrate_drag_mux_pulse(
-        exp,
-        targets=targets,
-        pulse_type="pi",
-        **kwargs,
-    )
-
-
 def calibrate_mux_pulse(
     exp: Experiment,
     targets: Collection[str] | str | None = None,
@@ -1522,7 +1550,7 @@ def calibrate_mux_pulse(
     )
 
 
-def ncopy_rb_sequence(
+def _ncopy_rb_sequence(
     exp: Experiment,
     targets: Collection[str] | str | None,
     *,
@@ -1531,16 +1559,11 @@ def ncopy_rb_sequence(
     seed: int | None = None,
     sequence_type: Literal["even", "odd"] = "even",
     odd_target: str | int | None = None,
-    final_state: str | None = None,
-    interleaved_clifford: Clifford | None = None,
-    interleaved_waveform: TargetMap[Waveform] | None = None,
 ) -> PulseSchedule:
     """Build one ncopy RB sequence for muxed single-qubit targets."""
     target_list = _normalize_targets(exp, targets)
     if not target_list:
         raise ValueError("At least one target is required.")
-    if final_state is None:
-        final_state = "0" * len(target_list)
 
     x90_map = _resolve_x90_map(exp, target_list, x90)
     odd_label: str | None = None
@@ -1563,10 +1586,6 @@ def ncopy_rb_sequence(
                 target=target,
                 n=n,
                 x90=x90_map[target],
-                interleaved_waveform=interleaved_waveform.get(target)
-                if interleaved_waveform
-                else None,
-                interleaved_clifford=interleaved_clifford,
                 seed=seed,
             )
             ps.add(target, rb_sequence)
@@ -1576,9 +1595,6 @@ def ncopy_rb_sequence(
             ps.add(odd_label, x90_map[odd_label].repeated(2))
             ps.barrier(target_list)
 
-        _apply_final_state(ps, target_list, x90_map, final_state)
-        ps.barrier(target_list)
-
     return ps
 
 
@@ -1587,58 +1603,45 @@ def _ncopy_sequence_keys(targets: Sequence[str]) -> list[str]:
 
 
 def _arrayify_probability_data(
-    probabilities: Mapping[str, Mapping[str, Mapping[str, list[float]]]],
-) -> dict[str, dict[str, dict[str, NDArray[np.float64]]]]:
+    probabilities: Mapping[str, Mapping[str, list[float]]],
+) -> dict[str, dict[str, NDArray[np.float64]]]:
     return {
-        final_state: {
-            seq_key: {
-                label: np.asarray(values, dtype=np.float64)
-                for label, values in state_probs.items()
-            }
-            for seq_key, state_probs in seq_probs.items()
+        seq_key: {
+            label: np.asarray(values, dtype=np.float64)
+            for label, values in state_probs.items()
         }
-        for final_state, seq_probs in probabilities.items()
+        for seq_key, state_probs in probabilities.items()
     }
 
 
 def _arrayify_curve_data(
-    curves: Mapping[str, Mapping[str, list[float]]],
-) -> dict[str, dict[str, NDArray[np.float64]]]:
+    curves: Mapping[str, list[float]],
+) -> dict[str, NDArray[np.float64]]:
     return {
-        final_state: {
-            seq_key: np.asarray(values, dtype=np.float64)
-            for seq_key, values in seq_curves.items()
-        }
-        for final_state, seq_curves in curves.items()
+        seq_key: np.asarray(values, dtype=np.float64)
+        for seq_key, values in curves.items()
     }
 
 
 def _arrayify_per_target_curve_data(
-    curves: Mapping[str, Mapping[str, Mapping[str, list[float]]]],
-) -> dict[str, dict[str, dict[str, NDArray[np.float64]]]]:
+    curves: Mapping[str, Mapping[str, list[float]]],
+) -> dict[str, dict[str, NDArray[np.float64]]]:
     return {
-        final_state: {
-            seq_key: {
-                target: np.asarray(values, dtype=np.float64)
-                for target, values in target_curves.items()
-            }
-            for seq_key, target_curves in seq_curves.items()
+        seq_key: {
+            target: np.asarray(values, dtype=np.float64)
+            for target, values in target_curves.items()
         }
-        for final_state, seq_curves in curves.items()
+        for seq_key, target_curves in curves.items()
     }
 
 
-def ncopy_rb_experiment(
+def _ncopy_rb_experiment(
     exp: Experiment,
     targets: Collection[str] | str | None,
     *,
     n_cliffords_range: ArrayLike,
     x90: TargetMap[Waveform] | None = None,
     seed: int | None = None,
-    final_states: Collection[str] | str | None = None,
-    interleaved_clifford: Clifford | None = None,
-    interleaved_waveform: TargetMap[Waveform] | None = None,
-    return_raw: bool = False,
     reset_awg_and_capunits: bool = True,
     n_shots: int | None = DEFAULT_SHOTS,
     shot_interval: float | None = DEFAULT_INTERVAL,
@@ -1649,7 +1652,7 @@ def ncopy_rb_experiment(
         n_shots=n_shots,
         shot_interval=shot_interval,
         deprecated_options=deprecated_options,
-        function_name="ncopy_rb_experiment",
+        function_name="ncopy_randomized_benchmarking",
     )
     if deprecated_options:
         unexpected = ", ".join(sorted(deprecated_options))
@@ -1668,137 +1671,117 @@ def ncopy_rb_experiment(
             raise ValueError(f"`{target}` is not a 1Q target.")
 
     n_cliffords = np.asarray(n_cliffords_range, dtype=int)
-    if final_states is None:
-        final_state_list = ["0" * len(target_list)]
-    elif isinstance(final_states, str):
-        final_state_list = [final_states]
-    else:
-        final_state_list = list(final_states)
-    for final_state in final_state_list:
-        if len(final_state) != len(target_list):
-            raise ValueError("Each final state length must match targets.")
-
     sequence_keys = _ncopy_sequence_keys(target_list)
-    probabilities: dict[str, dict[str, dict[str, list[float]]]] = {
-        final_state: {seq_key: defaultdict(list) for seq_key in sequence_keys}
-        for final_state in final_state_list
+    probabilities: dict[str, dict[str, list[float]]] = {
+        seq_key: defaultdict(list) for seq_key in sequence_keys
     }
-    leakage: dict[str, dict[str, list[float]]] = {
-        final_state: {seq_key: [] for seq_key in sequence_keys}
-        for final_state in final_state_list
+    leakage: dict[str, list[float]] = {
+        seq_key: [] for seq_key in sequence_keys
     }
-    per_target_leakage: dict[str, dict[str, dict[str, list[float]]]] = {
-        final_state: {
-            seq_key: {target: [] for target in target_list}
-            for seq_key in sequence_keys
-        }
-        for final_state in final_state_list
+    per_target_leakage: dict[str, dict[str, list[float]]] = {
+        seq_key: {target: [] for target in target_list}
+        for seq_key in sequence_keys
     }
-    raw_result: dict[str, dict[str, list[Any]]] | None = None
-    if return_raw:
-        raw_result = {
-            final_state: {seq_key: [] for seq_key in sequence_keys}
-            for final_state in final_state_list
-        }
-
     for n_clifford in n_cliffords:
-        for final_state in final_state_list:
-            for seq_key in sequence_keys:
-                if seq_key == "even":
-                    sequence = ncopy_rb_sequence(
-                        exp,
-                        target_list,
-                        n=int(n_clifford),
-                        x90=x90,
-                        seed=seed,
-                        sequence_type="even",
-                        final_state=final_state,
-                        interleaved_clifford=interleaved_clifford,
-                        interleaved_waveform=interleaved_waveform,
-                    )
-                else:
-                    odd_index = int(seq_key.removeprefix("odd_"))
-                    sequence = ncopy_rb_sequence(
-                        exp,
-                        target_list,
-                        n=int(n_clifford),
-                        x90=x90,
-                        seed=seed,
-                        sequence_type="odd",
-                        odd_target=odd_index,
-                        final_state=final_state,
-                        interleaved_clifford=interleaved_clifford,
-                        interleaved_waveform=interleaved_waveform,
-                    )
-                result = exp.measure(
-                    sequence=sequence,
-                    mode="single",
-                    n_shots=n_shots,
-                    shot_interval=shot_interval,
-                    reset_awg_and_capunits=reset_awg_and_capunits,
-                    plot=False,
+        for seq_key in sequence_keys:
+            if seq_key == "even":
+                sequence = _ncopy_rb_sequence(
+                    exp,
+                    target_list,
+                    n=int(n_clifford),
+                    x90=x90,
+                    seed=seed,
+                    sequence_type="even",
                 )
-                probs = _complete_probabilities(result, target_list)
-                for label, value in probs.items():
-                    probabilities[final_state][seq_key][label].append(value)
-                leakage[final_state][seq_key].append(_leakage_probability(probs))
-                target_leakage = _per_target_leakage(probs, target_list)
-                for target, value in target_leakage.items():
-                    per_target_leakage[final_state][seq_key][target].append(value)
-                if raw_result is not None:
-                    raw_result[final_state][seq_key].append(result)
+            else:
+                odd_index = int(seq_key.removeprefix("odd_"))
+                sequence = _ncopy_rb_sequence(
+                    exp,
+                    target_list,
+                    n=int(n_clifford),
+                    x90=x90,
+                    seed=seed,
+                    sequence_type="odd",
+                    odd_target=odd_index,
+                )
+            result = exp.measure(
+                sequence=sequence,
+                mode="single",
+                n_shots=n_shots,
+                shot_interval=shot_interval,
+                reset_awg_and_capunits=reset_awg_and_capunits,
+                plot=False,
+            )
+            probs = _complete_probabilities(result, target_list)
+            for label, value in probs.items():
+                probabilities[seq_key][label].append(value)
+            leakage[seq_key].append(_leakage_probability(probs))
+            target_leakage = _per_target_leakage(probs, target_list)
+            for target, value in target_leakage.items():
+                per_target_leakage[seq_key][target].append(value)
 
     data: dict[str, object] = {
         "n_cliffords": n_cliffords,
         "seed": seed,
         "targets": target_list,
-        "final_states": final_state_list,
         "probabilities": _arrayify_probability_data(probabilities),
         "leakage": _arrayify_curve_data(leakage),
         "per_target_leakage": _arrayify_per_target_curve_data(per_target_leakage),
     }
-    if raw_result is not None:
-        data["raw_result"] = raw_result
-
     return Result(data=data)
 
 
 def _aggregate_probability_trials(
     trial_results: Sequence[Result],
-    final_states: Sequence[str],
     sequence_keys: Sequence[str],
     n_cliffords: NDArray[np.int_],
 ) -> tuple[
-    dict[str, dict[str, dict[str, NDArray[np.float64]]]],
-    dict[str, dict[str, dict[str, NDArray[np.float64]]]],
+    dict[str, dict[str, NDArray[np.float64]]],
+    dict[str, dict[str, NDArray[np.float64]]],
 ]:
-    mean: dict[str, dict[str, dict[str, NDArray[np.float64]]]] = {}
-    std: dict[str, dict[str, dict[str, NDArray[np.float64]]]] = {}
+    mean: dict[str, dict[str, NDArray[np.float64]]] = {}
+    std: dict[str, dict[str, NDArray[np.float64]]] = {}
     zeros = np.zeros_like(n_cliffords, dtype=np.float64)
-    for final_state in final_states:
-        mean[final_state] = {}
-        std[final_state] = {}
-        for seq_key in sequence_keys:
-            labels: set[str] = set()
-            for result in trial_results:
-                labels.update(result["probabilities"][final_state][seq_key])
-            mean[final_state][seq_key] = {}
-            std[final_state][seq_key] = {}
-            for label in sorted(labels):
-                curves = [
-                    result["probabilities"][final_state][seq_key].get(label, zeros)
-                    for result in trial_results
-                ]
-                values = np.asarray(curves, dtype=np.float64)
-                mean[final_state][seq_key][label] = np.mean(values, axis=0)
-                std[final_state][seq_key][label] = np.std(values, axis=0)
+    for seq_key in sequence_keys:
+        labels: set[str] = set()
+        for result in trial_results:
+            labels.update(result["probabilities"][seq_key])
+        mean[seq_key] = {}
+        std[seq_key] = {}
+        for label in sorted(labels):
+            curves = [
+                result["probabilities"][seq_key].get(label, zeros)
+                for result in trial_results
+            ]
+            values = np.asarray(curves, dtype=np.float64)
+            mean[seq_key][label] = np.mean(values, axis=0)
+            std[seq_key][label] = np.std(values, axis=0)
     return mean, std
 
 
 def _aggregate_curve_trials(
     trial_results: Sequence[Result],
     key: str,
-    final_states: Sequence[str],
+    sequence_keys: Sequence[str],
+) -> tuple[
+    dict[str, NDArray[np.float64]],
+    dict[str, NDArray[np.float64]],
+]:
+    mean: dict[str, NDArray[np.float64]] = {}
+    std: dict[str, NDArray[np.float64]] = {}
+    for seq_key in sequence_keys:
+        values = np.asarray(
+            [result[key][seq_key] for result in trial_results],
+            dtype=np.float64,
+        )
+        mean[seq_key] = np.mean(values, axis=0)
+        std[seq_key] = np.std(values, axis=0)
+    return mean, std
+
+
+def _aggregate_per_target_leakage_trials(
+    trial_results: Sequence[Result],
+    targets: Sequence[str],
     sequence_keys: Sequence[str],
 ) -> tuple[
     dict[str, dict[str, NDArray[np.float64]]],
@@ -1806,46 +1789,19 @@ def _aggregate_curve_trials(
 ]:
     mean: dict[str, dict[str, NDArray[np.float64]]] = {}
     std: dict[str, dict[str, NDArray[np.float64]]] = {}
-    for final_state in final_states:
-        mean[final_state] = {}
-        std[final_state] = {}
-        for seq_key in sequence_keys:
+    for seq_key in sequence_keys:
+        mean[seq_key] = {}
+        std[seq_key] = {}
+        for target in targets:
             values = np.asarray(
-                [result[key][final_state][seq_key] for result in trial_results],
+                [
+                    result["per_target_leakage"][seq_key][target]
+                    for result in trial_results
+                ],
                 dtype=np.float64,
             )
-            mean[final_state][seq_key] = np.mean(values, axis=0)
-            std[final_state][seq_key] = np.std(values, axis=0)
-    return mean, std
-
-
-def _aggregate_per_target_leakage_trials(
-    trial_results: Sequence[Result],
-    targets: Sequence[str],
-    final_states: Sequence[str],
-    sequence_keys: Sequence[str],
-) -> tuple[
-    dict[str, dict[str, dict[str, NDArray[np.float64]]]],
-    dict[str, dict[str, dict[str, NDArray[np.float64]]]],
-]:
-    mean: dict[str, dict[str, dict[str, NDArray[np.float64]]]] = {}
-    std: dict[str, dict[str, dict[str, NDArray[np.float64]]]] = {}
-    for final_state in final_states:
-        mean[final_state] = {}
-        std[final_state] = {}
-        for seq_key in sequence_keys:
-            mean[final_state][seq_key] = {}
-            std[final_state][seq_key] = {}
-            for target in targets:
-                values = np.asarray(
-                    [
-                        result["per_target_leakage"][final_state][seq_key][target]
-                        for result in trial_results
-                    ],
-                    dtype=np.float64,
-                )
-                mean[final_state][seq_key][target] = np.mean(values, axis=0)
-                std[final_state][seq_key][target] = np.std(values, axis=0)
+            mean[seq_key][target] = np.mean(values, axis=0)
+            std[seq_key][target] = np.std(values, axis=0)
     return mean, std
 
 
@@ -1853,62 +1809,56 @@ def _plot_ncopy_results(
     *,
     targets: Sequence[str],
     n_cliffords: NDArray[np.int_],
-    final_states: Sequence[str],
     sequence_keys: Sequence[str],
-    leakage_mean: Mapping[str, Mapping[str, NDArray[np.float64]]],
-    leakage_std: Mapping[str, Mapping[str, NDArray[np.float64]]],
-    probability_mean: Mapping[str, Mapping[str, Mapping[str, NDArray[np.float64]]]],
-    probability_std: Mapping[str, Mapping[str, Mapping[str, NDArray[np.float64]]]],
+    leakage_mean: Mapping[str, NDArray[np.float64]],
+    leakage_std: Mapping[str, NDArray[np.float64]],
+    probability_mean: Mapping[str, Mapping[str, NDArray[np.float64]]],
+    probability_std: Mapping[str, Mapping[str, NDArray[np.float64]]],
     plot_metric: Literal["leakage", "ground_probability"],
     xaxis_type: Literal["linear", "log"],
     plot: bool,
 ) -> dict[str, go.Figure]:
     figures: dict[str, go.Figure] = {}
     ground_label = "0" * len(targets)
-    for final_state in final_states:
-        for target_index, target in enumerate(targets):
-            odd_key = f"odd_{target_index}"
-            if odd_key not in sequence_keys:
-                continue
-            fig = go.Figure()
-            for seq_key, name in (("even", "even"), (odd_key, "odd")):
-                if plot_metric == "leakage":
-                    y = leakage_mean[final_state][seq_key]
-                    yerr = leakage_std[final_state][seq_key]
-                    ylabel = "Leakage probability"
-                else:
-                    y = probability_mean[final_state][seq_key].get(
-                        ground_label,
-                        np.zeros_like(n_cliffords, dtype=np.float64),
-                    )
-                    yerr = probability_std[final_state][seq_key].get(
-                        ground_label,
-                        np.zeros_like(n_cliffords, dtype=np.float64),
-                    )
-                    ylabel = f"P({ground_label})"
-                fig.add_trace(
-                    go.Scatter(
-                        x=n_cliffords,
-                        y=y,
-                        error_y=dict(type="data", array=yerr),
-                        mode="markers",
-                        name=name,
-                    )
+    for target_index, target in enumerate(targets):
+        odd_key = f"odd_{target_index}"
+        if odd_key not in sequence_keys:
+            continue
+        fig = go.Figure()
+        for seq_key, name in (("even", "even"), (odd_key, "odd")):
+            if plot_metric == "leakage":
+                y = leakage_mean[seq_key]
+                yerr = leakage_std[seq_key]
+                ylabel = "Leakage probability"
+            else:
+                y = probability_mean[seq_key].get(
+                    ground_label,
+                    np.zeros_like(n_cliffords, dtype=np.float64),
                 )
-            fig.update_layout(
-                title=f"ncopy RB : {target} final={final_state}",
-                xaxis_title="Number of Cliffords",
-                yaxis_title=ylabel,
-                xaxis_type=xaxis_type,
-                yaxis_type="linear",
+                yerr = probability_std[seq_key].get(
+                    ground_label,
+                    np.zeros_like(n_cliffords, dtype=np.float64),
+                )
+                ylabel = f"P({ground_label})"
+            fig.add_trace(
+                go.Scatter(
+                    x=n_cliffords,
+                    y=y,
+                    error_y=dict(type="data", array=yerr),
+                    mode="markers",
+                    name=name,
+                )
             )
-            if plot:
-                fig.show(
-                    config=fitting._plotly_config(
-                        f"ncopy_rb_{target}_{final_state}_{plot_metric}"
-                    )
-                )
-            figures[f"{target}_{final_state}_{plot_metric}"] = fig
+        fig.update_layout(
+            title=f"ncopy RB : {target}",
+            xaxis_title="Number of Cliffords",
+            yaxis_title=ylabel,
+            xaxis_type=xaxis_type,
+            yaxis_type="linear",
+        )
+        if plot:
+            fig.show(config=fitting._plotly_config(f"ncopy_rb_{target}_{plot_metric}"))
+        figures[f"{target}_{plot_metric}"] = fig
     return figures
 
 
@@ -1928,22 +1878,386 @@ def _ncopy_metric_curve(
     *,
     targets: Sequence[str],
     target_index: int,
-    final_state: str,
-    leakage_values: Mapping[str, Mapping[str, NDArray[np.float64]]],
-    probability_values: Mapping[
-        str,
-        Mapping[str, Mapping[str, NDArray[np.float64]]],
-    ],
+    leakage_values: Mapping[str, NDArray[np.float64]],
+    probability_values: Mapping[str, Mapping[str, NDArray[np.float64]]],
     plot_metric: Literal["leakage", "ground_probability"],
 ) -> NDArray[np.float64]:
     seq_key = f"odd_{target_index}"
     if plot_metric == "leakage":
-        return leakage_values[final_state][seq_key]
+        return leakage_values[seq_key]
     ground_label = "0" * len(targets)
-    fallback = np.zeros_like(leakage_values[final_state][seq_key], dtype=np.float64)
-    return probability_values[final_state][seq_key].get(
+    fallback = np.zeros_like(leakage_values[seq_key], dtype=np.float64)
+    return probability_values[seq_key].get(
         ground_label,
         fallback,
+    )
+
+
+def _ncopy_exp_decay(n: ArrayLike, amplitude: float, decay: float, offset: float):
+    n_array = np.asarray(n, dtype=np.float64)
+    return amplitude * decay**n_array + offset
+
+
+def _ncopy_odd_decay(
+    n: ArrayLike,
+    real_amplitude: float,
+    real_decay: float,
+    oscillation_amplitude: float,
+    oscillation_decay: float,
+    frequency: float,
+    phase: float,
+    offset: float,
+):
+    n_array = np.asarray(n, dtype=np.float64)
+    return (
+        real_amplitude * real_decay**n_array
+        + oscillation_amplitude
+        * oscillation_decay**n_array
+        * np.cos(2 * np.pi * frequency * n_array + phase)
+        + offset
+    )
+
+
+def _curve_r2(
+    x: NDArray[np.float64],
+    y: NDArray[np.float64],
+    func: Any,
+    popt: NDArray[np.float64],
+) -> float:
+    residual = y - func(x, *popt)
+    total = y - np.mean(y)
+    denominator = float(np.sum(total**2))
+    if denominator == 0.0:
+        return np.nan
+    return float(1 - np.sum(residual**2) / denominator)
+
+
+def _parameter_errors(
+    covariance: NDArray[np.float64],
+    size: int,
+) -> NDArray[np.float64]:
+    if covariance.shape != (size, size):
+        return np.full(size, np.nan, dtype=np.float64)
+    diagonal = np.diag(covariance)
+    diagonal = np.where(diagonal >= 0, diagonal, np.nan)
+    return np.sqrt(diagonal)
+
+
+def _fit_ncopy_exp_decay(
+    *,
+    x: NDArray[np.float64],
+    y: NDArray[np.float64],
+) -> dict[str, object]:
+    if x.size < 3:
+        return {
+            "status": "error",
+            "message": "At least 3 points are required for single-exponential fit.",
+        }
+    amplitude_guess = float(y[0] - y[-1])
+    offset_guess = float(y[-1])
+    p0 = (amplitude_guess, 0.99, offset_guess)
+    bounds = ((-2.0, 0.0, -1.0), (2.0, 1.05, 2.0))
+    try:
+        popt, pcov = curve_fit(
+            _ncopy_exp_decay,
+            x,
+            y,
+            p0=p0,
+            bounds=bounds,
+            maxfev=20000,
+        )
+    except (RuntimeError, ValueError, TypeError) as exc:
+        return {"status": "error", "message": str(exc)}
+
+    errors = _parameter_errors(pcov, 3)
+    return {
+        "status": "success",
+        "model": "A * b**n + c",
+        "A": float(popt[0]),
+        "A_err": float(errors[0]),
+        "decay": float(popt[1]),
+        "decay_err": float(errors[1]),
+        "C": float(popt[2]),
+        "C_err": float(errors[2]),
+        "r2": _curve_r2(x, y, _ncopy_exp_decay, popt),
+        "popt": popt,
+        "pcov": pcov,
+    }
+
+
+def _fit_ncopy_odd_decay(
+    *,
+    x: NDArray[np.float64],
+    y: NDArray[np.float64],
+) -> dict[str, object]:
+    if x.size < 7:
+        return {
+            "status": "error",
+            "message": "At least 7 points are required for odd n-copy fit.",
+        }
+    amplitude_guess = float(y[0] - y[-1])
+    if amplitude_guess == 0.0:
+        amplitude_guess = float(np.max(y) - np.min(y))
+    frequency_guess = 1.0 / max(2.0 * float(np.max(x)), 120.0)
+    p0 = (
+        amplitude_guess,
+        0.85,
+        amplitude_guess,
+        0.95,
+        frequency_guess,
+        0.0,
+        float(y[-1]),
+    )
+    bounds = (
+        (-2.0, 0.0, -2.0, 0.0, 0.0, -2 * np.pi, -1.0),
+        (2.0, 1.05, 2.0, 1.05, 0.5, 2 * np.pi, 2.0),
+    )
+    try:
+        popt, pcov = curve_fit(
+            _ncopy_odd_decay,
+            x,
+            y,
+            p0=p0,
+            bounds=bounds,
+            maxfev=50000,
+        )
+    except (RuntimeError, ValueError, TypeError) as exc:
+        return {"status": "error", "message": str(exc)}
+
+    errors = _parameter_errors(pcov, 7)
+    return {
+        "status": "success",
+        "model": (
+            "A_r * b_r**n + A_i * b_i**n * "
+            "cos(2*pi*f*n + phi) + c"
+        ),
+        "A_real": float(popt[0]),
+        "A_real_err": float(errors[0]),
+        "real_decay": float(popt[1]),
+        "real_decay_err": float(errors[1]),
+        "A_osc": float(popt[2]),
+        "A_osc_err": float(errors[2]),
+        "oscillation_decay": float(popt[3]),
+        "oscillation_decay_err": float(errors[3]),
+        "frequency": float(popt[4]),
+        "frequency_err": float(errors[4]),
+        "phase": float(popt[5]),
+        "phase_err": float(errors[5]),
+        "C": float(popt[6]),
+        "C_err": float(errors[6]),
+        "r2": _curve_r2(x, y, _ncopy_odd_decay, popt),
+        "popt": popt,
+        "pcov": pcov,
+    }
+
+
+def _ncopy_fit_curve(
+    fit: Mapping[str, object],
+    x: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    popt = np.asarray(fit["popt"], dtype=np.float64)
+    if fit["model"] == "A * b**n + c":
+        return _ncopy_exp_decay(x, *popt)
+    return _ncopy_odd_decay(x, *popt)
+
+
+def _fit_ncopy_gate_evaluation(
+    *,
+    targets: Sequence[str],
+    target_index: int,
+    n_cliffords: NDArray[np.int_],
+    probability_mean: Mapping[str, Mapping[str, NDArray[np.float64]]],
+    probability_std: Mapping[str, Mapping[str, NDArray[np.float64]]],
+    native_gate_count_per_clifford: float,
+    plot: bool,
+    xaxis_type: Literal["linear", "log"],
+) -> tuple[dict[str, object], go.Figure | None]:
+    if len(targets) != 2:
+        return (
+            {
+                "status": "error",
+                "message": "Gate evaluation fitting is implemented for two-copy RB only.",
+            },
+            None,
+        )
+
+    ground_label = "0" * len(targets)
+    odd_key = f"odd_{target_index}"
+    x = np.asarray(n_cliffords, dtype=np.float64)
+    zeros = np.zeros_like(x, dtype=np.float64)
+
+    y_even = probability_mean["even"].get(ground_label)
+    y_odd = probability_mean[odd_key].get(ground_label)
+    if y_even is None or y_odd is None:
+        return (
+            {
+                "status": "error",
+                "message": f"Probability label {ground_label!r} is not available.",
+            },
+            None,
+        )
+    y_even_std = probability_std["even"].get(ground_label, zeros)
+    y_odd_std = probability_std[odd_key].get(ground_label, zeros)
+
+    even_fit = _fit_ncopy_exp_decay(x=x, y=np.asarray(y_even, dtype=np.float64))
+    odd_fit = _fit_ncopy_odd_decay(x=x, y=np.asarray(y_odd, dtype=np.float64))
+    if even_fit["status"] != "success" or odd_fit["status"] != "success":
+        return (
+            {
+                "status": "error",
+                "message": {
+                    "even": even_fit.get("message", ""),
+                    "odd": odd_fit.get("message", ""),
+                },
+                "even_fit": even_fit,
+                "odd_fit": odd_fit,
+            },
+            None,
+        )
+
+    even_decay = float(even_fit["decay"])
+    odd_real_decay = float(odd_fit["real_decay"])
+    if odd_real_decay <= even_decay:
+        real_decay = odd_real_decay
+        real_decay_err = float(odd_fit["real_decay_err"])
+        real_decay_source = odd_key
+    else:
+        real_decay = even_decay
+        real_decay_err = float(even_fit["decay_err"])
+        real_decay_source = "even"
+    oscillation_decay = float(odd_fit["oscillation_decay"])
+    oscillation_decay_err = float(odd_fit["oscillation_decay_err"])
+
+    circuit_fidelity = (6 * real_decay + 6 * oscillation_decay + 3) / 15
+    circuit_fidelity_err = (6 * real_decay_err + 6 * oscillation_decay_err) / 15
+    circuit_error = 1 - circuit_fidelity
+
+    native_gate_error = circuit_error / native_gate_count_per_clifford
+    native_gate_error_err = circuit_fidelity_err / native_gate_count_per_clifford
+    native_gate_fidelity = 1 - native_gate_error
+
+    lower_bound_fidelity = 1 - 3 * circuit_error
+    lower_bound_error = 1 - lower_bound_fidelity
+    lower_bound_error_err = 3 * circuit_fidelity_err
+
+    target = targets[target_index]
+    x_fine = np.linspace(float(np.min(x)), float(np.max(x)), 1000)
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=y_even,
+            error_y=dict(type="data", array=y_even_std),
+            mode="markers",
+            name="even",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x_fine,
+            y=_ncopy_fit_curve(even_fit, x_fine),
+            mode="lines",
+            name="even fit",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x,
+            y=y_odd,
+            error_y=dict(type="data", array=y_odd_std),
+            mode="markers",
+            name=odd_key,
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=x_fine,
+            y=_ncopy_fit_curve(odd_fit, x_fine),
+            mode="lines",
+            name=f"{odd_key} fit",
+        )
+    )
+    fig.add_annotation(
+        xref="paper",
+        yref="paper",
+        x=0.98,
+        y=0.98,
+        text=(
+            f"F_circuit = {circuit_fidelity * 100:.3f}%<br>"
+            f"F_X90 = {native_gate_fidelity * 100:.3f}%"
+        ),
+        showarrow=False,
+        align="right",
+    )
+    fig.update_layout(
+        title=f"n-copy RB gate evaluation : {target}",
+        xaxis_title="Number of Cliffords",
+        yaxis_title=f"P({ground_label})",
+        xaxis_type=xaxis_type,
+        yaxis_type="linear",
+    )
+    if plot:
+        fig.show(config=fitting._plotly_config(f"ncopy_rb_gate_evaluation_{target}"))
+
+    return (
+        {
+            "status": "success",
+            "target": target,
+            "ground_label": ground_label,
+            "sequence_key": odd_key,
+            "real_decay": real_decay,
+            "real_decay_err": real_decay_err,
+            "real_decay_source": real_decay_source,
+            "oscillation_decay": oscillation_decay,
+            "oscillation_decay_err": oscillation_decay_err,
+            "circuit_fidelity": circuit_fidelity,
+            "circuit_fidelity_err": circuit_fidelity_err,
+            "circuit_error": circuit_error,
+            "circuit_error_err": circuit_fidelity_err,
+            "native_gate_count_per_clifford": native_gate_count_per_clifford,
+            "native_gate_fidelity": native_gate_fidelity,
+            "native_gate_fidelity_err": native_gate_error_err,
+            "native_gate_error": native_gate_error,
+            "native_gate_error_err": native_gate_error_err,
+            "lower_bound_fidelity": lower_bound_fidelity,
+            "lower_bound_error": lower_bound_error,
+            "lower_bound_error_err": lower_bound_error_err,
+            "even_fit": even_fit,
+            "odd_fit": odd_fit,
+        },
+        fig,
+    )
+
+
+def _print_ncopy_gate_evaluation(evaluation: Mapping[str, object]) -> None:
+    if evaluation.get("status") != "success":
+        print(f"n-copy RB gate evaluation failed: {evaluation.get('message')}")
+        return
+    target = evaluation["target"]
+    print(f"n-copy RB gate evaluation : {target}")
+    print(
+        "  Circuit fidelity  : "
+        f"{float(evaluation['circuit_fidelity']) * 100:.4f} ± "
+        f"{float(evaluation['circuit_fidelity_err']) * 100:.4f}%"
+    )
+    print(
+        "  Circuit error     : "
+        f"{float(evaluation['circuit_error']) * 100:.4f} ± "
+        f"{float(evaluation['circuit_error_err']) * 100:.4f}%"
+    )
+    print(
+        "  Native X90 fidelity: "
+        f"{float(evaluation['native_gate_fidelity']) * 100:.4f} ± "
+        f"{float(evaluation['native_gate_fidelity_err']) * 100:.4f}%"
+    )
+    print(
+        "  Native X90 error   : "
+        f"{float(evaluation['native_gate_error']) * 100:.4f} ± "
+        f"{float(evaluation['native_gate_error_err']) * 100:.4f}%"
+    )
+    print(
+        "  Lower-bound fidelity: "
+        f"{float(evaluation['lower_bound_fidelity']) * 100:.4f}%"
     )
 
 
@@ -1958,12 +2272,7 @@ def ncopy_randomized_benchmarking(
     x90: TargetMap[Waveform] | None = None,
     in_parallel: bool | None = None,
     xaxis_type: Literal["linear", "log"] | None = None,
-    final_states: Collection[str] | str | None = None,
-    interleaved_clifford: Clifford | None = None,
-    interleaved_waveform: TargetMap[Waveform] | None = None,
-    return_raw: bool = False,
-    reset_awg_and_capunits: bool = True,
-    plot_metric: Literal["leakage", "ground_probability"] = "leakage",
+    plot_metric: Literal["auto", "leakage", "ground_probability"] = "auto",
     plot: bool | None = None,
     save_image: bool | None = None,
     n_shots: int | None = DEFAULT_SHOTS,
@@ -1973,10 +2282,10 @@ def ncopy_randomized_benchmarking(
     """
     Run ncopy randomized benchmarking for muxed single-qubit targets.
 
-    With three-state classifiers, leave `final_states` unset and use the returned
-    `leakage` / `per_target_leakage` curves.  For two-state compatibility with
-    older notebooks, pass computational `final_states` such as
-    `("00", "01", "10", "11")` and inspect `probabilities`.
+    With `plot_metric="auto"`, 3-state classifiers select leakage curves and
+    2-state classifiers select ground-state probability curves.  Gate
+    evaluation is fitted from P(00...0) when the resolved metric is
+    `ground_probability`.
     """
     n_shots, shot_interval = resolve_shot_options(
         n_shots=n_shots,
@@ -2007,6 +2316,25 @@ def ncopy_randomized_benchmarking(
     target_list = _normalize_targets(exp, targets)
     if not target_list:
         raise ValueError("At least one target is required.")
+    has_three_state_classifiers = all(
+        _classifier_has_states(exp, target, {0, 1, 2}) for target in target_list
+    )
+    if plot_metric == "auto":
+        plot_metric = "leakage" if has_three_state_classifiers else "ground_probability"
+    elif plot_metric not in ("leakage", "ground_probability"):
+        raise ValueError("plot_metric must be 'auto', 'leakage', or 'ground_probability'.")
+
+    if plot_metric == "leakage":
+        _validate_three_state_classifiers(exp, target_list)
+    fit_gate = plot_metric == "ground_probability"
+    native_gate_count_per_clifford = 2 * 24 / 23
+
+    classifier_state_counts = {
+        target: None
+        if exp.ctx.classifiers.get(target) is None
+        else int(exp.ctx.classifiers[target].n_states)
+        for target in target_list
+    }
     if n_cliffords_range is None:
         n_cliffords = _default_n_cliffords_range(max_n_cliffords)
     else:
@@ -2027,28 +2355,17 @@ def ncopy_randomized_benchmarking(
     return_data: dict[str, dict[str, object]] = {}
     figures: dict[str, go.Figure] = {}
     for target_group in target_groups:
-        if final_states is None:
-            final_state_list = ["0" * len(target_group)]
-        elif isinstance(final_states, str):
-            final_state_list = [final_states]
-        else:
-            final_state_list = list(final_states)
         sequence_keys = _ncopy_sequence_keys(target_group)
 
         trial_results: list[Result] = []
         for seed in seed_list:
             trial_results.append(
-                ncopy_rb_experiment(
+                _ncopy_rb_experiment(
                     exp,
                     target_group,
                     n_cliffords_range=n_cliffords,
                     x90=x90,
                     seed=int(seed),
-                    final_states=final_state_list,
-                    interleaved_clifford=interleaved_clifford,
-                    interleaved_waveform=interleaved_waveform,
-                    return_raw=return_raw,
-                    reset_awg_and_capunits=reset_awg_and_capunits,
                     n_shots=n_shots,
                     shot_interval=shot_interval,
                 )
@@ -2056,28 +2373,24 @@ def ncopy_randomized_benchmarking(
 
         probability_mean, probability_std = _aggregate_probability_trials(
             trial_results,
-            final_state_list,
             sequence_keys,
             n_cliffords,
         )
         leakage_mean, leakage_std = _aggregate_curve_trials(
             trial_results,
             "leakage",
-            final_state_list,
             sequence_keys,
         )
         per_target_leakage_mean, per_target_leakage_std = (
             _aggregate_per_target_leakage_trials(
                 trial_results,
                 target_group,
-                final_state_list,
                 sequence_keys,
             )
         )
         group_figures = _plot_ncopy_results(
             targets=target_group,
             n_cliffords=n_cliffords,
-            final_states=final_state_list,
             sequence_keys=sequence_keys,
             leakage_mean=leakage_mean,
             leakage_std=leakage_std,
@@ -2089,17 +2402,34 @@ def ncopy_randomized_benchmarking(
         )
         figures.update(group_figures)
 
-        default_final_state = final_state_list[0]
+        gate_evaluations: dict[str, dict[str, object]] = {}
+        if fit_gate:
+            for target_index, target in enumerate(target_group):
+                evaluation, fit_figure = _fit_ncopy_gate_evaluation(
+                    targets=target_group,
+                    target_index=target_index,
+                    n_cliffords=n_cliffords,
+                    probability_mean=probability_mean,
+                    probability_std=probability_std,
+                    native_gate_count_per_clifford=native_gate_count_per_clifford,
+                    plot=plot,
+                    xaxis_type=xaxis_type,
+                )
+                gate_evaluations[target] = evaluation
+                if fit_figure is not None:
+                    figures[f"{target}_gate_evaluation"] = fit_figure
+                _print_ncopy_gate_evaluation(evaluation)
+
         ground_label = "0" * len(target_group)
         if plot_metric == "leakage":
-            even_mean = leakage_mean[default_final_state]["even"]
-            even_std = leakage_std[default_final_state]["even"]
+            even_mean = leakage_mean["even"]
+            even_std = leakage_std["even"]
         else:
-            even_mean = probability_mean[default_final_state]["even"].get(
+            even_mean = probability_mean["even"].get(
                 ground_label,
                 np.zeros_like(n_cliffords, dtype=np.float64),
             )
-            even_std = probability_std[default_final_state]["even"].get(
+            even_std = probability_std["even"].get(
                 ground_label,
                 np.zeros_like(n_cliffords, dtype=np.float64),
             )
@@ -2107,7 +2437,6 @@ def ncopy_randomized_benchmarking(
             mean = _ncopy_metric_curve(
                 targets=target_group,
                 target_index=target_index,
-                final_state=default_final_state,
                 leakage_values=leakage_mean,
                 probability_values=probability_mean,
                 plot_metric=plot_metric,
@@ -2115,7 +2444,6 @@ def ncopy_randomized_benchmarking(
             std = _ncopy_metric_curve(
                 targets=target_group,
                 target_index=target_index,
-                final_state=default_final_state,
                 leakage_values=leakage_std,
                 probability_values=probability_std,
                 plot_metric=plot_metric,
@@ -2128,30 +2456,21 @@ def ncopy_randomized_benchmarking(
                 "even_std": even_std if n_trials > 1 else None,
                 "seeds": np.asarray(seed_list, dtype=np.int64),
                 "targets": target_group,
-                "final_states": final_state_list,
                 "plot_metric": plot_metric,
-                "probability_mean": probability_mean,
-                "probability_std": probability_std,
+                "classifier_state_counts": {
+                    label: classifier_state_counts[label] for label in target_group
+                },
+                "population_mean": probability_mean,
+                "population_std": probability_std,
                 "leakage_mean": leakage_mean,
                 "leakage_std": leakage_std,
                 "per_target_leakage_mean": per_target_leakage_mean,
                 "per_target_leakage_std": per_target_leakage_std,
+                "gate_evaluation": gate_evaluations.get(target),
             }
-            if return_raw:
-                return_data[target]["raw_result"] = trial_results
 
     if save_image:
         for name, fig in figures.items():
             viz.save_figure(fig, name=f"ncopy_randomized_benchmarking_{name}")
 
     return Result(data=return_data, figures=figures or None)
-
-
-def n_copy_rb_experiment(*args: Any, **kwargs: Any) -> Result:
-    """Compatibility alias for `ncopy_rb_experiment`."""
-    return ncopy_rb_experiment(*args, **kwargs)
-
-
-def n_copy_randomized_benchmarking(*args: Any, **kwargs: Any) -> Result:
-    """Compatibility alias for `ncopy_randomized_benchmarking`."""
-    return ncopy_randomized_benchmarking(*args, **kwargs)

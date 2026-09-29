@@ -2063,6 +2063,7 @@ class Experiment:
             str, Literal["0", "1", "+", "-", "+i", "-i"] | Literal["g", "e", "f"]
         ],
         *,
+        ef_targets: Mapping[str, str] | None = None,
         mode: MeasurementMode | None = None,
         n_shots: int | None = None,
         shot_interval: float | None = None,
@@ -2117,6 +2118,7 @@ class Experiment:
         """
         return self.measurement_service.measure_state(
             states=states,
+            ef_targets=ef_targets,
             mode=mode,
             n_shots=n_shots,
             shot_interval=shot_interval,
@@ -2501,6 +2503,7 @@ class Experiment:
         targets: Collection[str] | str | None = None,
         *,
         n_states: Literal[2, 3] | None = None,
+        ef_targets: Mapping[str, str] | None = None,
         n_shots: int | None = None,
         shot_interval: float | None = None,
         readout_duration: float | None = None,
@@ -2512,6 +2515,7 @@ class Experiment:
         return self.measurement_service.measure_state_distribution(
             targets=targets,
             n_states=n_states,
+            ef_targets=ef_targets,
             n_shots=n_shots,
             shot_interval=shot_interval,
             readout_duration=readout_duration,
@@ -2525,6 +2529,7 @@ class Experiment:
         targets: Collection[str] | str | None = None,
         *,
         n_states: Literal[2, 3] | None = None,
+        ef_targets: Mapping[str, str] | None = None,
         save_classifier: bool | None = None,
         save_dir: Path | str | None = None,
         n_shots: int | None = None,
@@ -2542,6 +2547,7 @@ class Experiment:
         return self.measurement_service.build_classifier(
             targets=targets,
             n_states=n_states,
+            ef_targets=ef_targets,
             save_classifier=save_classifier,
             save_dir=save_dir,
             n_shots=n_shots,

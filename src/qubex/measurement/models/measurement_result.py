@@ -24,6 +24,7 @@ class MeasurementResult(DataModel):
     measurement_config: MeasurementConfig
     device_config: dict[str, Any] | None = None
     classifier_refs: dict[str, ClassifierRef] | None = None
+    classifier_lookup_labels: dict[str, str] | None = None
 
     def __repr__(self) -> str:
         """Return a concise summary without embedding full capture payloads."""

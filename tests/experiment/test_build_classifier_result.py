@@ -58,12 +58,14 @@ def test_build_classifier_aggregates_figure_fields_across_targets() -> None:
         "Q00": object(),
         "Q01": object(),
     }
+    received_ef_targets: list[object] = []
 
     def fake_build_classifier(
         self: MeasurementService,
         targets: str,
-        **_: object,
+        **kwargs: object,
     ) -> Result:
+        received_ef_targets.append(kwargs.get("ef_targets"))
         figure = figures[targets]
         return Result(
             data={
@@ -80,6 +82,7 @@ def test_build_classifier_aggregates_figure_fields_across_targets() -> None:
 
     result = service.build_classifier(
         targets=["Q00", "Q01"],
+        ef_targets={"Q01": "Q01_ef"},
         save_classifier=False,
         plot=False,
     )
@@ -89,6 +92,7 @@ def test_build_classifier_aggregates_figure_fields_across_targets() -> None:
     assert result["classifiers"] == classifiers
     assert np.array_equal(result["data"]["Q00"][0], np.array([0.0 + 0.0j]))
     assert np.array_equal(result["data"]["Q01"][0], np.array([0.0 + 0.0j]))
+    assert received_ef_targets == [{"Q01": "Q01_ef"}, {"Q01": "Q01_ef"}]
 
 
 def test__build_classifier_uses_predict_counts_and_returns_figures(

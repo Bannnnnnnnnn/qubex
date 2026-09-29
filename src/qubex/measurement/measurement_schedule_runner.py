@@ -85,6 +85,7 @@ class MeasurementScheduleRunner:
         *,
         backend_result: object,
         config: MeasurementConfig,
+        request_metadata: Mapping[str, Any] | None = None,
     ) -> MeasurementResult:
         """Build canonical measurement result via measurement backend adapter."""
         if isinstance(backend_result, MeasurementResult):
@@ -112,12 +113,27 @@ class MeasurementScheduleRunner:
         if config.shot_averaging:
             sampling_period = sampling_period * capture_decimation_factor
 
-        return self._measurement_backend_adapter.build_measurement_result(
-            backend_result=backend_result,
-            measurement_config=config,
-            device_config=device_config,
-            sampling_period=sampling_period,
-        )
+        build_kwargs = {
+            "backend_result": backend_result,
+            "measurement_config": config,
+            "device_config": device_config,
+            "sampling_period": sampling_period,
+        }
+        if request_metadata is None:
+            return self._measurement_backend_adapter.build_measurement_result(
+                **build_kwargs
+            )
+        try:
+            return self._measurement_backend_adapter.build_measurement_result(
+                **build_kwargs,
+                request_metadata=request_metadata,
+            )
+        except TypeError as exc:
+            if "request_metadata" not in str(exc):
+                raise
+            return self._measurement_backend_adapter.build_measurement_result(
+                **build_kwargs
+            )
 
     def execute_sync(
         self,
@@ -140,7 +156,11 @@ class MeasurementScheduleRunner:
                 execution_mode=self._execution_mode,
                 clock_health_checks=self._clock_health_checks,
             )
-        return self._build_result(backend_result=backend_result, config=config)
+        return self._build_result(
+            backend_result=backend_result,
+            config=config,
+            request_metadata=request.metadata,
+        )
 
     async def execute_async(
         self,
@@ -185,6 +205,7 @@ class MeasurementScheduleRunner:
         return self._build_result(
             backend_result=backend_result,
             config=config,
+            request_metadata=request.metadata,
         )
 
     async def execute_many_async(
@@ -211,8 +232,9 @@ class MeasurementScheduleRunner:
                 self._build_result(
                     backend_result=backend_result,
                     config=config,
+                    request_metadata=request.metadata,
                 )
-                for backend_result in backend_results
+                for request, backend_result in zip(requests, backend_results)
             ]
 
         return [

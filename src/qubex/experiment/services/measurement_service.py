@@ -79,7 +79,7 @@ from qubex.measurement import (
     SweepValue,
 )
 from qubex.measurement.measurement_schedule_builder import CapturePlacement
-from qubex.system import TargetRegistry
+from qubex.system import TargetRegistry, TargetType
 from qubex.typing import (
     FrequencyLike,
     IQArray,
@@ -116,6 +116,15 @@ def _get_classifier_stddevs(
         return classifier.stddevs
     except (AttributeError, NotImplementedError):
         return None
+
+
+def _target_is_ef(target: Any) -> bool:
+    """Return whether a registered target is an EF drive target."""
+    target_type = getattr(target, "type", None)
+    return bool(getattr(target, "is_ef", False)) or target_type in (
+        TargetType.CTRL_EF,
+        "CTRL_EF",
+    )
 
 
 class MeasurementService:
@@ -155,6 +164,58 @@ class MeasurementService:
                 for label in labels
             ]
         )
+
+    def _target_qubit_label(self, target: str) -> str:
+        """Resolve a target label to its physical qubit label when possible."""
+        try:
+            return self.ctx.resolve_qubit_label(target)
+        except (AttributeError, KeyError, ValueError):
+            return target
+
+    def _measurement_output_label_for_source(self, target: str) -> str:
+        """Return the user-facing measurement output label for one source label."""
+        qubit = self._target_qubit_label(target)
+        try:
+            target_object = self.ctx.targets[target]
+        except (AttributeError, KeyError):
+            return qubit
+        if getattr(target_object, "is_ge", False) and target != qubit:
+            return target
+        return qubit
+
+    def _measurement_output_labels_for_sources(
+        self,
+        labels: Sequence[str],
+    ) -> list[str]:
+        """Return output labels expected from final measurement of source labels."""
+        return self.unique_in_order(
+            [self._measurement_output_label_for_source(label) for label in labels]
+        )
+
+    def _state_centers_for_target(self, target: str) -> dict | None:
+        """Return state centers keyed by target or its physical qubit alias."""
+        return self.ctx.state_centers.get(target) or self.ctx.state_centers.get(
+            self._target_qubit_label(target)
+        )
+
+    def _classifier_for_target(self, target: str) -> StateClassifier:
+        """Return classifier keyed by target or its physical qubit alias."""
+        classifier = self.ctx.classifiers.get(target)
+        if classifier is not None:
+            return classifier
+        qubit = self._target_qubit_label(target)
+        try:
+            return self.ctx.classifiers[qubit]
+        except KeyError:
+            raise KeyError(f"Classifier for `{target}` is not available.") from None
+
+    def _is_qubit_like_target(self, target: str) -> bool:
+        """Return whether the label can be resolved to a physical qubit."""
+        try:
+            self.ctx.resolve_qubit_label(target)
+        except (AttributeError, KeyError, ValueError):
+            return False
+        return True
 
     def _resolve_measurement_schedule(
         self,
@@ -802,7 +863,7 @@ class MeasurementService:
                 )
                 with PulseSchedule(labels) as ps:
                     for target, state in initial_states.items():
-                        if target in self.ctx.qubit_labels:
+                        if self._is_qubit_like_target(target):
                             ps.add(
                                 target, self.pulse.get_pulse_for_state(target, state)
                             )
@@ -820,7 +881,7 @@ class MeasurementService:
                 )
                 with PulseSchedule(labels) as ps:
                     for target, state in initial_states.items():
-                        if target in self.ctx.qubit_labels:
+                        if self._is_qubit_like_target(target):
                             ps.add(
                                 target, self.pulse.get_pulse_for_state(target, state)
                             )
@@ -881,6 +942,7 @@ class MeasurementService:
             str, Literal["0", "1", "+", "-", "+i", "-i"] | Literal["g", "e", "f"]
         ],
         *,
+        ef_targets: Mapping[str, str] | None = None,
         mode: MeasurementMode | None = None,
         n_shots: int | None = None,
         shot_interval: float | None = None,
@@ -903,7 +965,7 @@ class MeasurementService:
         for target, state in states.items():
             targets.append(target)
             if state == "f":
-                targets.append(self.ctx.resolve_ef_label(target))
+                targets.append(self._resolve_f_state_ef_label(target, ef_targets))
 
         with PulseSchedule(targets) as ps:
             for target, state in states.items():
@@ -916,7 +978,7 @@ class MeasurementService:
                 elif state == "f":
                     ps.add(target, self.pulse.get_hpi_pulse(target).repeated(2))
                     ps.barrier()
-                    ef_label = self.ctx.resolve_ef_label(target)
+                    ef_label = self._resolve_f_state_ef_label(target, ef_targets)
                     ps.add(ef_label, self.pulse.get_hpi_pulse(ef_label).repeated(2))
 
         return self.measure(
@@ -932,6 +994,46 @@ class MeasurementService:
             plot=plot,
             **deprecated_options,
         )
+
+    def _resolve_f_state_ef_label(
+        self,
+        target: str,
+        ef_targets: Mapping[str, str] | None,
+    ) -> str:
+        """Resolve the EF drive target used to prepare |f> for one target."""
+        if ef_targets is None:
+            return self.ctx.resolve_ef_label(target)
+
+        ef_label = ef_targets.get(target)
+        expected_qubit: str | None = None
+        if ef_label is None:
+            try:
+                expected_qubit = self.ctx.resolve_qubit_label(target)
+            except (KeyError, ValueError):
+                expected_qubit = None
+            if expected_qubit is not None:
+                ef_label = ef_targets.get(expected_qubit)
+
+        if ef_label is None:
+            return self.ctx.resolve_ef_label(target)
+
+        targets = self.ctx.targets
+        try:
+            ef_target = targets[ef_label]
+        except KeyError:
+            raise ValueError(f"EF target `{ef_label}` is not registered.") from None
+        if not _target_is_ef(ef_target):
+            raise ValueError(f"Target `{ef_label}` is not an EF target.")
+
+        if expected_qubit is None:
+            expected_qubit = self.ctx.resolve_qubit_label(target)
+        ef_qubit = self.ctx.resolve_qubit_label(ef_label)
+        if ef_qubit != expected_qubit:
+            raise ValueError(
+                f"EF target `{ef_label}` is bound to `{ef_qubit}`, "
+                f"not `{expected_qubit}`."
+            )
+        return ef_label
 
     def measure_idle_states(
         self,
@@ -973,7 +1075,7 @@ class MeasurementService:
         )
         data = {target: result.data[target].kerneled for target in targets}
         counts = {
-            target: self.ctx.classifiers[target].classify(
+            target: self._classifier_for_target(target).classify(
                 target,
                 data[target],
                 plot=plot,
@@ -1111,7 +1213,7 @@ class MeasurementService:
                     .get_sampled_sequences()
                     for param in sweep_range
                 ]
-                ordered_qubits = self.ctx.ordered_qubit_labels(initial_sequence.labels)
+                source_labels = list(initial_sequence.labels)
             elif isinstance(initial_sequence, dict):
                 sequences = [
                     {
@@ -1120,18 +1222,25 @@ class MeasurementService:
                     }
                     for param in sweep_range
                 ]
-                ordered_qubits = self.ctx.ordered_qubit_labels(list(initial_sequence))
+                source_labels = list(initial_sequence)
             else:
                 raise TypeError("Invalid sequence.")
         else:
             raise TypeError("Invalid sequence.")
 
-        signals: dict[str, list[object]] = {qubit: [] for qubit in ordered_qubits}
+        ordered_qubits = self.ctx.ordered_qubit_labels(source_labels)
+        ordered_measurement_targets = self._measurement_output_labels_for_sources(
+            source_labels
+        )
+        signals: dict[str, list[object]] = {
+            target: [] for target in ordered_measurement_targets
+        }
         plotter = IQPlotter(
             {
-                qubit: self.ctx.state_centers[qubit]
-                for qubit in ordered_qubits
-                if qubit in self.ctx.state_centers
+                target: state_centers
+                for target in ordered_measurement_targets
+                if (state_centers := self._state_centers_for_target(target))
+                is not None
             }
         )
 
@@ -1157,7 +1266,7 @@ class MeasurementService:
                     reset_awg_and_capunits=False,
                     **deprecated_options,
                 )
-                for target in ordered_qubits:
+                for target in ordered_measurement_targets:
                     if target in result.data:
                         signals[target].append(result.data[target].kerneled)
                 for target, data in result.data.items():
@@ -1188,7 +1297,7 @@ class MeasurementService:
                 data=np.array(signals[target]),
                 sweep_range=sweep_range,
                 rabi_param=rabi_params.get(target),
-                state_centers=self.ctx.state_centers.get(target),
+                state_centers=self._state_centers_for_target(target),
                 title=title,
                 xlabel=xlabel,
                 ylabel=ylabel,
@@ -1335,8 +1444,12 @@ class MeasurementService:
             ramptime = HPI_DURATION - HPI_RAMPTIME  # π/2
 
         if amplitudes is None:
-            ampl = self.ctx.params.control_amplitude
-            amplitudes = {target: ampl[target] for target in targets}
+            amplitudes = {
+                target: self.ctx.params.get_control_amplitude(
+                    self._target_qubit_label(target)
+                )
+                for target in targets
+            }
 
         if simultaneous:
             result = self.rabi_experiment(
@@ -1641,7 +1754,10 @@ class MeasurementService:
             targets = list(targets)
         time_range = np.asarray(time_range)
         amplitudes = {
-            target: self.ctx.params.get_control_amplitude(target) for target in targets
+            target: self.ctx.params.get_control_amplitude(
+                self._target_qubit_label(target)
+            )
+            for target in targets
         }
         if rabi_level == "ge":
             result = self.rabi_experiment(
@@ -1812,7 +1928,7 @@ class MeasurementService:
                 data=data.data,
                 time_range=effective_time_range,
                 rabi_param=rabi_params[target],
-                state_centers=self.ctx.state_centers.get(target),
+                state_centers=self._state_centers_for_target(target),
             )
             for target, data in sweep_data.items()
         }
@@ -1982,6 +2098,7 @@ class MeasurementService:
         targets: Collection[str] | str | None = None,
         *,
         n_states: Literal[2, 3] | None = None,
+        ef_targets: Mapping[str, str] | None = None,
         n_shots: int | None = None,
         shot_interval: float | None = None,
         readout_amplitudes: dict[str, float] | None = None,
@@ -2001,6 +2118,9 @@ class MeasurementService:
             Target qubits to measure.
         n_states
             Number of states to prepare (2 or 3).
+        ef_targets
+            Optional mapping from target or physical qubit labels to EF drive
+            target labels used for |f> preparation.
         plot
             Whether to plot IQ distributions.
         """
@@ -2019,6 +2139,7 @@ class MeasurementService:
         result = {
             state: self.measure_state(
                 dict.fromkeys(targets, state),  # type: ignore
+                ef_targets=ef_targets,
                 n_shots=n_shots,
                 shot_interval=shot_interval,
                 readout_amplitudes=readout_amplitudes,
@@ -2046,6 +2167,7 @@ class MeasurementService:
         targets: Collection[str] | str | None = None,
         *,
         n_states: Literal[2, 3] | None = None,
+        ef_targets: Mapping[str, str] | None = None,
         save_classifier: bool | None = None,
         save_dir: Path | str | None = None,
         n_shots: int | None = None,
@@ -2068,6 +2190,9 @@ class MeasurementService:
             Target qubits used for classifier training.
         n_states
             Number of basis states to use.
+        ef_targets
+            Optional mapping from target or physical qubit labels to EF drive
+            target labels used for |f> preparation.
         save_classifier
             Whether to save trained classifiers.
         """
@@ -2088,6 +2213,7 @@ class MeasurementService:
             return self._build_classifier(
                 targets=targets,
                 n_states=n_states,
+                ef_targets=ef_targets,
                 save_classifier=save_classifier,
                 save_dir=save_dir,
                 n_shots=n_shots,
@@ -2111,6 +2237,7 @@ class MeasurementService:
                 result = self._build_classifier(
                     targets=target,
                     n_states=n_states,
+                    ef_targets=ef_targets,
                     save_classifier=save_classifier,
                     save_dir=save_dir,
                     n_shots=n_shots,
@@ -2148,6 +2275,7 @@ class MeasurementService:
         targets: Collection[str] | str | None = None,
         *,
         n_states: Literal[2, 3] | None = None,
+        ef_targets: Mapping[str, str] | None = None,
         save_classifier: bool | None = None,
         save_dir: Path | str | None = None,
         n_shots: int | None = None,
@@ -2187,6 +2315,7 @@ class MeasurementService:
         results = self.measure_state_distribution(
             targets=targets,
             n_states=n_states,
+            ef_targets=ef_targets,
             n_shots=n_shots,
             shot_interval=shot_interval,
             readout_pre_margin=readout_pre_margin,
@@ -2821,7 +2950,7 @@ class MeasurementService:
         )
         if fit_gmm:
             probabilities = {
-                target: self.ctx.classifiers[target].estimate_weights(
+                target: self._classifier_for_target(target).estimate_weights(
                     result.data[target].kerneled
                 )
                 for target in result.data

@@ -631,6 +631,13 @@ class CharacterizationService:
         """Return the calibration service."""
         return self._calibration_service
 
+    def _target_qubit_label(self, target: str) -> str:
+        """Resolve a target label to its physical qubit label when possible."""
+        try:
+            return self.ctx.resolve_qubit_label(target)
+        except (AttributeError, KeyError, ValueError):
+            return target
+
     @staticmethod
     def _is_valid_chevron_rabi_param(param: Any) -> bool:
         """Return whether a shared Rabi parameter is safe for chevron normalization."""
@@ -2019,7 +2026,8 @@ class CharacterizationService:
             )
 
             detuned_frequencies = {
-                target: self.ctx.qubits[target].frequency + detuning
+                target: self.ctx.qubits[self._target_qubit_label(target)].frequency
+                + detuning
                 for target in target_qubits
             }
 
@@ -2043,7 +2051,7 @@ class CharacterizationService:
                         plot=plot,
                     )
                     if fit_result.status is FitStatus.SUCCESS:
-                        f = self.ctx.qubits[target].frequency
+                        f = self.ctx.qubits[self._target_qubit_label(target)].frequency
                         t2 = fit_result["tau"]
                         ramsey_freq = fit_result["f"]
                         phi = fit_result["phi"]

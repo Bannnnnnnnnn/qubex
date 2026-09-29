@@ -42,6 +42,20 @@ _QUEL1SE_R8_AWG_OPTIONS = {
     "se8_mxfe1_awg3113",
 }
 _QUEL1SE_R8_DEFAULT_AWG_OPTION = "se8_mxfe1_awg2222"
+_S159A_BOX_NAME = "S159A"
+_S159A_BOXTYPE = "quel1se-fujitsu11-a"
+_S159A_MXFE0_DAC_CHANNEL_ASSIGN = {
+    "dac0": [0],
+    "dac1": [1],
+    "dac2": [4, 3],
+    "dac3": [7, 6, 5, 2],
+}
+_S159A_MXFE1_DAC_CHANNEL_ASSIGN = {
+    "dac0": [2],
+    "dac1": [1],
+    "dac2": [5, 4],
+    "dac3": [7, 6, 3, 0],
+}
 
 
 class _ClosableResource(Protocol):
@@ -70,6 +84,33 @@ def _resolve_quel1se_r8_awg_option(options: list[str]) -> str:
     if len(awg_options) == 1:
         return awg_options[0]
     return _QUEL1SE_R8_DEFAULT_AWG_OPTION
+
+
+def _is_s159a_multi_channel_profile(*, box_name: str, boxtype: str) -> bool:
+    return box_name == _S159A_BOX_NAME and boxtype == _S159A_BOXTYPE
+
+
+def _build_s159a_multi_channel_relinkup_param(
+    box: Quel1Box,
+    *,
+    config_options: list[Quel1ConfigOption] | None,
+) -> dict[str, Any]:
+    dev = getattr(box, "_dev", None)
+    load_config_parameter = getattr(dev, "_load_config_parameter", None)
+    if load_config_parameter is None:
+        raise RuntimeError("S159A multi-channel relinkup requires Quel1Box internals.")
+
+    param = deepcopy(load_config_parameter(config_options=config_options))
+    try:
+        mxfe0_channel_assign = param["ad9082"][0]["dac"]["channel_assign"]
+        mxfe1_channel_assign = param["ad9082"][1]["dac"]["channel_assign"]
+    except (IndexError, KeyError, TypeError) as exc:
+        raise RuntimeError("S159A relinkup parameter has unexpected shape.") from exc
+    mxfe0_channel_assign.clear()
+    mxfe0_channel_assign.update(deepcopy(_S159A_MXFE0_DAC_CHANNEL_ASSIGN))
+    mxfe1_channel_assign.clear()
+    mxfe1_channel_assign.update(deepcopy(_S159A_MXFE1_DAC_CHANNEL_ASSIGN))
+    return param
 
 
 class Quel1ConnectionManager:
@@ -370,11 +411,17 @@ class Quel1ConnectionManager:
         config_options = self._resolve_config_options(
             box_name=box_name, boxtype=box.boxtype
         )
-        box.relinkup(
-            use_204b=False,
-            background_noise_threshold=relinkup_noise_threshold,
-            config_options=config_options,
-        )
+        relinkup_kwargs: dict[str, Any] = {
+            "use_204b": False,
+            "background_noise_threshold": relinkup_noise_threshold,
+            "config_options": config_options,
+        }
+        if _is_s159a_multi_channel_profile(box_name=box_name, boxtype=box.boxtype):
+            relinkup_kwargs["param"] = _build_s159a_multi_channel_relinkup_param(
+                box,
+                config_options=config_options,
+            )
+        box.relinkup(**relinkup_kwargs)
         box.reconnect(background_noise_threshold=reconnect_noise_threshold)
 
     def relinkup_boxes(

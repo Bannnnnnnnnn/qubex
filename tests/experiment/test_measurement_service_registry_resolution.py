@@ -17,6 +17,7 @@ from qubex.measurement.models import (
     MeasurementResult,
     MeasureResult,
 )
+from qubex.system import TargetType
 
 
 class _DummyResult:
@@ -422,3 +423,100 @@ def test_measure_state_resolves_ef_labels_via_target_registry() -> None:
     )
 
     assert captured["labels"] == ["custom-target", "Q17-ef"]
+
+
+def test_measure_state_uses_explicit_ef_target_for_f_state() -> None:
+    """Given a custom EF mapping, when preparing |f>, then the mapped EF target is driven."""
+
+    class _TargetRegistry:
+        @staticmethod
+        def resolve_qubit_label(label: str) -> str:
+            return "Q28" if label in {"Q28_ge", "Q28_ef", "Q28"} else label
+
+        @staticmethod
+        def resolve_ef_label(label: str) -> str:
+            _ = label
+            return "Q28-ef"
+
+    experiment_system = SimpleNamespace(
+        target_registry=_TargetRegistry(),
+        resolve_qubit_label=lambda label: _TargetRegistry.resolve_qubit_label(label),
+        resolve_ef_label=lambda label: _TargetRegistry.resolve_ef_label(label),
+    )
+
+    captured: dict[str, object] = {}
+    pulse_calls: list[str] = []
+
+    service = cast(Any, object.__new__(MeasurementService))
+    service.__dict__["_ctx"] = SimpleNamespace(
+        experiment_system=experiment_system,
+        targets={
+            "Q28_ef": SimpleNamespace(type=TargetType.CTRL_EF),
+        },
+        resolve_qubit_label=lambda label: experiment_system.resolve_qubit_label(label),
+        resolve_ef_label=lambda label: experiment_system.resolve_ef_label(label),
+    )
+    service.__dict__["_pulse_service"] = SimpleNamespace(
+        get_pulse_for_state=lambda _target, _state: Blank(0),
+        get_hpi_pulse=lambda target: pulse_calls.append(target) or Blank(0),
+    )
+
+    def _measure(
+        self: MeasurementService,
+        sequence: PulseSchedule,
+        **_: object,
+    ) -> _DummyResult:
+        captured["labels"] = list(sequence.labels)
+        return _DummyResult()
+
+    service.__dict__["measure"] = MethodType(_measure, service)
+
+    service.measure_state(
+        states={"Q28_ge": "f"},
+        ef_targets={"Q28_ge": "Q28_ef"},
+        plot=False,
+    )
+
+    assert captured["labels"] == ["Q28_ge", "Q28_ef"]
+    assert pulse_calls == ["Q28_ge", "Q28_ef"]
+
+
+def test_measure_state_rejects_explicit_non_ef_target_for_f_state() -> None:
+    """Given a non-EF mapping, when preparing |f>, then a clear validation error is raised."""
+
+    class _TargetRegistry:
+        @staticmethod
+        def resolve_qubit_label(label: str) -> str:
+            return "Q28" if label in {"Q28_ge", "Q28_bad", "Q28"} else label
+
+        @staticmethod
+        def resolve_ef_label(label: str) -> str:
+            _ = label
+            return "Q28-ef"
+
+    experiment_system = SimpleNamespace(
+        target_registry=_TargetRegistry(),
+        resolve_qubit_label=lambda label: _TargetRegistry.resolve_qubit_label(label),
+        resolve_ef_label=lambda label: _TargetRegistry.resolve_ef_label(label),
+    )
+
+    service = cast(Any, object.__new__(MeasurementService))
+    service.__dict__["_ctx"] = SimpleNamespace(
+        experiment_system=experiment_system,
+        targets={
+            "Q28_bad": SimpleNamespace(type=TargetType.CTRL_GE),
+        },
+        resolve_qubit_label=lambda label: experiment_system.resolve_qubit_label(label),
+        resolve_ef_label=lambda label: experiment_system.resolve_ef_label(label),
+    )
+    service.__dict__["_pulse_service"] = SimpleNamespace(
+        get_pulse_for_state=lambda _target, _state: Blank(0),
+        get_hpi_pulse=lambda _target: Blank(0),
+    )
+
+    with pytest.raises(ValueError, match="not an EF target"):
+        service.measure_state(
+            states={"Q28_ge": "f"},
+            ef_targets={"Q28_ge": "Q28_bad"},
+            plot=False,
+        )

@@ -122,6 +122,37 @@ class PulseService:
                 if target not in rabi_params:
                     raise ValueError(f"Rabi parameters for {target} are not stored.")
 
+    def _target_qubit_label(self, target: str) -> str:
+        """Resolve a target to its physical qubit label when possible."""
+        try:
+            return self.ctx.resolve_qubit_label(target)
+        except (AttributeError, KeyError, ValueError):
+            return target
+
+    def _calibration_lookup_labels(self, target: str) -> list[str]:
+        """Return target-specific then physical-qubit calibration lookup labels."""
+        labels = [target]
+        qubit = self._target_qubit_label(target)
+        if qubit not in labels:
+            labels.append(qubit)
+        return labels
+
+    def _get_calibration_param(
+        self,
+        getter: Any,
+        target: str,
+        *,
+        valid_days: int | None,
+    ) -> Any:
+        """Return the first calibration parameter found for a target alias."""
+        if not callable(getter):
+            raise TypeError("getter must be callable.")
+        for label in self._calibration_lookup_labels(target):
+            param = getter(label, valid_days=valid_days)
+            if param is not None:
+                return param
+        return None
+
     def calc_control_amplitude(
         self,
         target: str,
@@ -277,7 +308,8 @@ class PulseService:
         valid_days: int | None = None,
     ) -> Waveform:
         """Get the π/2 pulse for the given target."""
-        param = self.ctx.calib_note.get_hpi_param(
+        param = self._get_calibration_param(
+            self.ctx.calib_note.get_hpi_param,
             target,
             valid_days=valid_days or self.ctx.calibration_valid_days,
         )
@@ -290,7 +322,9 @@ class PulseService:
         else:
             return FlatTop(
                 duration=HPI_DURATION,
-                amplitude=self.ctx.params.get_control_amplitude(target),
+                amplitude=self.ctx.params.get_control_amplitude(
+                    self._target_qubit_label(target)
+                ),
                 tau=HPI_RAMPTIME,
             )
 
@@ -301,7 +335,8 @@ class PulseService:
         valid_days: int | None = None,
     ) -> Waveform:
         """Get the π pulse for the given target."""
-        param = self.ctx.calib_note.get_pi_param(
+        param = self._get_calibration_param(
+            self.ctx.calib_note.get_pi_param,
             target,
             valid_days=valid_days or self.ctx.calibration_valid_days,
         )
@@ -324,7 +359,8 @@ class PulseService:
         valid_days: int | None = None,
     ) -> Waveform:
         """Get the DRAG π/2 pulse for the given target."""
-        param = self.ctx.calib_note.get_drag_hpi_param(
+        param = self._get_calibration_param(
+            self.ctx.calib_note.get_drag_hpi_param,
             target,
             valid_days=valid_days or self.ctx.calibration_valid_days,
         )
@@ -347,7 +383,8 @@ class PulseService:
         valid_days: int | None = None,
     ) -> Waveform:
         """Get the DRAG π pulse for the given target."""
-        param = self.ctx.calib_note.get_drag_pi_param(
+        param = self._get_calibration_param(
+            self.ctx.calib_note.get_drag_pi_param,
             target,
             valid_days=valid_days or self.ctx.calibration_valid_days,
         )

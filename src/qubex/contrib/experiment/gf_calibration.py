@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass
 from typing import Any, Literal
 
 import numpy as np
@@ -33,7 +34,7 @@ from qubex.experiment.models.experiment_result import (
 )
 from qubex.experiment.models.result import Result
 from qubex.pulse import Blank, FlatTop, PulseSchedule
-from qubex.system import Target
+from qubex.system import Target, TargetType
 
 from ._deprecated_options import resolve_shot_options
 
@@ -47,6 +48,184 @@ def _normalize_targets(
     if isinstance(targets, str):
         return [targets]
     return list(targets)
+
+
+@dataclass(frozen=True)
+class _GFTargetLabels:
+    input_label: str
+    qubit_label: str
+    ge_label: str
+    ef_label: str
+    gf_label: str
+
+
+def _target_or_none(exp: Experiment, label: str) -> Any | None:
+    return exp.ctx.targets.get(label)
+
+
+def _require_ef_target(exp: Experiment, label: str) -> None:
+    target = _target_or_none(exp, label)
+    if target is None:
+        raise ValueError(f"EF target `{label}` is not registered.")
+    if getattr(target, "type", None) != TargetType.CTRL_EF:
+        raise ValueError(f"Target `{label}` is not an EF target.")
+
+
+def _require_ge_target(exp: Experiment, label: str) -> None:
+    target = _target_or_none(exp, label)
+    if target is None:
+        raise ValueError(f"GE target `{label}` is not registered.")
+    if getattr(target, "type", None) != TargetType.CTRL_GE:
+        raise ValueError(f"Target `{label}` is not a GE target.")
+
+
+def _mapped_target(
+    exp: Experiment,
+    label: str,
+    target_map: Mapping[str, str] | None,
+) -> str | None:
+    if target_map is None:
+        return None
+    if label in target_map:
+        return target_map[label]
+    try:
+        qubit_label = exp.ctx.resolve_qubit_label(label)
+    except ValueError:
+        return None
+    return target_map.get(qubit_label)
+
+
+def _require_same_qubit(
+    exp: Experiment,
+    *,
+    label: str,
+    expected_qubit: str,
+) -> None:
+    qubit = exp.ctx.resolve_qubit_label(label)
+    if qubit != expected_qubit:
+        raise ValueError(
+            f"Target `{label}` is bound to `{qubit}`, not `{expected_qubit}`."
+        )
+
+
+def _resolve_gf_target_labels(
+    exp: Experiment,
+    label: str,
+    *,
+    ge_targets: Mapping[str, str] | None,
+    ef_targets: Mapping[str, str] | None,
+) -> _GFTargetLabels:
+    qubit_label = exp.ctx.resolve_qubit_label(label)
+    target = _target_or_none(exp, label)
+
+    mapped_ge_label = _mapped_target(exp, label, ge_targets)
+    if mapped_ge_label is not None:
+        _require_ge_target(exp, mapped_ge_label)
+        _require_same_qubit(exp, label=mapped_ge_label, expected_qubit=qubit_label)
+        ge_label = mapped_ge_label
+    elif target is not None and getattr(target, "type", None) == TargetType.CTRL_GE:
+        ge_label = label
+    else:
+        ge_label = exp.ctx.resolve_ge_label(label)
+        _require_ge_target(exp, ge_label)
+
+    mapped_ef_label = _mapped_target(exp, label, ef_targets)
+    if mapped_ef_label is not None:
+        _require_ef_target(exp, mapped_ef_label)
+        _require_same_qubit(exp, label=mapped_ef_label, expected_qubit=qubit_label)
+        return _GFTargetLabels(
+            input_label=label,
+            qubit_label=qubit_label,
+            ge_label=ge_label,
+            ef_label=mapped_ef_label,
+            gf_label=f"{ge_label}_{mapped_ef_label}",
+        )
+
+    if target is not None and getattr(target, "type", None) == TargetType.CTRL_EF:
+        return _GFTargetLabels(
+            input_label=label,
+            qubit_label=qubit_label,
+            ge_label=ge_label,
+            ef_label=label,
+            gf_label=f"{ge_label}_{label}",
+        )
+
+    ef_label = exp.ctx.resolve_ef_label(label)
+    _require_ef_target(exp, ef_label)
+    return _GFTargetLabels(
+        input_label=label,
+        qubit_label=qubit_label,
+        ge_label=ge_label,
+        ef_label=ef_label,
+        gf_label=f"{ge_label}_{ef_label}",
+    )
+
+
+def _resolve_gf_target_list(
+    exp: Experiment,
+    targets: Collection[str],
+    *,
+    ge_targets: Mapping[str, str] | None,
+    ef_targets: Mapping[str, str] | None,
+) -> list[_GFTargetLabels]:
+    return [
+        _resolve_gf_target_labels(
+            exp,
+            target,
+            ge_targets=ge_targets,
+            ef_targets=ef_targets,
+        )
+        for target in targets
+    ]
+
+
+def _resolve_gf_frequency_map(
+    exp: Experiment,
+    resolved_targets: Collection[_GFTargetLabels],
+    frequencies: Mapping[str, float] | None,
+) -> dict[str, float]:
+    frequency_map: dict[str, float] = {}
+    for resolved in resolved_targets:
+        if frequencies is not None and resolved.ef_label in frequencies:
+            frequency = frequencies[resolved.ef_label]
+        elif frequencies is not None and resolved.input_label in frequencies:
+            frequency = frequencies[resolved.input_label]
+        elif frequencies is not None and resolved.qubit_label in frequencies:
+            frequency = frequencies[resolved.qubit_label]
+        else:
+            frequency = exp.ctx.targets[resolved.ef_label].frequency
+        frequency_map[resolved.ef_label] = float(frequency)
+    return frequency_map
+
+
+def _sweep_data_for_gf_target(
+    sweep_result: ExperimentResult[Any],
+    resolved: _GFTargetLabels,
+) -> Any:
+    for label in (
+        resolved.input_label,
+        resolved.qubit_label,
+        resolved.ge_label,
+        resolved.ef_label,
+    ):
+        if label in sweep_result.data:
+            return sweep_result.data[label]
+    raise ValueError(f"Measurement data for `{resolved.input_label}` was not found.")
+
+
+def _gf_targets_by_output_label(
+    resolved_targets: Collection[_GFTargetLabels],
+) -> dict[str, _GFTargetLabels]:
+    return {
+        label: resolved
+        for resolved in resolved_targets
+        for label in (
+            resolved.input_label,
+            resolved.qubit_label,
+            resolved.ge_label,
+            resolved.ef_label,
+        )
+    }
 
 
 def _build_gf_rabi_sequence(
@@ -84,6 +263,8 @@ def gf_rabi_experiment(
     time_range: ArrayLike,
     ramptime: float | None = None,
     frequencies: dict[str, float] | None = None,
+    ge_targets: Mapping[str, str] | None = None,
+    ef_targets: Mapping[str, str] | None = None,
     detuning: float | None = None,
     is_damped: bool | None = None,
     fit_threshold: float | None = None,
@@ -108,6 +289,10 @@ def gf_rabi_experiment(
         Ramp time of the flat-top pulse in ns.
     frequencies
         Target EF frequencies keyed by EF label.
+    ge_targets
+        Explicit GE target labels keyed by input target or qubit label.
+    ef_targets
+        Explicit EF target labels keyed by input target or qubit label.
     detuning
         Optional detuning applied to target frequencies.
     is_damped
@@ -147,36 +332,40 @@ def gf_rabi_experiment(
     if store_params is None:
         store_params = False
 
-    normalized_amplitudes = {
-        Target.ef_label(label): amplitude for label, amplitude in amplitudes.items()
+    resolved_targets = _resolve_gf_target_list(
+        exp,
+        list(amplitudes),
+        ge_targets=ge_targets,
+        ef_targets=ef_targets,
+    )
+    amplitudes_by_ef = {
+        resolved.ef_label: amplitudes[resolved.input_label]
+        for resolved in resolved_targets
     }
-    ge_labels = [Target.ge_label(label) for label in normalized_amplitudes]
-    ef_labels = [Target.ef_label(label) for label in normalized_amplitudes]
+    ge_labels = [resolved.ge_label for resolved in resolved_targets]
+    ef_labels = [resolved.ef_label for resolved in resolved_targets]
+    resolved_by_output = _gf_targets_by_output_label(resolved_targets)
 
     time_values = np.asarray(time_range, dtype=np.float64)
     if ramptime is None:
         ramptime = 0.0
     effective_time_range = time_values + ramptime
 
-    if frequencies is None:
-        frequencies = {
-            target: exp.ctx.targets[target].frequency
-            for target in normalized_amplitudes
-        }
+    frequencies = _resolve_gf_frequency_map(exp, resolved_targets, frequencies)
 
     def gf_rabi_sequence(duration_ns: int) -> PulseSchedule:
         return _build_gf_rabi_sequence(
             exp,
             ge_labels=ge_labels,
             ef_labels=ef_labels,
-            amplitudes=normalized_amplitudes,
+            amplitudes=amplitudes_by_ef,
             duration_ns=duration_ns,
             ramptime=ramptime,
         )
 
     if detuning is not None:
         frequencies = {
-            target: frequencies[target] + detuning for target in normalized_amplitudes
+            target: frequencies[target] + detuning for target in amplitudes_by_ef
         }
 
     sweep_result = exp.measurement_service.sweep_parameter(
@@ -191,13 +380,14 @@ def gf_rabi_experiment(
     gf_rabi_params: dict[str, RabiParam] = {}
     gf_rabi_data: dict[str, RabiData] = {}
     for qubit, sweep_data in sweep_result.data.items():
-        ef_label = Target.ef_label(qubit)
-        ge_label = Target.ge_label(qubit)
-        gf_label = f"{ge_label}_{ef_label}"
-        ge_rabi_param = exp.ge_rabi_params[qubit]
+        resolved = resolved_by_output.get(qubit)
+        if resolved is None:
+            raise ValueError(f"Unexpected GF Rabi output target `{qubit}`.")
+        gf_label = resolved.gf_label
+        ge_rabi_param = exp.ge_rabi_params[resolved.ge_label]
         iq_e = ge_rabi_param.endpoints[0]
         fit_result = fitting.fit_rabi(
-            target=qubit,
+            target=resolved.qubit_label,
             times=effective_time_range,
             data=sweep_data.data,
             reference_point=iq_e,
@@ -244,6 +434,8 @@ def obtain_gf_rabi_params(
     time_range: ArrayLike | None = None,
     ramptime: float | None = None,
     frequencies: dict[str, float] | None = None,
+    ge_targets: Mapping[str, str] | None = None,
+    ef_targets: Mapping[str, str] | None = None,
     is_damped: bool | None = None,
     fit_threshold: float | None = None,
     n_shots: int | None = None,
@@ -267,6 +459,10 @@ def obtain_gf_rabi_params(
         Ramp time of the flat-top pulse in ns.
     frequencies
         Target EF frequencies keyed by EF label.
+    ge_targets
+        Explicit GE target labels keyed by input target or qubit label.
+    ef_targets
+        Explicit EF target labels keyed by input target or qubit label.
     is_damped
         Whether to fit with a damped cosine model.
     fit_threshold
@@ -308,33 +504,45 @@ def obtain_gf_rabi_params(
 
     target_list = _normalize_targets(exp, targets)
     time_values = np.asarray(time_range)
+    resolved_targets = _resolve_gf_target_list(
+        exp,
+        target_list,
+        ge_targets=ge_targets,
+        ef_targets=ef_targets,
+    )
+    resolved_by_input = {
+        resolved.input_label: resolved for resolved in resolved_targets
+    }
 
     if ramptime is None:
         ramptime = 32 - 12
 
     amplitudes = {
-        target: exp.params.get_ef_control_amplitude(target) for target in target_list
+        target: exp.params.get_ef_control_amplitude(
+            resolved_by_input[target].qubit_label
+        )
+        for target in target_list
     }
 
     rabi_data: dict[str, RabiData] = {}
     rabi_params: dict[str, RabiParam] = {}
     for target in target_list:
-        ge_label = Target.ge_label(target)
-        ef_label = Target.ef_label(target)
-        gf_label = f"{ge_label}_{ef_label}"
+        gf_label = resolved_by_input[target].gf_label
         data = gf_rabi_experiment(
             exp=exp,
             amplitudes={target: amplitudes[target]},
             time_range=time_values,
             ramptime=ramptime,
             frequencies=frequencies,
+            ge_targets=ge_targets,
+            ef_targets=ef_targets,
             is_damped=is_damped,
             fit_threshold=fit_threshold,
             n_shots=n_shots,
             shot_interval=shot_interval,
             store_params=store_params,
             plot=plot,
-        ).data[gf_label]
+        ).data[resolved_by_input[target].gf_label]
         rabi_data[gf_label] = data
         rabi_params[gf_label] = data.rabi_param
 
@@ -594,6 +802,8 @@ def calibrate_gf_pulse(
     n_points: int | None = None,
     n_rotations: int | None = None,
     r2_threshold: float | None = None,
+    ge_targets: Mapping[str, str] | None = None,
+    ef_targets: Mapping[str, str] | None = None,
     plot: bool | None = None,
     n_shots: int | None = None,
     shot_interval: float | None = None,
@@ -620,10 +830,17 @@ def calibrate_gf_pulse(
         shot_interval = DEFAULT_INTERVAL
 
     target_list = _normalize_targets(exp, targets)
+    resolved_targets = _resolve_gf_target_list(
+        exp,
+        target_list,
+        ge_targets=ge_targets,
+        ef_targets=ef_targets,
+    )
+    resolved_by_input = {
+        resolved.input_label: resolved for resolved in resolved_targets
+    }
     gf_rabi_params_or_none = {
-        target: exp.get_rabi_param(
-            f"{Target.ge_label(target)}_{Target.ef_label(target)}"
-        )
+        target: exp.get_rabi_param(resolved_by_input[target].gf_label)
         for target in target_list
     }
     missing_gf_rabi = [
@@ -643,8 +860,9 @@ def calibrate_gf_pulse(
     )
 
     def calibrate(target: str) -> AmplCalibData:
-        ge_label = Target.ge_label(target)
-        ef_label = Target.ef_label(target)
+        resolved = resolved_by_input[target]
+        ge_label = resolved.ge_label
+        ef_label = resolved.ef_label
 
         if pulse_type == "hpi":
             pulse = FlatTop(
@@ -667,7 +885,7 @@ def calibrate_gf_pulse(
 
         gf_rabi_param = gf_rabi_params[target]
 
-        default_amplitude = exp.params.get_ef_control_amplitude(target)
+        default_amplitude = exp.params.get_ef_control_amplitude(resolved.qubit_label)
         ampl = rabi_rate * default_amplitude / gf_rabi_param.frequency
 
         ampl_min = ampl * (1 - 0.8 / n_rotations)
@@ -691,7 +909,7 @@ def calibrate_gf_pulse(
                 ps.add(ge_label, exp.pulse.x180(ge_label))
             return ps
 
-        sweep_data = exp.measurement_service.sweep_parameter(
+        sweep_result = exp.measurement_service.sweep_parameter(
             sequence=sequence,
             sweep_range=ampl_range,
             repetitions=1,
@@ -699,7 +917,8 @@ def calibrate_gf_pulse(
             n_shots=n_shots,
             shot_interval=shot_interval,
             plot=plot,
-        ).data[ge_label]
+        )
+        sweep_data = _sweep_data_for_gf_target(sweep_result, resolved)
         sweep_data.rabi_param = gf_rabi_param
 
         fit_result = fitting.fit_ampl_calib_data(
@@ -764,6 +983,8 @@ def calibrate_gf_hpi_pulse(
     n_points: int | None = None,
     n_rotations: int | None = None,
     r2_threshold: float | None = None,
+    ge_targets: Mapping[str, str] | None = None,
+    ef_targets: Mapping[str, str] | None = None,
     plot: bool | None = None,
     n_shots: int | None = None,
     shot_interval: float | None = None,
@@ -779,6 +1000,8 @@ def calibrate_gf_hpi_pulse(
         n_points=n_points,
         n_rotations=n_rotations,
         r2_threshold=r2_threshold,
+        ge_targets=ge_targets,
+        ef_targets=ef_targets,
         plot=plot,
         n_shots=n_shots,
         shot_interval=shot_interval,
@@ -795,6 +1018,8 @@ def calibrate_gf_pi_pulse(
     n_points: int | None = None,
     n_rotations: int | None = None,
     r2_threshold: float | None = None,
+    ge_targets: Mapping[str, str] | None = None,
+    ef_targets: Mapping[str, str] | None = None,
     plot: bool | None = None,
     n_shots: int | None = None,
     shot_interval: float | None = None,
@@ -810,6 +1035,8 @@ def calibrate_gf_pi_pulse(
         n_points=n_points,
         n_rotations=n_rotations,
         r2_threshold=r2_threshold,
+        ge_targets=ge_targets,
+        ef_targets=ef_targets,
         plot=plot,
         n_shots=n_shots,
         shot_interval=shot_interval,
@@ -825,6 +1052,8 @@ def gf_ramsey_experiment(
     detuning: float | None = None,
     second_rotation_axis: Literal["X", "Y"] | None = None,
     spectator_state: Literal["0", "1", "+", "-", "+i", "-i"] | None = None,
+    ge_targets: Mapping[str, str] | None = None,
+    ef_targets: Mapping[str, str] | None = None,
     n_shots: int | None = None,
     shot_interval: float | None = None,
     plot: bool | None = None,
@@ -852,6 +1081,16 @@ def gf_ramsey_experiment(
         save_image = False
 
     target_list = _normalize_targets(exp, targets)
+    resolved_targets = _resolve_gf_target_list(
+        exp,
+        target_list,
+        ge_targets=ge_targets,
+        ef_targets=ef_targets,
+    )
+    resolved_by_input = {
+        resolved.input_label: resolved for resolved in resolved_targets
+    }
+    resolved_by_output = _gf_targets_by_output_label(resolved_targets)
 
     if time_range is None:
         time_range = np.arange(0, 10001, 100)
@@ -863,13 +1102,15 @@ def gf_ramsey_experiment(
     if detuning is None:
         detuning = 0.001
 
-    exp.pulse.validate_rabi_params(target_list)
+    exp.pulse.validate_rabi_params(
+        [resolved.ge_label for resolved in resolved_targets]
+    )
 
     ef_hpi_pulses = exp.ef_hpi_pulse
     missing_ef_hpi = [
-        Target.ef_label(target)
-        for target in target_list
-        if Target.ef_label(target) not in ef_hpi_pulses
+        resolved.ef_label
+        for resolved in resolved_targets
+        if resolved.ef_label not in ef_hpi_pulses
     ]
     if missing_ef_hpi:
         raise ValueError(
@@ -877,9 +1118,7 @@ def gf_ramsey_experiment(
         )
 
     gf_rabi_params = {
-        target: exp.get_rabi_param(
-            f"{Target.ge_label(target)}_{Target.ef_label(target)}"
-        )
+        target: exp.get_rabi_param(resolved_by_input[target].gf_label)
         for target in target_list
     }
     missing_gf_rabi = [
@@ -927,10 +1166,12 @@ def gf_ramsey_experiment(
 
                 # Ramsey sequence for the target qubit
                 for target in _target_qubits:
-                    ef_label = Target.ef_label(target)
-                    x180 = exp.pulse.x180(target)
+                    resolved = resolved_by_output[target]
+                    ge_label = resolved.ge_label
+                    ef_label = resolved.ef_label
+                    x180 = exp.pulse.x180(ge_label)
                     ef90 = ef_hpi_pulses[ef_label]
-                    ps.add(target, x180)
+                    ps.add(ge_label, x180)
                     ps.barrier()
                     ps.add(ef_label, ef90)
                     ps.barrier()
@@ -941,10 +1182,11 @@ def gf_ramsey_experiment(
                     else:
                         ps.add(ef_label, ef90.shifted(-np.pi / 2))
                     ps.barrier()
-                    ps.add(target, x180)
+                    ps.add(ge_label, x180)
             return ps
 
-        ef_labels = [Target.ef_label(target) for target in target_qubits]
+        group_resolved_targets = [resolved_by_output[target] for target in target_qubits]
+        ef_labels = [resolved.ef_label for resolved in group_resolved_targets]
         detuned_frequencies = {
             ef_label: exp.targets[ef_label].frequency + detuning
             for ef_label in ef_labels
@@ -959,11 +1201,13 @@ def gf_ramsey_experiment(
             plot=plot,
         )
 
+        target_outputs = _gf_targets_by_output_label(group_resolved_targets)
         for target, sweep_data in sweep_result.data.items():
-            if target in target_qubits:
-                sweep_data.rabi_param = gf_rabi_params[target]
+            resolved = target_outputs.get(target)
+            if resolved is not None:
+                sweep_data.rabi_param = gf_rabi_params[resolved.input_label]
                 fit_result = fitting.fit_ramsey(
-                    target=target,
+                    target=resolved.input_label,
                     times=sweep_data.sweep_range,
                     data=sweep_data.normalized,
                     amplitude_est=1.0,
@@ -971,7 +1215,8 @@ def gf_ramsey_experiment(
                     plot=plot,
                 )
                 if fit_result.status is FitStatus.SUCCESS:
-                    ef_label = Target.ef_label(target)
+                    ge_label = resolved.ge_label
+                    ef_label = resolved.ef_label
                     f = exp.targets[ef_label].frequency
                     t2 = fit_result["tau"]
                     ramsey_freq = fit_result["f"]
@@ -992,18 +1237,18 @@ def gf_ramsey_experiment(
                         bare_freq=bare_freq,
                         r2=r2,
                     )
-                    data[target] = ramsey_data
+                    data[resolved.input_label] = ramsey_data
 
                     print(f"Bare ef frequency with |{spectator_state}〉:")
-                    print(f"  {target}: {ramsey_data.bare_freq:.6f}")
+                    print(f"  {resolved.input_label}: {ramsey_data.bare_freq:.6f}")
                     print("")
                     print(
-                        f"  anharmonicity: {ramsey_data.bare_freq - exp.targets[target].frequency:.6f}"
+                        f"  anharmonicity: {ramsey_data.bare_freq - exp.targets[ge_label].frequency:.6f}"
                     )
                     print("")
 
                     if save_image:
                         fig = fit_result.get_figure()
-                        viz.save_figure(fig, name=f"gf_ramsey_{target}")
+                        viz.save_figure(fig, name=f"gf_ramsey_{resolved.input_label}")
 
     return ExperimentResult(data=data)

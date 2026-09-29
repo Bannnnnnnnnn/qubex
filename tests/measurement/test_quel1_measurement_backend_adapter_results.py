@@ -13,13 +13,19 @@ from qubex.measurement.adapters.backend_adapter import Quel1MeasurementBackendAd
 from qubex.measurement.measurement_constraint_profile import (
     MeasurementConstraintProfile,
 )
+from qubex.measurement.measurement_result_converter import MeasurementResultConverter
 from qubex.measurement.models.measurement_config import MeasurementConfig
+from qubex.measurement.models.capture_schedule import Capture, CaptureSchedule
+from qubex.measurement.models.measurement_schedule import MeasurementSchedule
 from qubex.typing import MeasurementMode
 
 
 @dataclass
 class _Target:
-    sideband: str
+    sideband: str = "U"
+    is_read: bool = False
+    is_pump: bool = False
+    is_ge: bool = False
 
 
 @dataclass
@@ -28,6 +34,29 @@ class _ExperimentSystemStub:
 
     def get_target(self, target: str) -> _Target:
         return _Target(sideband=self.sideband_by_target[target])
+
+
+@dataclass
+class _PulseScheduleStub:
+    labels: list[str]
+
+
+@dataclass
+class _AliasExperimentSystemStub:
+    targets: dict[str, _Target]
+    read_labels: dict[str, str]
+    target_registry: Any
+
+    def get_target(self, target: str) -> _Target:
+        return self.targets[target]
+
+    def resolve_read_label(self, target: str) -> str:
+        return self.read_labels[target]
+
+
+class _AliasTargetRegistryStub:
+    def measurement_output_label(self, target: str) -> str:
+        return {"Q28_tmp": "Q28", "RQ28": "Q28"}.get(target, target)
 
 
 def _make_config(
@@ -92,6 +121,92 @@ def test_build_measurement_result_converts_single_mode_to_qubit_labels() -> None
         )
         * norm_factor,
     )
+
+
+def test_build_measurement_result_restores_custom_target_label(
+    dummy_classifier: Any,
+) -> None:
+    """Given request metadata for a custom drive target, result keys should use the requested label."""
+    norm_factor = 2 ** (-32)
+    backend_result = Quel1BackendExecutionResult(
+        status={},
+        data={
+            "RQ28": [
+                np.array([[9.0 + 0.0j]], dtype=np.complex128),
+                np.array([[0.0 + 0.0j], [1.0 + 0.0j]], dtype=np.complex128),
+            ]
+        },
+        config={},
+    )
+    adapter = Quel1MeasurementBackendAdapter(
+        backend_controller=cast(Any, object()),
+        experiment_system=cast(
+            Any,
+            _ExperimentSystemStub(sideband_by_target={"RQ28": "U"}),
+        ),
+    )
+
+    result = adapter.build_measurement_result(
+        backend_result=backend_result,
+        measurement_config=_make_config(mode="single", shots=2),
+        device_config={"kind": "quel1"},
+        sampling_period=2.0,
+        request_metadata={
+            "measurement_output_labels": {"RQ28": "Q28_tmp"},
+            "classifier_lookup_labels": {"Q28_tmp": "Q28"},
+        },
+    )
+
+    assert set(result.data) == {"Q28_tmp"}
+    assert result.data["Q28_tmp"][0].target == "Q28_tmp"
+    assert result.classifier_lookup_labels == {"Q28_tmp": "Q28"}
+    assert_allclose(
+        result.data["Q28_tmp"][0].data,
+        np.array([[0.0 + 0.0j], [1.0 + 0.0j]], dtype=np.complex128) * norm_factor,
+    )
+
+    legacy = MeasurementResultConverter.to_measure_result(
+        result,
+        classifiers={"Q28": dummy_classifier},
+    )
+    assert legacy.data["Q28_tmp"].classifier is dummy_classifier
+
+
+def test_build_request_metadata_maps_custom_ge_target_to_requested_label() -> None:
+    """Given a custom GE source label, request metadata should remap the readout result."""
+    adapter = Quel1MeasurementBackendAdapter(
+        backend_controller=cast(Any, object()),
+        experiment_system=cast(
+            Any,
+            _AliasExperimentSystemStub(
+                targets={
+                    "Q28_tmp": _Target(is_ge=True),
+                    "RQ28": _Target(is_read=True),
+                },
+                read_labels={"Q28_tmp": "RQ28"},
+                target_registry=_AliasTargetRegistryStub(),
+            ),
+        ),
+    )
+    schedule = MeasurementSchedule.model_construct(
+        pulse_schedule=_PulseScheduleStub(labels=["Q28_tmp", "RQ28"]),
+        capture_schedule=CaptureSchedule(
+            captures=[
+                Capture(
+                    channels=["RQ28"],
+                    start_time=0.0,
+                    duration=100.0,
+                )
+            ]
+        ),
+    )
+
+    metadata = adapter._build_request_metadata(schedule=schedule)
+
+    assert metadata == {
+        "measurement_output_labels": {"RQ28": "Q28_tmp"},
+        "classifier_lookup_labels": {"Q28_tmp": "Q28"},
+    }
 
 
 def test_build_measurement_result_converts_avg_mode_with_shot_scaling() -> None:
