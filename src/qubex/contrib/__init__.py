@@ -31,10 +31,13 @@ from .experiment.gf_calibration import (
     obtain_gf_rabi_params,
 )
 from .experiment.leakage_randomized_benchmarking import (
+    fit_computational_leakage_rb,
     fit_leakage_rb,
+    interleaved_leakage_rb_experiment_1q,
+    interleaved_leakage_rb_experiment_2q,
     leakage_randomized_benchmarking,
     leakage_rb_experiment_1q,
-    leakage_rb_sequence_1q,
+    leakage_rb_experiment_2q,
 )
 from .experiment.measurement_induced_decay import (
     measurement_induced_decay_experiment,
@@ -129,6 +132,7 @@ __all__ = [
     "estimate_qubit_frequency_from_chevron",
     "estimate_qubit_frequency_from_chevron_adaptive",
     "filtered_ckp_experiment",
+    "fit_computational_leakage_rb",
     "fit_leakage_rb",
     "fit_readout_parameters",
     "fourier_analysis",
@@ -138,11 +142,13 @@ __all__ = [
     "gf_rabi_experiment",
     "gf_ramsey_experiment",
     "ghz_state_tomography",
+    "interleaved_leakage_rb_experiment_1q",
+    "interleaved_leakage_rb_experiment_2q",
     "interleaved_purity_benchmarking",
     "ipb_experiment",
     "leakage_randomized_benchmarking",
     "leakage_rb_experiment_1q",
-    "leakage_rb_sequence_1q",
+    "leakage_rb_experiment_2q",
     "measure_1d_cluster_state",
     "measure_bell_state_fidelities",
     "measure_bell_states",
