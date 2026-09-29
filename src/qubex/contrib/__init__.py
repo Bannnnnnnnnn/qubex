@@ -91,6 +91,13 @@ from .experiment.simultaneous_coherence_measurement import (
 from .experiment.simultaneous_qubit_spectroscopy import (
     simultaneous_qubit_spectroscopy,
 )
+from .experiment.simultaneous_randomized_benchmarking import (
+    create_xy_rb_sequences,
+    generate_1q_xy_cliffords,
+    simultaneous_randomized_benchmarking,
+    simultaneous_xy_rb_sequence,
+    xy_rb_sequence_1q,
+)
 from .experiment.stark_characterization import (
     stark_ramsey_experiment,
     stark_t1_experiment,
@@ -126,12 +133,14 @@ __all__ = [
     "create_maximum_spanning_tree",
     "create_measurement_rounds",
     "create_mqc_sequence",
+    "create_xy_rb_sequences",
     "decompose_cr_crosstalk",
     "estimate_qubit_frequency_from_chevron",
     "estimate_qubit_frequency_from_chevron_adaptive",
     "filtered_ckp_experiment",
     "fit_readout_parameters",
     "fourier_analysis",
+    "generate_1q_xy_cliffords",
     "get_resistance_charge",
     "get_superconducting_gap",
     "gf_chevron_pattern",
@@ -168,9 +177,12 @@ __all__ = [
     "rzx_gate_property",
     "simultaneous_coherence_measurement",
     "simultaneous_qubit_spectroscopy",
+    "simultaneous_randomized_benchmarking",
+    "simultaneous_xy_rb_sequence",
     "stark_ramsey_experiment",
     "stark_t1_experiment",
     "sweep_readout_snr",
     "thermal_excitation_via_rabi",
     "visualize_graph",
+    "xy_rb_sequence_1q",
 ]
