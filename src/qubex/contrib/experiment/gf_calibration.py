@@ -474,7 +474,6 @@ def gf_chevron_pattern(
 
         for detuning in tqdm(detuning_values, leave=False):
             with exp.util.no_output():
-
                 sweep_result = exp.measurement_service.sweep_parameter(
                     sequence=gf_rabi_sequence,
                     sweep_range=time_values,
