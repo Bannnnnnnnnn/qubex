@@ -334,6 +334,81 @@ def test_print_chip_info_maps_t2_star_ef_ratio(monkeypatch) -> None:
     assert call["image_name"] == "t2_star_ef"
 
 
+def test_print_chip_info_maps_ej_over_ec(monkeypatch) -> None:
+    """Given GE and EF control frequencies, Ej/Ec should be mapped."""
+
+    class FakeParamLoader:
+        """Config-loader stub returning qubit parameter maps."""
+
+        def __init__(self) -> None:
+            self.requests: list[str] = []
+
+        def load_param_data(self, name: str) -> dict[str, float | None]:
+            """Return fake parameter data by name."""
+            self.requests.append(name)
+            if name == "control_frequency":
+                return {
+                    "Q0": 6.0,
+                    "Q1": 5.0,
+                    "Q2": None,
+                    "Q3": 4.0,
+                }
+            if name == "control_frequency_ef":
+                return {
+                    "Q0": 5.7,
+                    "Q1": 5.0,
+                    "Q2": 4.75,
+                    "Q3": None,
+                }
+            return {}
+
+    plot_calls: list[dict[str, object]] = []
+
+    class FakeLatticeGraph:
+        """LatticeGraph stub recording plot arguments."""
+
+        def __init__(self, n_qubits: int) -> None:
+            self.n_qubits = n_qubits
+            self.qubits = [f"Q{i}" for i in range(n_qubits)]
+
+        def plot_lattice_data(self, **kwargs: object) -> None:
+            """Record one lattice plot call."""
+            plot_calls.append(kwargs)
+
+    fake_loader = FakeParamLoader()
+    fake_chip = type("FakeChip", (), {"id": "TESTCHIP", "n_qubits": 4})()
+    fake_manager = FakeSystemManager(
+        experiment_system=type(
+            "FakeExperimentSystemWithChip", (), {"chip": fake_chip}
+        )(),
+        backend_controller=FakeBackendController(),
+        config_loader=fake_loader,
+    )
+    monkeypatch.setattr(experiment_tool, "system_manager", fake_manager)
+    monkeypatch.setattr(experiment_tool, "LatticeGraph", FakeLatticeGraph)
+
+    experiment_tool.print_chip_info("ej_over_ec", save_image=True)
+
+    assert fake_loader.requests == ["control_frequency", "control_frequency_ef"]
+    assert len(plot_calls) == 1
+    call = plot_calls[0]
+    values = cast(list[float], call["values"])
+    texts = cast(list[str], call["texts"])
+    hovertexts = cast(list[str], call["hovertexts"])
+    expected = ((6.0 + 0.3) ** 2 / (8 * 0.3)) / 0.3
+    assert call["title"] == "Ej/Ec"
+    assert len(values) == 4
+    assert math.isclose(values[0], expected, rel_tol=0, abs_tol=1e-12)
+    assert math.isnan(values[1])
+    assert math.isnan(values[2])
+    assert math.isnan(values[3])
+    assert texts[0] == "Q0<br>55.13"
+    assert texts[1:] == ["N/A", "N/A", "N/A"]
+    assert hovertexts[0] == "Q0: 55.125000"
+    assert call["save_image"] is True
+    assert call["image_name"] == "ej_over_ec"
+
+
 def test_check_skew_renders_figure_widget_via_plotly_figure(
     monkeypatch, tmp_path
 ) -> None:

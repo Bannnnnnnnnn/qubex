@@ -280,6 +280,7 @@ def print_chip_info(
         "resonator_frequency",
         "qubit_frequency",
         "qubit_anharmonicity",
+        "ej_over_ec",
         "t1",
         "t2_star",
         "t2_star_ef",
@@ -315,6 +316,7 @@ def print_chip_info(
             "chip_summary",
             "qubit_frequency",
             "qubit_anharmonicity",
+            "ej_over_ec",
             "t1",
             "t2_echo",
             "average_readout_fidelity",
@@ -328,6 +330,7 @@ def print_chip_info(
             "resonator_frequency",
             "qubit_frequency",
             "qubit_anharmonicity",
+            "ej_over_ec",
             "t1",
             "t2_star",
             "t2_star_ef",
@@ -424,6 +427,55 @@ def print_chip_info(
                     ],
                     save_image=save_image,
                     image_name="qubit_anharmonicity",
+                )
+
+        if "ej_over_ec" in info_type:
+            control_frequency_values = loader.load_param_data("control_frequency")
+            control_frequency_ef_values = loader.load_param_data("control_frequency_ef")
+            if control_frequency_values and control_frequency_ef_values:
+                values = {}
+                for qubit in graph.qubits:
+                    control_frequency = cast(
+                        float | None, control_frequency_values.get(qubit)
+                    )
+                    control_frequency_ef = cast(
+                        float | None, control_frequency_ef_values.get(qubit)
+                    )
+                    if (
+                        control_frequency is None
+                        or control_frequency_ef is None
+                        or math.isnan(control_frequency)
+                        or math.isnan(control_frequency_ef)
+                    ):
+                        values[qubit] = math.nan
+                        continue
+                    charging_energy = control_frequency - control_frequency_ef
+                    if charging_energy <= 0.0:
+                        values[qubit] = math.nan
+                        continue
+                    josephson_energy = (control_frequency + charging_energy) ** 2 / (
+                        8 * charging_energy
+                    )
+                    values[qubit] = (
+                        josephson_energy / charging_energy
+                        if josephson_energy != 0.0
+                        else math.nan
+                    )
+                graph.plot_lattice_data(
+                    title="Ej/Ec",
+                    values=list(values.values()),
+                    texts=[
+                        f"{qubit}<br>{value:.2f}" if _is_valid(value) else "N/A"
+                        for qubit, value in values.items()
+                    ],
+                    hovertexts=[
+                        f"{qubit}: {value:.6f}"
+                        if _is_valid(value)
+                        else f"{qubit}: N/A"
+                        for qubit, value in values.items()
+                    ],
+                    save_image=save_image,
+                    image_name="ej_over_ec",
                 )
 
         if "t1" in info_type:
