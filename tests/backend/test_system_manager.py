@@ -276,6 +276,7 @@ def test_sync_backend_settings_to_experiment_system_updates_in_place(
         "sideband": "L",
         "lo_freq": 10_000_000_000,
         "cnco_freq": 1_500,
+        "cnco_freqs": [1_500, 1_500],
         "fnco_freqs": [100, 200],
         "fullscale_current": 40_527,
     }
@@ -285,6 +286,7 @@ def test_sync_backend_settings_to_experiment_system_updates_in_place(
         "sideband": None,
         "lo_freq": 8_000_000_000,
         "cnco_freq": 2_500,
+        "cnco_freqs": [2_500],
         "fnco_freqs": [300],
         "fullscale_current": None,
     }
@@ -827,6 +829,77 @@ def test_push_restores_full_cache_after_partial_fetch_when_cache_is_empty(
         "A": {"ports": {1: {"mode": "ctrl"}}},
         "B": {"ports": {2: {"mode": "read"}}},
     }
+
+
+def test_push_reapplies_model_cache_after_hardware_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given model-only cache fields, push keeps them after raw hardware fetch."""
+    manager = SystemManager.shared()
+    backend_controller = FakeBackendController({})
+    hardware_settings = {
+        "A": {
+            "ports": {
+                1: {
+                    "direction": "out",
+                    "cnco_freq": 1_312_500_000,
+                    "channels": {
+                        0: {"fnco_freq": -93_750_000},
+                        1: {"fnco_freq": 234_375_000},
+                    },
+                }
+            }
+        }
+    }
+    model_cache = {
+        "A": {
+            "ports": {
+                1: {
+                    "direction": "out",
+                    "cnco_freq": 1_312_500_000,
+                    "channels": {
+                        0: {"cnco_freq": 1_312_500_000, "fnco_freq": -93_750_000},
+                        1: {"cnco_freq": 1_312_500_000, "fnco_freq": 234_375_000},
+                    },
+                }
+            }
+        }
+    }
+    monkeypatch.setattr(manager, "_backend_controller", backend_controller)
+    monkeypatch.setattr(manager, "_backend_settings", {})
+
+    box = SimpleNamespace(id="A", name="Alpha")
+    monkeypatch.setattr(
+        manager,
+        "_experiment_system",
+        SimpleNamespace(
+            get_box=lambda box_id: box,
+            hash=0,
+        ),
+    )
+    monkeypatch.setattr(
+        manager, "_sync_experiment_system_to_hardware", lambda **_: None
+    )
+    monkeypatch.setattr(
+        manager,
+        "_fetch_backend_settings_from_hardware",
+        lambda **_: hardware_settings,
+    )
+
+    def _sync_model_cache(*, boxes: Sequence[object]) -> None:
+        assert [box.id for box in boxes] == ["A"]
+        backend_controller.update_box_config_cache(model_cache)
+
+    monkeypatch.setattr(
+        manager,
+        "_sync_experiment_system_cache_to_backend_controller",
+        _sync_model_cache,
+    )
+
+    manager.push(["A"], confirm=False)
+
+    assert manager.backend_settings == hardware_settings
+    assert backend_controller.get_box_config_cache() == model_cache
 
 
 def test_push_without_cache_sync_still_applies_hardware_sync(

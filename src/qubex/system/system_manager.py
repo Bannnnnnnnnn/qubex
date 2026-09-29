@@ -545,6 +545,7 @@ This operation will overwrite the existing backend settings. Do you want to cont
             self._sync_backend_settings_to_backend_controller(
                 backend_settings=merged_backend_settings
             )
+            self._sync_experiment_system_cache_to_backend_controller(boxes=boxes)
         except Exception:
             self._set_backend_settings(previous_backend_settings)
             self._replace_box_config_cache(previous_box_cache)
@@ -681,6 +682,25 @@ This operation will overwrite the existing backend settings. Do you want to cont
             parallel=parallel,
             target_labels=target_labels,
         )
+
+    def _sync_experiment_system_cache_to_backend_controller(
+        self,
+        *,
+        boxes: Sequence[Box],
+    ) -> None:
+        """Refresh backend execution cache from model-only settings."""
+        if any(not hasattr(box, "ports") for box in boxes):
+            return
+        system_synchronizer = self._resolve_system_synchronizer()
+        if system_synchronizer is None:
+            return
+        sync_cache = getattr(
+            system_synchronizer,
+            "sync_experiment_system_cache_to_backend_controller",
+            None,
+        )
+        if callable(sync_cache):
+            sync_cache(boxes=boxes)
 
     def _fetch_backend_settings_from_hardware(
         self,

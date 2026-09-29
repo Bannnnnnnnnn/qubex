@@ -8,6 +8,8 @@
 #   address: <ip_address>  # required for QuBE and QuEL-1
 #   adapter: <adapter_id>  # required for QuBE and QuEL-1
 #   options: [<option_label>, ...]  # optional backend-specific box options
+#   # Type-A dual-readout:
+#   # options: ["dual_readout_group0", "dual_readout_group1"]
 
 Q2A:
   name: "QuBE OU #1-02"

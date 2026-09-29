@@ -1142,6 +1142,70 @@ def test_control_system_box_options_loaded_from_box_yaml(tmp_path: Path) -> None
     assert box.options == ("se8_mxfe1_awg1331", "refclk_corrected_mxfe1")
 
 
+def test_control_system_dual_readout_options_update_channels_from_box_yaml(
+    tmp_path: Path,
+) -> None:
+    """Given dual-readout box options, when loading config, then port channel counts are updated."""
+    chip_id = "TESTCHIP"
+    config_dir = tmp_path / "config"
+    params_dir = tmp_path / "params"
+
+    _write_yaml(
+        config_dir / "chip.yaml",
+        {chip_id: {"name": "Test Chip", "n_qubits": 4, "clock_master": "10.0.0.1"}},
+    )
+    _write_yaml(
+        config_dir / "box.yaml",
+        {
+            "BOX1": {
+                "name": "Box One",
+                "type": "quel1-a",
+                "address": "10.0.0.2",
+                "adapter": "dummy",
+                "options": ["dual_readout_group0"],
+            }
+        },
+    )
+    _write_yaml(
+        config_dir / "wiring.yaml",
+        {
+            chip_id: [
+                {
+                    "mux": 0,
+                    "read_out": "BOX1-1",
+                    "read_in": "BOX1-0",
+                    "ctrl": ["BOX1-2", "BOX1-4", "BOX1-9", "BOX1-11"],
+                    "pump": "BOX1-3",
+                }
+            ]
+        },
+    )
+    _write_yaml(
+        config_dir / "system.yaml",
+        {
+            chip_id: {
+                "chip_id": chip_id,
+                "backend": "quel1",
+            }
+        },
+    )
+    _write_yaml(params_dir / "props.yaml", {})
+    _write_yaml(params_dir / "params.yaml", {})
+
+    loader = ConfigLoader(
+        system_id=chip_id,
+        config_dir=config_dir,
+        params_dir=params_dir,
+    )
+    system = loader.get_experiment_system()
+    box = system.control_system.get_box("BOX1")
+
+    assert box.options == ("dual_readout_group0",)
+    assert box.get_port(0).n_channels == 5
+    assert box.get_port(1).n_channels == 2
+    assert box.get_port(2).n_channels == 2
+
+
 def test_control_system_clock_master_prefers_system_yaml(tmp_path: Path) -> None:
     """Given system.yaml and chip.yaml clock-master values, when loading control system config, then system.yaml value is used."""
     config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
@@ -1728,6 +1792,195 @@ def test_configure_updates_port_state_before_target_registry_rebuild(
     assert read_in_port.lo_freq is not None
     assert read_in_port.cnco_freq is not None
     assert all(channel.fnco_freq is not None for channel in read_in_port.channels)
+
+
+def test_dual_readout_configure_splits_output_and_added_capture_channel(
+    tmp_path: Path,
+) -> None:
+    """Given dual-readout box, when one target exceeds 200 MHz, then added CNCO lane is used."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    _write_yaml(
+        config_dir / "box.yaml",
+        {
+            "BOX1": {
+                "name": "Box One",
+                "type": "quel1-a",
+                "address": "10.0.0.2",
+                "adapter": "dummy",
+                "options": ["dual_readout_group0"],
+            }
+        },
+    )
+    _write_yaml(
+        params_dir / "resonator_frequency.yaml",
+        {
+            "meta": {"unit": "GHz"},
+            "data": {
+                "Q0": 10.232,
+                "Q1": 10.548,
+                "Q2": 10.355,
+                "Q3": 10.098,
+            },
+        },
+    )
+
+    loader = ConfigLoader(
+        system_id=chip_id,
+        config_dir=config_dir,
+        params_dir=params_dir,
+    )
+    experiment_system = loader.get_experiment_system()
+    read_out_port = experiment_system.control_system.get_gen_port("BOX1", 1)
+    read_in_port = experiment_system.control_system.get_cap_port("BOX1", 0)
+
+    assert (
+        experiment_system.get_read_out_target("RQ1").channel
+        == read_out_port.channels[1]
+    )
+    assert (
+        experiment_system.get_read_in_target("RQ1").channel == read_in_port.channels[4]
+    )
+    for label, cap_channel_number in {
+        "RQ3": 0,
+        "RQ0": 1,
+        "RQ2": 2,
+    }.items():
+        assert (
+            experiment_system.get_read_out_target(label).channel
+            == read_out_port.channels[0]
+        )
+        assert (
+            experiment_system.get_read_in_target(label).channel
+            == read_in_port.channels[cap_channel_number]
+        )
+        assert abs(experiment_system.get_awg_frequency(label)) <= 0.2
+    assert abs(experiment_system.get_awg_frequency("RQ1")) <= 0.2
+    assert read_out_port.cnco_freq == 1_312_500_000
+    assert read_out_port.channels[0].cnco_freq == 1_218_750_000
+    assert read_out_port.channels[1].cnco_freq == 1_546_875_000
+    assert read_out_port.channels[0].fnco_freq == 0
+    assert read_out_port.channels[1].fnco_freq == 0
+    assert read_in_port.channels[0].cnco_freq == read_out_port.channels[0].cnco_freq
+    assert read_in_port.channels[0].fnco_freq == 0
+    assert read_in_port.channels[4].cnco_freq == read_out_port.channels[1].cnco_freq
+    assert read_in_port.channels[4].fnco_freq == 0
+
+
+def test_dual_readout_update_port_params_keeps_capture_fnco(
+    tmp_path: Path,
+) -> None:
+    """Given dual-readout read target, when retuned, then capture FNCO follows output FNCO."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    _write_yaml(
+        config_dir / "box.yaml",
+        {
+            "BOX1": {
+                "name": "Box One",
+                "type": "quel1-a",
+                "address": "10.0.0.2",
+                "adapter": "dummy",
+                "options": ["dual_readout_group0"],
+            }
+        },
+    )
+    _write_yaml(
+        params_dir / "resonator_frequency.yaml",
+        {
+            "meta": {"unit": "GHz"},
+            "data": {
+                "Q0": 10.232,
+                "Q1": 10.548,
+                "Q2": 10.355,
+                "Q3": 10.098,
+            },
+        },
+    )
+    experiment_system = ConfigLoader(
+        system_id=chip_id,
+        config_dir=config_dir,
+        params_dir=params_dir,
+    ).get_experiment_system()
+
+    experiment_system.update_port_params(
+        "RQ1",
+        lo_freq=9_000_000_000,
+        cnco_freq=1_500_000_000,
+        fnco_freq=123_000_000,
+    )
+
+    assert experiment_system.get_read_out_target("RQ1").channel.fnco_freq == 123_000_000
+    assert experiment_system.get_read_in_target("RQ1").channel.fnco_freq == 123_000_000
+
+
+def test_readout_configure_keeps_single_channel_without_dual_readout(
+    tmp_path: Path,
+) -> None:
+    """Given ordinary readout box, when readout target exceeds 200 MHz, then existing assignment is kept."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    _write_yaml(
+        params_dir / "resonator_frequency.yaml",
+        {
+            "meta": {"unit": "GHz"},
+            "data": {
+                "Q0": 10.232,
+                "Q1": 10.548,
+                "Q2": 10.355,
+                "Q3": 10.098,
+            },
+        },
+    )
+
+    loader = ConfigLoader(
+        system_id=chip_id,
+        config_dir=config_dir,
+        params_dir=params_dir,
+    )
+    experiment_system = loader.get_experiment_system()
+    read_out_port = experiment_system.control_system.get_gen_port("BOX1", 1)
+
+    assert (
+        experiment_system.get_read_out_target("RQ1").channel
+        == read_out_port.channels[0]
+    )
+    assert abs(experiment_system.get_awg_frequency("RQ1")) > 0.2
+
+
+def test_dual_readout_configure_raises_when_added_channel_cannot_fit(
+    tmp_path: Path,
+) -> None:
+    """Given dual-readout box, when one added channel cannot satisfy 200 MHz, then ValueError is raised."""
+    config_dir, params_dir, chip_id = _make_minimal_files(tmp_path)
+    _write_yaml(
+        config_dir / "box.yaml",
+        {
+            "BOX1": {
+                "name": "Box One",
+                "type": "quel1-a",
+                "address": "10.0.0.2",
+                "adapter": "dummy",
+                "options": ["dual_readout_group0"],
+            }
+        },
+    )
+    _write_yaml(
+        params_dir / "resonator_frequency.yaml",
+        {
+            "meta": {"unit": "GHz"},
+            "data": {
+                "Q0": 9.0,
+                "Q1": 10.0,
+                "Q2": 11.0,
+                "Q3": 12.0,
+            },
+        },
+    )
+
+    with pytest.raises(ValueError, match="Dual-readout cannot keep readout AWG"):
+        ConfigLoader(
+            system_id=chip_id,
+            config_dir=config_dir,
+            params_dir=params_dir,
+        )
 
 
 def test_configure_initializes_monitor_ports_for_quel1(tmp_path: Path) -> None:

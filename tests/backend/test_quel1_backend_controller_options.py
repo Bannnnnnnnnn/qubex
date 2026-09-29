@@ -21,6 +21,14 @@ class _FakeQuel1ConfigOption(str, Enum):
     SE8_MXFE1_AWG1331 = "se8_mxfe1_awg1331"
     SE8_MXFE1_AWG2222 = "se8_mxfe1_awg2222"
     REFCLK_CORRECTED_MXFE1 = "refclk_corrected_mxfe1"
+    DUAL_READOUT_OUTPUT_MXFE0 = "dual_readout_output_mxfe0"
+    DUAL_READOUT_OUTPUT_MXFE1 = "dual_readout_output_mxfe1"
+
+
+class _FakeQuel1ConfigOptionWithoutDual(str, Enum):
+    SE8_MXFE1_AWG1331 = "se8_mxfe1_awg1331"
+    SE8_MXFE1_AWG2222 = "se8_mxfe1_awg2222"
+    REFCLK_CORRECTED_MXFE1 = "refclk_corrected_mxfe1"
 
 
 class _FakeBox:
@@ -29,6 +37,7 @@ class _FakeBox:
         self._status = status
         self.relinkup_calls: list[dict[str, Any]] = []
         self.reconnect_calls: list[dict[str, Any]] = []
+        self.dual_readout_calls: list[int] = []
 
     def link_status(self) -> dict[int, bool]:
         """Return a fixed link status."""
@@ -41,6 +50,28 @@ class _FakeBox:
     def reconnect(self, **kwargs: Any) -> None:
         """Accept reconnect calls."""
         self.reconnect_calls.append(kwargs)
+
+    def enable_dual_readout(self, port: int) -> None:
+        """Record dual-readout enable calls."""
+        self.dual_readout_calls.append(port)
+
+
+class _FakeBoxWithoutDualReadout:
+    def __init__(self, boxtype: str, status: dict[int, bool]) -> None:
+        self.boxtype = boxtype
+        self._status = status
+
+    def link_status(self) -> dict[int, bool]:
+        """Return a fixed link status."""
+        return self._status
+
+    def relinkup(self, **kwargs: Any) -> None:
+        """Accept relinkup calls."""
+        _ = kwargs
+
+    def reconnect(self, **kwargs: Any) -> None:
+        """Accept reconnect calls."""
+        _ = kwargs
 
 
 def _make_controller() -> Quel1BackendController:
@@ -166,6 +197,147 @@ def test_relinkup_maps_explicit_options(monkeypatch: pytest.MonkeyPatch) -> None
         _FakeQuel1ConfigOption.SE8_MXFE1_AWG1331,
         _FakeQuel1ConfigOption.REFCLK_CORRECTED_MXFE1,
     ]
+
+
+def test_relinkup_maps_dual_readout_group0(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Given dual-readout group0 option, when relinkup runs, then capture and config options are enabled."""
+    controller = _make_controller()
+    fake_box = _FakeBox("quel1-a", {0: False})
+    _override_driver_classes(controller, Quel1ConfigOption=_FakeQuel1ConfigOption)
+    monkeypatch.setattr(
+        controller._runtime_context, "validate_box_availability", lambda _: None
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_get_existing_or_create_box",
+        lambda **kwargs: fake_box,
+    )
+    controller.set_box_options({"B0": ("dual_readout_group0",)})
+
+    controller.relinkup("B0")
+
+    assert fake_box.dual_readout_calls == [0]
+    assert fake_box.relinkup_calls[0]["config_options"] == [
+        _FakeQuel1ConfigOption.DUAL_READOUT_OUTPUT_MXFE0
+    ]
+
+
+def test_relinkup_maps_dual_readout_group0_for_quel1se_fujitsu11(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given S159A-style dual-readout option, when relinkup runs, then mxfe0 config option is enabled."""
+    controller = _make_controller()
+    fake_box = _FakeBox("quel1se-fujitsu11-a", {0: False})
+    _override_driver_classes(controller, Quel1ConfigOption=_FakeQuel1ConfigOption)
+    monkeypatch.setattr(
+        controller._runtime_context, "validate_box_availability", lambda _: None
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_get_existing_or_create_box",
+        lambda **kwargs: fake_box,
+    )
+    controller.set_box_options({"S159A": ("dual_readout_group0",)})
+
+    controller.relinkup("S159A")
+
+    assert fake_box.dual_readout_calls == [0]
+    assert fake_box.relinkup_calls[0]["config_options"] == [
+        _FakeQuel1ConfigOption.DUAL_READOUT_OUTPUT_MXFE0
+    ]
+
+
+def test_relinkup_maps_dual_readout_group1(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Given dual-readout group1 option, when relinkup runs, then mxfe1 config option is enabled."""
+    controller = _make_controller()
+    fake_box = _FakeBox("quel1-a", {0: False, 1: False})
+    _override_driver_classes(controller, Quel1ConfigOption=_FakeQuel1ConfigOption)
+    monkeypatch.setattr(
+        controller._runtime_context, "validate_box_availability", lambda _: None
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_get_existing_or_create_box",
+        lambda **kwargs: fake_box,
+    )
+    controller.set_box_options({"B0": ("dual_readout_group1",)})
+
+    controller.relinkup("B0")
+
+    assert fake_box.dual_readout_calls == [7]
+    assert fake_box.relinkup_calls[0]["config_options"] == [
+        _FakeQuel1ConfigOption.DUAL_READOUT_OUTPUT_MXFE1
+    ]
+
+
+def test_relinkup_maps_both_dual_readout_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given both dual-readout options, when relinkup runs, then both groups are enabled."""
+    controller = _make_controller()
+    fake_box = _FakeBox("qube-riken-a", {0: False, 1: False})
+    _override_driver_classes(controller, Quel1ConfigOption=_FakeQuel1ConfigOption)
+    monkeypatch.setattr(
+        controller._runtime_context, "validate_box_availability", lambda _: None
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_get_existing_or_create_box",
+        lambda **kwargs: fake_box,
+    )
+    controller.set_box_options({"B0": ("dual_readout_group0", "dual_readout_group1")})
+
+    controller.relinkup("B0")
+
+    assert fake_box.dual_readout_calls == [1, 12]
+    assert fake_box.relinkup_calls[0]["config_options"] == [
+        _FakeQuel1ConfigOption.DUAL_READOUT_OUTPUT_MXFE0,
+        _FakeQuel1ConfigOption.DUAL_READOUT_OUTPUT_MXFE1,
+    ]
+
+
+def test_relinkup_rejects_dual_readout_when_backend_api_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given old quel_ic_config box, when dual-readout is requested, then a clear error is raised."""
+    controller = _make_controller()
+    fake_box = _FakeBoxWithoutDualReadout("quel1-a", {0: False})
+    _override_driver_classes(controller, Quel1ConfigOption=_FakeQuel1ConfigOption)
+    monkeypatch.setattr(
+        controller._runtime_context, "validate_box_availability", lambda _: None
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_get_existing_or_create_box",
+        lambda **kwargs: fake_box,
+    )
+    controller.set_box_options({"B0": ("dual_readout_group0",)})
+
+    with pytest.raises(TypeError, match="enable_dual_readout"):
+        controller.relinkup("B0")
+
+
+def test_relinkup_rejects_dual_readout_when_config_option_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Given old Quel1ConfigOption enum, when dual-readout is requested, then a clear error is raised."""
+    controller = _make_controller()
+    fake_box = _FakeBox("quel1-a", {0: False})
+    _override_driver_classes(
+        controller, Quel1ConfigOption=_FakeQuel1ConfigOptionWithoutDual
+    )
+    monkeypatch.setattr(
+        controller._runtime_context, "validate_box_availability", lambda _: None
+    )
+    monkeypatch.setattr(
+        controller._connection_manager,
+        "_get_existing_or_create_box",
+        lambda **kwargs: fake_box,
+    )
+    controller.set_box_options({"B0": ("dual_readout_group0",)})
+
+    with pytest.raises(RuntimeError, match="dual_readout_output_mxfe0"):
+        controller.relinkup("B0")
 
 
 def test_relinkup_rejects_conflicting_awg_options(

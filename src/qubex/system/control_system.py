@@ -99,6 +99,15 @@ class PortType(Enum):
     FOGI = "FOGI"
 
 
+@dataclass(frozen=True)
+class DualReadoutPortLayout:
+    """Port layout overrides for one dual-readout read-input group."""
+
+    read_in_port: int
+    read_out_port: int
+    donor_ctrl_port: int
+
+
 PORT_DIRECTION: Final = {
     PortType.READ_IN: "in",
     PortType.READ_OUT: "out",
@@ -107,6 +116,28 @@ PORT_DIRECTION: Final = {
     PortType.MNTR_IN: "in",
     PortType.MNTR_OUT: "out",
     PortType.FOGI: "out",
+}
+
+DUAL_READOUT_GROUP_OPTION_PREFIX: Final = "dual_readout_group"
+DUAL_READOUT_OUTPUT_OPTION_PREFIX: Final = "dual_readout_output_mxfe"
+
+DUAL_READOUT_PORT_LAYOUTS: Final[dict[BoxType, dict[int, DualReadoutPortLayout]]] = {
+    BoxType.QUEL1_A: {
+        0: DualReadoutPortLayout(read_in_port=0, read_out_port=1, donor_ctrl_port=2),
+        1: DualReadoutPortLayout(read_in_port=7, read_out_port=8, donor_ctrl_port=11),
+    },
+    BoxType.QUEL1SE_A: {
+        0: DualReadoutPortLayout(read_in_port=0, read_out_port=1, donor_ctrl_port=2),
+        1: DualReadoutPortLayout(read_in_port=7, read_out_port=8, donor_ctrl_port=9),
+    },
+    BoxType.QUBE_RIKEN_A: {
+        0: DualReadoutPortLayout(read_in_port=1, read_out_port=0, donor_ctrl_port=5),
+        1: DualReadoutPortLayout(read_in_port=12, read_out_port=13, donor_ctrl_port=8),
+    },
+    BoxType.QUBE_OU_A: {
+        0: DualReadoutPortLayout(read_in_port=1, read_out_port=0, donor_ctrl_port=5),
+        1: DualReadoutPortLayout(read_in_port=12, read_out_port=13, donor_ctrl_port=8),
+    },
 }
 
 
@@ -481,6 +512,38 @@ _QUEL1SE_R8_PORTS_BY_AWG_OPTION: Final[dict[str, dict[int, int]]] = {
     "se8_mxfe1_awg2222": {6: 2, 7: 2, 8: 2, 9: 2},
     "se8_mxfe1_awg3113": {6: 3, 7: 1, 8: 1, 9: 3},
 }
+_DUAL_READOUT_GROUP_OPTIONS: Final[dict[str, int]] = {
+    "dual_readout_group0": 0,
+    "dual_readout_group1": 1,
+}
+_DUAL_READOUT_SUPPORTED_BOX_TYPES: Final[frozenset[BoxType]] = frozenset(
+    {
+        BoxType.QUEL1SE_A,
+        BoxType.QUEL1_A,
+        BoxType.QUBE_RIKEN_A,
+        BoxType.QUBE_OU_A,
+    }
+)
+_DUAL_READOUT_CHANNEL_OVERRIDES: Final[
+    dict[BoxType, dict[int, dict[int | tuple[int, int], int]]]
+] = {
+    BoxType.QUEL1_A: {
+        0: {0: 5, 1: 2, 2: 2},
+        1: {7: 5, 8: 2, 11: 2},
+    },
+    BoxType.QUEL1SE_A: {
+        0: {0: 5, 1: 2, 2: 2},
+        1: {7: 5, 8: 2, 9: 2},
+    },
+    BoxType.QUBE_RIKEN_A: {
+        0: {1: 5, 0: 2, 5: 2},
+        1: {12: 5, 13: 2, 8: 2},
+    },
+    BoxType.QUBE_OU_A: {
+        0: {1: 5, 0: 2, 5: 2},
+        1: {12: 5, 13: 2, 8: 2},
+    },
+}
 
 
 def _resolve_quel1se_r8_awg_option(options: Sequence[str] | None = None) -> str:
@@ -492,6 +555,73 @@ def _resolve_quel1se_r8_awg_option(options: Sequence[str] | None = None) -> str:
     if len(awg_options) == 1:
         return awg_options[0]
     return _QUEL1SE_R8_DEFAULT_AWG_OPTION
+
+
+def _resolve_dual_readout_groups(
+    box_type: BoxType,
+    options: Sequence[str] | None = None,
+) -> set[int]:
+    """Resolve enabled dual-readout groups from optional labels."""
+    option_labels = tuple(options or ())
+    unknown_options = sorted(
+        label
+        for label in option_labels
+        if label.startswith("dual_readout_group")
+        and label not in _DUAL_READOUT_GROUP_OPTIONS
+    )
+    if unknown_options:
+        joined = ", ".join(unknown_options)
+        raise ValueError(f"Unknown dual-readout option(s): {joined}")
+
+    groups = {
+        group
+        for label, group in _DUAL_READOUT_GROUP_OPTIONS.items()
+        if label in option_labels
+    }
+    if groups and box_type not in _DUAL_READOUT_SUPPORTED_BOX_TYPES:
+        raise ValueError(
+            "Dual-readout options are supported only for "
+            "quel1-a, quel1se-fujitsu11-a, qube-riken-a, and qube-ou-a."
+        )
+    return groups
+
+
+def resolve_dual_readout_groups(
+    box_type: BoxType,
+    options: Sequence[str] | None = None,
+) -> frozenset[int]:
+    """Resolve enabled dual-readout group indices from option labels."""
+    return frozenset(_resolve_dual_readout_groups(box_type, options))
+
+
+def is_dual_readout_port(
+    *,
+    box_type: BoxType,
+    options: Sequence[str] | None,
+    port_number: int | tuple[int, int],
+    port_type: PortType,
+) -> bool:
+    """Return whether a port belongs to an enabled dual-readout group."""
+    if not isinstance(port_number, int):
+        return False
+    layouts = DUAL_READOUT_PORT_LAYOUTS.get(box_type, {})
+    for group in _resolve_dual_readout_groups(box_type, options):
+        layout = layouts[group]
+        if port_type == PortType.READ_IN and port_number == layout.read_in_port:
+            return True
+        if port_type == PortType.READ_OUT and port_number == layout.read_out_port:
+            return True
+    return False
+
+
+def _validate_box_options(
+    box_type: BoxType,
+    options: Sequence[str] | None = None,
+) -> None:
+    """Validate option labels that affect static box modeling."""
+    if box_type == BoxType.QUEL1SE_R8:
+        _resolve_quel1se_r8_awg_option(options)
+    _resolve_dual_readout_groups(box_type, options)
 
 
 def _get_number_of_channels(
@@ -506,6 +636,10 @@ def _get_number_of_channels(
             override = _QUEL1SE_R8_PORTS_BY_AWG_OPTION[awg_option].get(port_number)
             if override is not None:
                 return override
+    for group in sorted(_resolve_dual_readout_groups(box_type, options)):
+        override = _DUAL_READOUT_CHANNEL_OVERRIDES[box_type][group].get(port_number)
+        if override is not None:
+            return override
     return NUMBER_OF_CHANNELS[box_type].get(port_number, 0)
 
 
@@ -688,6 +822,7 @@ class Box(MutableModel):
         """Create a box with ports from settings."""
         type = BoxType(type) if isinstance(type, str) else type
         options_tuple = tuple(options or ())
+        _validate_box_options(type, options_tuple)
         return cls(
             id=id,
             name=name,
@@ -835,6 +970,7 @@ class GenChannel(Channel):
     """Generator channel with frequency parameters."""
 
     port_ref: GenPort = Field(alias="_port", exclude=True, repr=False)
+    cnco_freq_override: int | None = None
     fnco_freq: int | None = None
     nwait: int | None = None
 
@@ -865,7 +1001,11 @@ class GenChannel(Channel):
     @property
     def cnco_freq(self) -> int:
         """Return the CNCO frequency for the channel."""
-        cnco = self.port.cnco_freq
+        cnco = (
+            self.cnco_freq_override
+            if self.cnco_freq_override is not None
+            else self.port.cnco_freq
+        )
         if cnco is None:
             raise ValueError("CNCO frequency is not set.")
         return cnco
@@ -882,10 +1022,7 @@ class GenChannel(Channel):
         """Return the coarse frequency for the channel."""
         sideband = self.port.sideband
         lo = self.port.lo_freq
-        cnco = self.port.cnco_freq
-
-        if cnco is None:
-            raise ValueError("CNCO frequency is not set.")
+        cnco = self.cnco_freq
         if lo is None and sideband is None:
             return cnco
         elif lo is None:
@@ -905,9 +1042,7 @@ class GenChannel(Channel):
         """Return the fine frequency for the channel."""
         sideband = self.port.sideband
         lo = self.port.lo_freq
-        cnco = self.port.cnco_freq
-        if cnco is None:
-            raise ValueError("CNCO frequency is not set.")
+        cnco = self.cnco_freq
         fnco = self.fnco_freq
         if fnco is None:
             raise ValueError("FNCO frequency is not set.")
@@ -932,6 +1067,7 @@ class CapChannel(Channel):
     """Capture channel with frequency parameters."""
 
     port_ref: CapPort = Field(alias="_port", exclude=True, repr=False)
+    cnco_freq_override: int | None = None
     fnco_freq: int | None = None
     ndelay: int | None = None
 
@@ -951,6 +1087,18 @@ class CapChannel(Channel):
     def _port(self, port: CapPort) -> None:
         """Set the parent capture port via legacy attribute name."""
         self.port_ref = port
+
+    @property
+    def cnco_freq(self) -> int:
+        """Return the CNCO frequency for the channel."""
+        cnco = (
+            self.cnco_freq_override
+            if self.cnco_freq_override is not None
+            else self.port.cnco_freq
+        )
+        if cnco is None:
+            raise ValueError("CNCO frequency is not set.")
+        return cnco
 
 
 class ControlSystem:
@@ -1035,6 +1183,7 @@ class ControlSystem:
         sideband: Literal["U", "L"] | None | Sentinel = MISSING,
         lo_freq: int | None | Sentinel = MISSING,
         cnco_freq: int | None = None,
+        cnco_freqs: Sequence[int | None] | None = None,
         fnco_freqs: Sequence[int] | None = None,
         vatt: int | None | Sentinel = MISSING,
         fullscale_current: int | None = None,
@@ -1053,6 +1202,16 @@ class ControlSystem:
                 port.lo_freq = lo_freq
             if cnco_freq is not None:
                 port.cnco_freq = cnco_freq
+            if cnco_freqs is not None:
+                if len(cnco_freqs) != len(port.channels):
+                    raise ValueError(
+                        f"Expected {len(port.channels)} cnco_freqs, "
+                        f"but got {len(cnco_freqs)}."
+                    )
+                for gen_channel, channel_cnco_freq in zip(
+                    port.channels, cnco_freqs, strict=True
+                ):
+                    gen_channel.cnco_freq_override = channel_cnco_freq
             if fnco_freqs is not None:
                 if len(fnco_freqs) != len(port.channels):
                     raise ValueError(
@@ -1078,6 +1237,16 @@ class ControlSystem:
                 port.lo_freq = lo_freq
             if cnco_freq is not None:
                 port.cnco_freq = cnco_freq
+            if cnco_freqs is not None:
+                if len(cnco_freqs) != len(port.channels):
+                    raise ValueError(
+                        f"Expected {len(port.channels)} cnco_freqs, "
+                        f"but got {len(cnco_freqs)}."
+                    )
+                for cap_channel, channel_cnco_freq in zip(
+                    port.channels, cnco_freqs, strict=True
+                ):
+                    cap_channel.cnco_freq_override = channel_cnco_freq
             if fnco_freqs is not None:
                 if len(fnco_freqs) != len(port.channels):
                     raise ValueError(

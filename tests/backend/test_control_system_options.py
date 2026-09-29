@@ -12,6 +12,11 @@ def _control_channel_counts(box: Box) -> list[int]:
     return [len(box.get_port(port_num).channels) for port_num in (6, 7, 8, 9)]
 
 
+def _port_channel_counts(box: Box, port_numbers: tuple[int, ...]) -> tuple[int, ...]:
+    """Return channel counts for selected ports."""
+    return tuple(len(box.get_port(port_num).channels) for port_num in port_numbers)
+
+
 def test_r8_box_uses_default_awg2222_when_options_omitted() -> None:
     """Given R8 box without options, when building ports, then control channels are 2-2-2-2."""
     box = Box.new(
@@ -37,6 +42,113 @@ def test_r8_box_applies_awg1331_option_to_control_channels() -> None:
     )
 
     assert _control_channel_counts(box) == [1, 3, 3, 1]
+
+
+@pytest.mark.parametrize(
+    ("box_type", "group0_ports", "group1_ports"),
+    [
+        ("quel1-a", (0, 1, 2), (7, 8, 11)),
+        ("quel1se-fujitsu11-a", (0, 1, 2), (7, 8, 9)),
+        ("qube-riken-a", (1, 0, 5), (12, 13, 8)),
+        ("qube-ou-a", (1, 0, 5), (12, 13, 8)),
+    ],
+)
+def test_dual_readout_group0_updates_type_a_port_channels(
+    box_type: str,
+    group0_ports: tuple[int, int, int],
+    group1_ports: tuple[int, int, int],
+) -> None:
+    """Given dual-readout group0 option, when building Type-A ports, then group0 channel counts change."""
+    box = Box.new(
+        id="B0",
+        name="Box",
+        type=box_type,
+        address="192.0.2.10",
+        adapter="A0",
+        options=("dual_readout_group0",),
+    )
+
+    assert _port_channel_counts(box, group0_ports) == (5, 2, 2)
+    assert _port_channel_counts(box, group1_ports) == (4, 1, 3)
+
+
+@pytest.mark.parametrize(
+    ("box_type", "group0_ports", "group1_ports"),
+    [
+        ("quel1-a", (0, 1, 2), (7, 8, 11)),
+        ("quel1se-fujitsu11-a", (0, 1, 2), (7, 8, 9)),
+        ("qube-riken-a", (1, 0, 5), (12, 13, 8)),
+        ("qube-ou-a", (1, 0, 5), (12, 13, 8)),
+    ],
+)
+def test_dual_readout_group1_updates_type_a_port_channels(
+    box_type: str,
+    group0_ports: tuple[int, int, int],
+    group1_ports: tuple[int, int, int],
+) -> None:
+    """Given dual-readout group1 option, when building Type-A ports, then group1 channel counts change."""
+    box = Box.new(
+        id="B0",
+        name="Box",
+        type=box_type,
+        address="192.0.2.10",
+        adapter="A0",
+        options=("dual_readout_group1",),
+    )
+
+    assert _port_channel_counts(box, group0_ports) == (4, 1, 3)
+    assert _port_channel_counts(box, group1_ports) == (5, 2, 2)
+
+
+@pytest.mark.parametrize(
+    ("box_type", "group0_ports", "group1_ports"),
+    [
+        ("quel1-a", (0, 1, 2), (7, 8, 11)),
+        ("quel1se-fujitsu11-a", (0, 1, 2), (7, 8, 9)),
+        ("qube-riken-a", (1, 0, 5), (12, 13, 8)),
+        ("qube-ou-a", (1, 0, 5), (12, 13, 8)),
+    ],
+)
+def test_dual_readout_both_groups_update_type_a_port_channels(
+    box_type: str,
+    group0_ports: tuple[int, int, int],
+    group1_ports: tuple[int, int, int],
+) -> None:
+    """Given both dual-readout options, when building Type-A ports, then both groups change."""
+    box = Box.new(
+        id="B0",
+        name="Box",
+        type=box_type,
+        address="192.0.2.10",
+        adapter="A0",
+        options=("dual_readout_group0", "dual_readout_group1"),
+    )
+
+    assert _port_channel_counts(box, group0_ports) == (5, 2, 2)
+    assert _port_channel_counts(box, group1_ports) == (5, 2, 2)
+
+
+@pytest.mark.parametrize(
+    "box_type",
+    [
+        "quel1-b",
+        "qube-riken-b",
+        "qube-ou-b",
+        "quel1se-riken8",
+        "quel1se-fujitsu11-b",
+    ],
+)
+def test_dual_readout_options_reject_unsupported_box_types(box_type: str) -> None:
+    """Given dual-readout option on unsupported box type, when building ports, then ValueError is raised."""
+    with pytest.raises(ValueError, match="Dual-readout options are supported only"):
+        Box.new(
+            id="B0",
+            name="Box",
+            type=box_type,
+            address="192.0.2.10",
+            adapter="A0",
+            options=("dual_readout_group0",),
+        )
 
 
 def test_r8_box_rejects_multiple_awg_options() -> None:

@@ -26,9 +26,12 @@ from .measurement_defaults import MeasurementDefaults
 from .quantum_system import Chip, Mux, QuantumSystem, Qubit, Resonator
 from .quel1.quel1_control_parameter_defaults import DEFAULT_CAPTURE_DELAY
 from .quel1.quel1_port_configurator import (
+    QUEL1_BOX_TYPES,
     MixingUtil,
+    ReadoutMixingConfig,
     create_control_configuration,
     create_readout_configuration,
+    create_readout_port_configuration,
     get_boxes_to_configure,
 )
 from .quel1.quel1_system_constants import (
@@ -433,30 +436,44 @@ class ExperimentSystem:
         original_values = (
             gen_channel.port.lo_freq,
             gen_channel.port.cnco_freq,
+            gen_channel.cnco_freq_override,
             gen_channel.fnco_freq,
         )
+        cap_original_values: (
+            tuple[int | None, int | None, int | None, int | None] | None
+        ) = None
         try:
             gen_channel.port.lo_freq = lo_freq
             gen_channel.port.cnco_freq = cnco_freq
+            gen_channel.cnco_freq_override = cnco_freq
             gen_channel.fnco_freq = fnco_freq
             if target.is_read:
                 cap_channel = self.get_read_in_target(label).channel
+                cap_original_values = (
+                    cap_channel.port.lo_freq,
+                    cap_channel.port.cnco_freq,
+                    cap_channel.cnco_freq_override,
+                    cap_channel.fnco_freq,
+                )
                 cap_channel.port.lo_freq = lo_freq
                 cap_channel.port.cnco_freq = cnco_freq
+                cap_channel.cnco_freq_override = cnco_freq
                 cap_channel.fnco_freq = fnco_freq
         except Exception as e:
             # rollback
             (
                 gen_channel.port.lo_freq,
                 gen_channel.port.cnco_freq,
+                gen_channel.cnco_freq_override,
                 gen_channel.fnco_freq,
             ) = original_values
-            if target.is_read:
+            if target.is_read and cap_original_values is not None:
                 (
                     cap_channel.port.lo_freq,
                     cap_channel.port.cnco_freq,
+                    cap_channel.cnco_freq_override,
                     cap_channel.fnco_freq,
-                ) = original_values
+                ) = cap_original_values
             raise ValueError(f"Error setting readout port params: {e}") from None
 
     def _create_qubit_port_set_map(self) -> dict[str, QubitPortSet]:
@@ -601,18 +618,23 @@ class ExperimentSystem:
         if mux.is_not_available:
             return
         traits = box.traits
-        config = create_readout_configuration(
-            mux,
-            excluded_targets=self.targets_to_exclude,
-            ssb=traits.readout_ssb,
-            cnco_center=traits.readout_cnco_center,
+        config = self._create_readout_configuration(
+            box=box,
+            mux=mux,
+            n_readout_channels=port.n_channels,
         )
         port.lo_freq = config["lo"]
         port.cnco_freq = config["cnco"]
         port.sideband = traits.readout_ssb
         port.vatt = params.get_readout_vatt(mux.index)
         port.fullscale_current = params.get_readout_fsc(mux.index)
-        port.channels[0].fnco_freq = config["fnco"]
+        for channel in port.channels:
+            channel_config = config["channels"].get(
+                channel.number,
+                config["channels"][0],
+            )
+            channel.cnco_freq_override = channel_config["cnco"]
+            channel.fnco_freq = channel_config["fnco"]
 
     def _configure_capture_port(
         self,
@@ -629,27 +651,85 @@ class ExperimentSystem:
             return
         if mux.is_not_available:
             return
-        traits = box.traits
-        config = create_readout_configuration(
-            mux,
-            excluded_targets=self.targets_to_exclude,
-            ssb=traits.readout_ssb,
-            cnco_center=traits.readout_cnco_center,
+        config = self._create_readout_configuration(
+            box=box,
+            mux=mux,
+            n_readout_channels=self._capture_port_readout_channel_count(port),
         )
         port.lo_freq = config["lo"]
         port.cnco_freq = config["cnco"]
         if box.type == BoxType.QUEL3:
             for cap_channel in port.channels:
+                cap_channel.cnco_freq_override = config["channels"][0]["cnco"]
                 cap_channel.fnco_freq = config["fnco"]
             return
+        capture_delay = params.get_capture_delay(mux.index)
+        if not isinstance(capture_delay, int):
+            raise TypeError(
+                "QuEL-1 capture delay must be configured as integer `ndelay`."
+            )
+        primary_config = config["channels"][0]
         for cap_channel in port.channels:
-            cap_channel.fnco_freq = config["fnco"]
-            capture_delay = params.get_capture_delay(mux.index)
-            if not isinstance(capture_delay, int):
-                raise TypeError(
-                    "QuEL-1 capture delay must be configured as integer `ndelay`."
-                )
+            cap_channel.cnco_freq_override = primary_config["cnco"]
+            cap_channel.fnco_freq = primary_config["capture_fnco"]
             cap_channel.ndelay = capture_delay
+        for channel_idx, channel_config in config["channels"].items():
+            if channel_idx == 0:
+                continue
+            capture_channel_idx = self._readout_capture_channel_index(
+                port=port,
+                readout_channel=channel_idx,
+            )
+            port.channels[capture_channel_idx].cnco_freq_override = channel_config[
+                "cnco"
+            ]
+            port.channels[capture_channel_idx].fnco_freq = channel_config[
+                "capture_fnco"
+            ]
+
+    def _create_readout_configuration(
+        self,
+        *,
+        box: Box,
+        mux: Mux,
+        n_readout_channels: int,
+    ) -> ReadoutMixingConfig:
+        """Build readout configuration, enabling auto split only for QuEL-1 readout."""
+        traits = box.traits
+        readout_channels = n_readout_channels if box.type in QUEL1_BOX_TYPES else 1
+        if readout_channels >= 2:
+            return create_readout_port_configuration(
+                mux,
+                excluded_targets=self.targets_to_exclude,
+                ssb=traits.readout_ssb,
+                cnco_center=traits.readout_cnco_center,
+                n_lanes=readout_channels,
+            )
+        return create_readout_configuration(
+            mux,
+            excluded_targets=self.targets_to_exclude,
+            ssb=traits.readout_ssb,
+            cnco_center=traits.readout_cnco_center,
+        )
+
+    @staticmethod
+    def _capture_port_readout_channel_count(port: CapPort) -> int:
+        """Return readout output channels represented by a capture port."""
+        return 2 if len(port.channels) >= 5 else 1
+
+    @staticmethod
+    def _readout_capture_channel_index(
+        *,
+        port: CapPort,
+        readout_channel: int,
+    ) -> int:
+        """Return capture channel index corresponding to an extra readout output."""
+        if readout_channel != 1 or len(port.channels) < 5:
+            raise ValueError(
+                f"Readout port `{port.id}` does not have a dual-readout "
+                f"capture channel for readout channel {readout_channel}."
+            )
+        return len(port.channels) - 1
 
     def _configure_monitor_port(
         self,
@@ -679,6 +759,7 @@ class ExperimentSystem:
                 if isinstance(port, GenPort):
                     if port.type == PortType.READ_OUT:
                         self._build_readout_targets(
+                            box=box,
                             port=port,
                             gen_targets=gen_targets,
                         )
@@ -698,6 +779,7 @@ class ExperimentSystem:
                 elif isinstance(port, CapPort):
                     if port.type == PortType.READ_IN:
                         self._build_capture_targets(
+                            box=box,
                             port=port,
                             cap_targets=cap_targets,
                         )
@@ -936,6 +1018,7 @@ class ExperimentSystem:
 
     def _build_readout_targets(
         self,
+        box: Box,
         port: GenPort,
         gen_targets: dict[str, Target],
     ) -> None:
@@ -943,17 +1026,30 @@ class ExperimentSystem:
         mux = self.get_mux_by_readout_port(port)
         if mux is None or mux.is_not_available:
             return
+        config = self._create_readout_configuration(
+            box=box,
+            mux=mux,
+            n_readout_channels=port.n_channels,
+        )
+        channel_by_target = {
+            target: channel_idx
+            for channel_idx, channel_config in config["channels"].items()
+            for target in channel_config["targets"]
+        }
         for resonator in mux.resonators:
             if not resonator.is_valid:
                 continue
+            target_label = Target.read_label(resonator.label)
+            channel_idx = channel_by_target.get(target_label, 0)
             read_out_target = Target.new_read_target(
                 resonator=resonator,
-                channel=port.channels[0],
+                channel=port.channels[channel_idx],
             )
             gen_targets[read_out_target.label] = read_out_target
 
     def _build_capture_targets(
         self,
+        box: Box,
         port: CapPort,
         cap_targets: dict[str, CapTarget],
     ) -> None:
@@ -961,11 +1057,29 @@ class ExperimentSystem:
         mux = self.get_mux_by_readout_port(port)
         if mux is None or mux.is_not_available:
             return
-        for idx, resonator in enumerate(mux.resonators):
-            if not resonator.is_valid:
-                continue
-            read_in_target = CapTarget.new_read_target(
-                resonator=resonator,
-                channel=port.channels[idx],
-            )
-            cap_targets[read_in_target.label] = read_in_target
+        config = self._create_readout_configuration(
+            box=box,
+            mux=mux,
+            n_readout_channels=self._capture_port_readout_channel_count(port),
+        )
+        resonator_by_target = {
+            Target.read_label(resonator.label): resonator
+            for resonator in mux.resonators
+            if resonator.is_valid
+        }
+        for readout_channel, channel_config in config["channels"].items():
+            for lane_index, target_label in enumerate(channel_config["targets"]):
+                resonator = resonator_by_target[target_label]
+                capture_channel_idx = (
+                    lane_index
+                    if readout_channel == 0
+                    else self._readout_capture_channel_index(
+                        port=port,
+                        readout_channel=readout_channel,
+                    )
+                )
+                read_in_target = CapTarget.new_read_target(
+                    resonator=resonator,
+                    channel=port.channels[capture_channel_idx],
+                )
+                cap_targets[read_in_target.label] = read_in_target

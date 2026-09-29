@@ -42,6 +42,20 @@ _QUEL1SE_R8_AWG_OPTIONS = {
     "se8_mxfe1_awg3113",
 }
 _QUEL1SE_R8_DEFAULT_AWG_OPTION = "se8_mxfe1_awg2222"
+_DUAL_READOUT_GROUP_OPTIONS = {
+    "dual_readout_group0": 0,
+    "dual_readout_group1": 1,
+}
+_DUAL_READOUT_CONFIG_OPTION_LABELS = {
+    0: "dual_readout_output_mxfe0",
+    1: "dual_readout_output_mxfe1",
+}
+_DUAL_READOUT_READ_IN_PORTS_BY_BOXTYPE = {
+    "quel1-a": {0: 0, 1: 7},
+    "quel1se-fujitsu11-a": {0: 0, 1: 7},
+    "qube-riken-a": {0: 1, 1: 12},
+    "qube-ou-a": {0: 1, 1: 12},
+}
 
 
 class _ClosableResource(Protocol):
@@ -70,6 +84,48 @@ def _resolve_quel1se_r8_awg_option(options: list[str]) -> str:
     if len(awg_options) == 1:
         return awg_options[0]
     return _QUEL1SE_R8_DEFAULT_AWG_OPTION
+
+
+def _normalize_boxtype_label(boxtype: Any) -> str:
+    """Return a string boxtype label across quelware API generations."""
+    if isinstance(boxtype, str):
+        return boxtype
+    tostr = getattr(boxtype, "tostr", None)
+    if callable(tostr):
+        return str(tostr())
+    return str(boxtype)
+
+
+def _resolve_dual_readout_groups(
+    *,
+    box_name: str,
+    boxtype: str,
+    option_labels: Collection[str],
+) -> set[int]:
+    """Resolve dual-readout group labels for one box."""
+    unknown_options = sorted(
+        label
+        for label in option_labels
+        if label.startswith("dual_readout_group")
+        and label not in _DUAL_READOUT_GROUP_OPTIONS
+    )
+    if unknown_options:
+        joined = ", ".join(unknown_options)
+        raise ValueError(
+            f"Unknown dual-readout option(s) for box `{box_name}`: {joined}."
+        )
+
+    groups = {
+        group
+        for label, group in _DUAL_READOUT_GROUP_OPTIONS.items()
+        if label in option_labels
+    }
+    if groups and boxtype not in _DUAL_READOUT_READ_IN_PORTS_BY_BOXTYPE:
+        raise ValueError(
+            f"Dual-readout options for box `{box_name}` are supported only for "
+            "quel1-a, quel1se-fujitsu11-a, qube-riken-a, and qube-ou-a."
+        )
+    return groups
 
 
 class Quel1ConnectionManager:
@@ -281,6 +337,7 @@ class Quel1ConnectionManager:
         """Linkup one box and return the connected box."""
         self._runtime_context.validate_box_availability(box_name)
         box = self._get_existing_or_create_box(box_name=box_name, reconnect=False)
+        self._apply_dual_readout_options(box_name=box_name, box=box)
         reconnect_noise_threshold = (
             DEFAULT_BACKGROUND_NOISE_THRESHOLD_AT_RECONNECT
             if noise_threshold is None
@@ -367,6 +424,7 @@ class Quel1ConnectionManager:
             else noise_threshold
         )
         box = self._get_existing_or_create_box(box_name=box_name, reconnect=False)
+        self._apply_dual_readout_options(box_name=box_name, box=box)
         config_options = self._resolve_config_options(
             box_name=box_name, boxtype=box.boxtype
         )
@@ -430,6 +488,7 @@ class Quel1ConnectionManager:
         self._runtime_context.validate_box_availability(box_name)
         db = self._runtime_context.qubecalib.system_config_database
         box = db.create_box(box_name, reconnect=False)
+        self._apply_dual_readout_options(box_name=box_name, box=box)
         if reconnect:
             box.reconnect(
                 background_noise_threshold=DEFAULT_BACKGROUND_NOISE_THRESHOLD_AT_RECONNECT
@@ -510,6 +569,7 @@ class Quel1ConnectionManager:
             for box_name in box_names:
                 setting = settings_by_name[box_name]
                 box = created_boxes[box_name]
+                self._apply_dual_readout_options(box_name=box_name, box=box)
                 sequencer = driver.SequencerClient(str(setting.ipaddr_sss))
                 boxpool._boxes[box_name] = (box, sequencer)
                 boxpool._linkstatus[box_name] = False
@@ -524,6 +584,7 @@ class Quel1ConnectionManager:
                     ipaddr_css=str(setting.ipaddr_css),
                     boxtype=setting.boxtype,
                 )
+                self._apply_dual_readout_options(box_name=box_name, box=box)
                 boxes_to_reconnect.append(box)
 
         if parallel and boxes_to_reconnect:
@@ -632,8 +693,22 @@ class Quel1ConnectionManager:
         boxtype: str,
     ) -> list[Quel1ConfigOption] | None:
         """Resolve config options for relinkup from optional per-box labels."""
+        boxtype_label = _normalize_boxtype_label(boxtype)
         option_labels = list(self._runtime_context.box_options.get(box_name, ()))
-        if boxtype == "quel1se-riken8":
+        dual_readout_groups = _resolve_dual_readout_groups(
+            box_name=box_name,
+            boxtype=boxtype_label,
+            option_labels=option_labels,
+        )
+        option_labels = [
+            label for label in option_labels if label not in _DUAL_READOUT_GROUP_OPTIONS
+        ]
+        for group in sorted(dual_readout_groups):
+            option_label = _DUAL_READOUT_CONFIG_OPTION_LABELS[group]
+            if option_label not in option_labels:
+                option_labels.append(option_label)
+
+        if boxtype_label == "quel1se-riken8":
             awg_option = _resolve_quel1se_r8_awg_option(option_labels)
             if awg_option not in option_labels:
                 option_labels.insert(0, awg_option)
@@ -645,11 +720,44 @@ class Quel1ConnectionManager:
         for option_label in option_labels:
             option = option_map.get(option_label)
             if option is None:
+                if option_label in _DUAL_READOUT_CONFIG_OPTION_LABELS.values():
+                    raise RuntimeError(
+                        f"Box `{box_name}` uses dual-readout, but "
+                        f"Quel1ConfigOption `{option_label}` is unavailable. "
+                        "Install a dual-readout-enabled quel_ic_config."
+                    )
                 raise ValueError(
                     f"Unknown Quel1 config option `{option_label}` for box `{box_name}`."
                 )
             config_options.append(option)
         return config_options
+
+    def _apply_dual_readout_options(self, *, box_name: str, box: Quel1Box) -> None:
+        """Enable dual-readout capture routing before link maintenance."""
+        option_labels = list(self._runtime_context.box_options.get(box_name, ()))
+        if not any(label.startswith("dual_readout_group") for label in option_labels):
+            return
+
+        boxtype = _normalize_boxtype_label(box.boxtype)
+        groups = _resolve_dual_readout_groups(
+            box_name=box_name,
+            boxtype=boxtype,
+            option_labels=option_labels,
+        )
+        if not groups:
+            return
+
+        enable_dual_readout = getattr(box, "enable_dual_readout", None)
+        if not callable(enable_dual_readout):
+            raise TypeError(
+                f"Box `{box_name}` uses dual-readout, but its Quel1Box object "
+                "does not expose enable_dual_readout(port). Install a "
+                "dual-readout-enabled quel_ic_config."
+            )
+
+        read_input_ports = _DUAL_READOUT_READ_IN_PORTS_BY_BOXTYPE[boxtype]
+        for group in sorted(groups):
+            enable_dual_readout(read_input_ports[group])
 
     def _collect_held_resources(self) -> list[_DisconnectResource]:
         """Collect clockmaster and box objects currently held by runtime state."""

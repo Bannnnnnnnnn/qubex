@@ -10,7 +10,7 @@ import numpy as np
 from typing_extensions import TypedDict
 
 from qubex.system.control_system import Box, BoxType
-from qubex.system.quantum_system import Mux, Qubit
+from qubex.system.quantum_system import Mux, Qubit, Resonator
 from qubex.system.quel1.quel1_system_constants import (
     AWG_MAX_HZ,
     CNCO_CENTER_CTRL_HZ,
@@ -23,6 +23,19 @@ from qubex.typing import ConfigurationMode
 
 logger = logging.getLogger(__name__)
 
+READOUT_AWG_AUTO_SPLIT_LIMIT_HZ: Final[int] = 200_000_000
+_READOUT_PRIMARY_CHANNEL: Final[int] = 0
+_READOUT_SECONDARY_CHANNEL: Final[int] = 1
+
+
+class ReadoutChannelConfig(TypedDict):
+    """Per-channel readout mixing configuration."""
+
+    cnco: int
+    fnco: int
+    capture_fnco: int
+    targets: list[str]
+
 
 class ReadoutMixingConfig(TypedDict):
     """Readout mixing configuration for one mux."""
@@ -30,6 +43,7 @@ class ReadoutMixingConfig(TypedDict):
     lo: int | None
     cnco: int
     fnco: int
+    channels: dict[int, ReadoutChannelConfig]
 
 
 class ControlChannelConfig(TypedDict):
@@ -110,6 +124,31 @@ class MixingUtil:
             f_mix = lo + cnco + fnco if ssb == "U" else lo - cnco - fnco
         return fnco, f_mix
 
+    @staticmethod
+    def calc_cnco_for_lo(
+        f: float,
+        ssb: Literal["U", "L"] | None,
+        lo: int | None,
+        nco_step: int = NCO_STEP_HZ,
+    ) -> tuple[int, int]:
+        """Calculate CNCO settings for a target frequency with a fixed LO."""
+        if ssb is None and lo is None:
+            cnco = round(f / nco_step) * nco_step
+            f_mix = cnco
+        elif lo is None:
+            raise ValueError("LO frequency is required when SSB is not None.")
+        elif ssb is None:
+            raise ValueError("SSB is required when LO frequency is not None.")
+        elif ssb == "U":
+            cnco = round((f - lo) / nco_step) * nco_step
+            f_mix = lo + cnco
+        elif ssb == "L":
+            cnco = round((lo - f) / nco_step) * nco_step
+            f_mix = lo - cnco
+        else:
+            raise ValueError("Invalid SSB")
+        return cnco, f_mix
+
 
 QUEL1_BOX_TYPES: Final[frozenset[BoxType]] = frozenset(
     {
@@ -137,6 +176,8 @@ def create_readout_configuration(
     excluded_targets: Sequence[str],
     ssb: Literal["U", "L"] | None = "U",
     cnco_center: int | None = CNCO_CENTER_READ_HZ,
+    n_channels: int = 1,
+    auto_split_awg_limit_hz: int | None = None,
 ) -> ReadoutMixingConfig:
     """Build readout mixing settings for one mux."""
     resonators = [
@@ -151,13 +192,396 @@ def create_readout_configuration(
         ssb=ssb,
         cnco_center=cnco_center,
     )
+    target_labels = [_readout_target_label(resonator) for resonator in resonators]
+    if auto_split_awg_limit_hz is None or n_channels < 2:
+        fnco, _ = MixingUtil.calc_fnco(
+            f=f_target,
+            ssb=ssb,
+            lo=lo,
+            cnco=cnco,
+        )
+        return {
+            "lo": lo,
+            "cnco": cnco,
+            "fnco": fnco,
+            "channels": {
+                _READOUT_PRIMARY_CHANNEL: {
+                    "cnco": cnco,
+                    "fnco": fnco,
+                    "capture_fnco": fnco,
+                    "targets": target_labels,
+                },
+            },
+        }
+
+    primary_config = _build_readout_channel_config(
+        resonators=resonators,
+        ssb=ssb,
+        lo=lo,
+        cnco=cnco,
+    )
+    if (
+        _max_readout_awg_offset_hz(
+            resonators=resonators,
+            config=primary_config,
+            ssb=ssb,
+            lo=lo,
+            cnco=cnco,
+        )
+        <= auto_split_awg_limit_hz
+    ):
+        return {
+            "lo": lo,
+            "cnco": cnco,
+            "fnco": primary_config["fnco"],
+            "channels": {_READOUT_PRIMARY_CHANNEL: primary_config},
+        }
+
+    split = _find_readout_auto_split(
+        resonators=resonators,
+        ssb=ssb,
+        lo=lo,
+        cnco=cnco,
+        limit_hz=auto_split_awg_limit_hz,
+        primary_config=primary_config,
+    )
+    if split is None:
+        frequencies = ", ".join(
+            f"{_readout_target_label(resonator)}={resonator.frequency:.6f} GHz"
+            for resonator in resonators
+        )
+        raise ValueError(
+            "Dual-readout cannot keep readout AWG frequencies within "
+            f"+/-{auto_split_awg_limit_hz * 1e-6:.0f} MHz for mux "
+            f"`{mux.label}`: {frequencies}."
+        )
+    return {
+        "lo": lo,
+        "cnco": cnco,
+        "fnco": split[_READOUT_PRIMARY_CHANNEL]["fnco"],
+        "channels": split,
+    }
+
+
+def create_readout_port_configuration(
+    mux: Mux,
+    *,
+    excluded_targets: Sequence[str],
+    n_lanes: int = 1,
+    ssb: Literal["U", "L"] | None = "U",
+    cnco_center: int | None = CNCO_CENTER_READ_HZ,
+    auto_split_awg_limit_hz: int | None = READOUT_AWG_AUTO_SPLIT_LIMIT_HZ,
+) -> ReadoutMixingConfig:
+    """Build readout mixing settings with optional dual-readout CNCO lanes."""
+    resonators = _valid_readout_resonators(
+        mux=mux,
+        excluded_targets=excluded_targets,
+    )
+    freqs = [resonator.frequency * 1e9 for resonator in resonators]
+    f_target = (max(freqs) + min(freqs)) / 2
+    lo, cnco, _ = MixingUtil.calc_lo_cnco(
+        f=f_target,
+        ssb=ssb,
+        cnco_center=cnco_center,
+    )
+    single_channel = _build_readout_lane_config(
+        resonators=resonators,
+        ssb=ssb,
+        lo=lo,
+        cnco=cnco,
+    )
+    if (
+        n_lanes < 2
+        or len(resonators) < 2
+        or (
+            auto_split_awg_limit_hz is not None
+            and _max_readout_awg_offset_hz(
+                resonators=resonators,
+                config=single_channel,
+                ssb=ssb,
+                lo=lo,
+                cnco=cnco,
+            )
+            <= auto_split_awg_limit_hz
+        )
+    ):
+        return {
+            "lo": lo,
+            "cnco": cnco,
+            "fnco": single_channel["fnco"],
+            "channels": {_READOUT_PRIMARY_CHANNEL: single_channel},
+        }
+
+    lanes = split_readout_resonators(resonators, n_lanes=n_lanes)
+    channels = {
+        lane_index: _build_readout_lane_config(
+            resonators=lane_resonators,
+            ssb=ssb,
+            lo=lo,
+            cnco=cnco,
+        )
+        for lane_index, lane_resonators in enumerate(lanes)
+    }
+    if auto_split_awg_limit_hz is not None:
+        max_offset = max(
+            abs(offset)
+            for lane_index, lane_resonators in enumerate(lanes)
+            for offset in _readout_awg_offsets_hz(
+                resonators=lane_resonators,
+                config=channels[lane_index],
+                ssb=ssb,
+                lo=lo,
+                cnco=cnco,
+            ).values()
+        )
+        max_fnco = max(
+            max(abs(channel["fnco"]), abs(channel["capture_fnco"]))
+            for channel in channels.values()
+        )
+        if max_offset > auto_split_awg_limit_hz or max_fnco > FNCO_MAX_HZ:
+            frequencies = ", ".join(
+                f"{_readout_target_label(resonator)}={resonator.frequency:.6f} GHz"
+                for resonator in resonators
+            )
+            raise ValueError(
+                "Dual-readout cannot keep readout AWG frequencies within "
+                f"+/-{auto_split_awg_limit_hz * 1e-6:.0f} MHz for mux "
+                f"`{mux.label}`: {frequencies}."
+            )
+    primary = channels[_READOUT_PRIMARY_CHANNEL]
+    return {
+        "lo": lo,
+        "cnco": cnco,
+        "fnco": primary["fnco"],
+        "channels": channels,
+    }
+
+
+def _readout_target_label(resonator: Resonator) -> str:
+    """Return the readout target label for one resonator."""
+    return f"R{resonator.qubit}"
+
+
+def _build_readout_lane_config(
+    *,
+    resonators: Sequence[Resonator],
+    ssb: Literal["U", "L"] | None,
+    lo: int | None,
+    cnco: int,
+) -> ReadoutChannelConfig:
+    """Build one readout lane with lane-local CNCO and zero FNCO."""
+    freqs = [resonator.frequency * 1e9 for resonator in resonators]
+    f_target = (max(freqs) + min(freqs)) / 2
+    lane_cnco, _ = MixingUtil.calc_cnco_for_lo(f=f_target, ssb=ssb, lo=lo)
+    return {
+        "cnco": lane_cnco,
+        "fnco": 0,
+        "capture_fnco": 0,
+        "targets": [_readout_target_label(resonator) for resonator in resonators],
+    }
+
+
+def split_readout_resonators(
+    resonators: Sequence[Resonator],
+    *,
+    n_lanes: int,
+) -> tuple[tuple[Resonator, ...], ...]:
+    """Split readout resonators into a primary lane and one edge lane."""
+    valid_resonators = tuple(resonators)
+    if n_lanes < 2 or len(valid_resonators) < 2:
+        return (valid_resonators,)
+
+    ordered = tuple(sorted(valid_resonators, key=lambda resonator: resonator.frequency))
+    span_without_low = ordered[-1].frequency - ordered[1].frequency
+    span_without_high = ordered[-2].frequency - ordered[0].frequency
+    if span_without_high <= span_without_low:
+        primary = ordered[:-1]
+        secondary = (ordered[-1],)
+    else:
+        primary = ordered[1:]
+        secondary = (ordered[0],)
+    return (primary, secondary)
+
+
+def _valid_readout_resonators(
+    *,
+    mux: Mux,
+    excluded_targets: Sequence[str],
+) -> list[Resonator]:
+    """Return resonators used to calculate readout mixing settings."""
+    return [
+        resonator
+        for resonator in mux.resonators
+        if resonator.is_valid and resonator.label not in excluded_targets
+    ]
+
+
+def _build_readout_channel_config(
+    *,
+    resonators: Sequence[Resonator],
+    ssb: Literal["U", "L"] | None,
+    lo: int | None,
+    cnco: int,
+) -> ReadoutChannelConfig:
+    """Build one readout channel configuration for a resonator cluster."""
+    freqs = [resonator.frequency * 1e9 for resonator in resonators]
+    f_target = (max(freqs) + min(freqs)) / 2
     fnco, _ = MixingUtil.calc_fnco(
         f=f_target,
         ssb=ssb,
         lo=lo,
         cnco=cnco,
     )
-    return {"lo": lo, "cnco": cnco, "fnco": fnco}
+    return {
+        "cnco": cnco,
+        "fnco": fnco,
+        "capture_fnco": fnco,
+        "targets": [_readout_target_label(resonator) for resonator in resonators],
+    }
+
+
+def _find_readout_auto_split(
+    *,
+    resonators: Sequence[Resonator],
+    ssb: Literal["U", "L"] | None,
+    lo: int | None,
+    cnco: int,
+    limit_hz: int,
+    primary_config: ReadoutChannelConfig,
+) -> dict[int, ReadoutChannelConfig] | None:
+    """Find a one-target readout split that satisfies the AWG limit."""
+    candidates: list[tuple[float, float, str, dict[int, ReadoutChannelConfig]]] = []
+    original_offsets = _readout_awg_offsets_hz(
+        resonators=resonators,
+        config=primary_config,
+        ssb=ssb,
+        lo=lo,
+        cnco=cnco,
+    )
+    for moved in resonators:
+        primary_resonators = [
+            resonator for resonator in resonators if resonator is not moved
+        ]
+        if not primary_resonators:
+            continue
+        secondary_resonators = [moved]
+        primary = _build_readout_channel_config(
+            resonators=primary_resonators,
+            ssb=ssb,
+            lo=lo,
+            cnco=cnco,
+        )
+        secondary = _build_readout_channel_config(
+            resonators=secondary_resonators,
+            ssb=ssb,
+            lo=lo,
+            cnco=cnco,
+        )
+        if abs(primary["fnco"]) > FNCO_MAX_HZ or abs(secondary["fnco"]) > FNCO_MAX_HZ:
+            continue
+        primary_offsets = _readout_awg_offsets_hz(
+            resonators=primary_resonators,
+            config=primary,
+            ssb=ssb,
+            lo=lo,
+            cnco=cnco,
+        )
+        secondary_offsets = _readout_awg_offsets_hz(
+            resonators=secondary_resonators,
+            config=secondary,
+            ssb=ssb,
+            lo=lo,
+            cnco=cnco,
+        )
+        max_offset = max(
+            [abs(offset) for offset in primary_offsets.values()]
+            + [abs(offset) for offset in secondary_offsets.values()]
+        )
+        if max_offset > limit_hz:
+            continue
+        moved_label = _readout_target_label(moved)
+        candidates.append(
+            (
+                max_offset,
+                -abs(original_offsets[moved_label]),
+                moved_label,
+                {
+                    _READOUT_PRIMARY_CHANNEL: primary,
+                    _READOUT_SECONDARY_CHANNEL: secondary,
+                },
+            )
+        )
+    if not candidates:
+        return None
+    candidates.sort(key=lambda candidate: candidate[:3])
+    return candidates[0][3]
+
+
+def _readout_awg_offsets_hz(
+    *,
+    resonators: Sequence[Resonator],
+    config: ReadoutChannelConfig,
+    ssb: Literal["U", "L"] | None,
+    lo: int | None,
+    cnco: int,
+) -> dict[str, float]:
+    """Return per-target AWG offsets for one readout channel config."""
+    fine_frequency = _readout_fine_frequency_hz(
+        ssb=ssb,
+        lo=lo,
+        cnco=config["cnco"],
+        fnco=config["fnco"],
+    )
+    offsets: dict[str, float] = {}
+    for resonator in resonators:
+        frequency_hz = resonator.frequency * 1e9
+        if ssb == "L":
+            offset = fine_frequency - frequency_hz
+        elif ssb in ("U", None):
+            offset = frequency_hz - fine_frequency
+        else:
+            raise ValueError(f"Invalid SSB: {ssb}")
+        offsets[_readout_target_label(resonator)] = offset
+    return offsets
+
+
+def _max_readout_awg_offset_hz(
+    *,
+    resonators: Sequence[Resonator],
+    config: ReadoutChannelConfig,
+    ssb: Literal["U", "L"] | None,
+    lo: int | None,
+    cnco: int,
+) -> float:
+    """Return the largest absolute AWG offset for one readout channel config."""
+    offsets = _readout_awg_offsets_hz(
+        resonators=resonators,
+        config=config,
+        ssb=ssb,
+        lo=lo,
+        cnco=cnco,
+    )
+    return max(abs(offset) for offset in offsets.values())
+
+
+def _readout_fine_frequency_hz(
+    *,
+    ssb: Literal["U", "L"] | None,
+    lo: int | None,
+    cnco: int,
+    fnco: int,
+) -> int:
+    """Return the fine readout frequency for one channel."""
+    nco = cnco + fnco
+    if ssb is None and lo is None:
+        return nco
+    if lo is None:
+        raise ValueError("LO frequency is required when SSB is not None.")
+    if ssb == "U":
+        return lo + nco
+    if ssb == "L":
+        return lo - nco
+    raise ValueError(f"Invalid SSB: {ssb}")
 
 
 def create_control_configuration(
