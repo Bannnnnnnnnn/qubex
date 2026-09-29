@@ -81,6 +81,11 @@ from .experiment.repetition_code import (
     plot_repetition_code_logical_summary,
     repetition_code,
 )
+from .experiment.repetition_code_noisy_simulation import (
+    is_stim_available,
+    plot_repetition_code_noisy_simulation,
+    repetition_code_noisy_simulation,
+)
 from .experiment.rzx_gate import rzx, rzx_gate_property
 from .experiment.simultaneous_coherence_measurement import (
     simultaneous_coherence_measurement,
@@ -132,6 +137,7 @@ __all__ = [
     "ghz_state_tomography",
     "interleaved_purity_benchmarking",
     "ipb_experiment",
+    "is_stim_available",
     "measure_1d_cluster_state",
     "measure_bell_state_fidelities",
     "measure_bell_states",
@@ -151,12 +157,14 @@ __all__ = [
     "plot_repetition_code_analysis",
     "plot_repetition_code_correlation",
     "plot_repetition_code_logical_summary",
+    "plot_repetition_code_noisy_simulation",
     "purity_benchmarking",
     "purity_sequence_1q",
     "purity_sequence_2q",
     "quantum_efficiency_measurement",
     "readout_snr",
     "repetition_code",
+    "repetition_code_noisy_simulation",
     "rzx",
     "rzx_gate_property",
     "simultaneous_coherence_measurement",
