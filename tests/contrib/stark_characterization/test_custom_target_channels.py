@@ -9,8 +9,10 @@ from qubex.contrib import (
     experiment as contrib_experiment,
     insitu_target,
     make_insitu_channel,
+    make_spectator_stark_channel,
     make_stark_channel,
     make_stark_cr_channel,
+    spectator_stark_target,
     stark_cr_target,
     stark_target,
 )
@@ -39,6 +41,8 @@ class _TargetStub:
 
 class _ContextStub:
     def resolve_qubit_label(self, target: str) -> str:
+        if target in {"Q16", "Q16-under-test"}:
+            return "Q16"
         if target in {"Q17", "Q17-ef"}:
             return "Q17"
         if target in {"Q18", "Q18_insitu"}:
@@ -50,6 +54,7 @@ class _ExperimentStub:
     def __init__(self) -> None:
         self.ctx = _ContextStub()
         self.targets = {
+            "Q16": _TargetStub(frequency=5.0),
             "Q17": _TargetStub(frequency=5.2),
             "Q18": _TargetStub(frequency=4.8),
             "Q18_insitu": _TargetStub(frequency=4.75),
@@ -68,12 +73,16 @@ def test_custom_channel_functions_are_exported_from_contrib() -> None:
     assert callable(insitu_target)
     assert callable(make_stark_channel)
     assert callable(make_insitu_channel)
+    assert callable(spectator_stark_target)
+    assert callable(make_spectator_stark_channel)
     assert callable(stark_cr_target)
     assert callable(make_stark_cr_channel)
     assert callable(contrib_experiment.stark_target)
     assert callable(contrib_experiment.insitu_target)
     assert callable(contrib_experiment.make_stark_channel)
     assert callable(contrib_experiment.make_insitu_channel)
+    assert callable(contrib_experiment.spectator_stark_target)
+    assert callable(contrib_experiment.make_spectator_stark_channel)
 
 
 def test_custom_target_labels_resolve_canonical_qubit_label() -> None:
@@ -83,6 +92,9 @@ def test_custom_target_labels_resolve_canonical_qubit_label() -> None:
 
     assert stark_target(exp, "Q17-ef") == "Q17_stark"
     assert insitu_target(exp, "Q17-ef") == "Q17_insitu"
+    assert (
+        spectator_stark_target(exp, "Q16-under-test", "Q17-ef") == "Q16_under_Q17_stark"
+    )
     assert (
         stark_cr_target(exp, "Q17", "Q18", stark_drive_qubit="target")
         == "Q17-Q18_insitu"
@@ -116,6 +128,33 @@ def test_make_custom_channel_registers_with_explicit_qubit_label() -> None:
             "qubit_label": "Q17",
             "update_lsi": True,
         }
+
+
+def test_make_spectator_stark_channel_registers_control_target() -> None:
+    """Given a spectator Stark helper, when called, then target and Stark labels stay distinct."""
+    stub = _ExperimentStub()
+    exp = cast(Experiment, stub)
+
+    make_spectator_stark_channel(
+        exp,
+        target="Q16",
+        stark_drive_target="Q17",
+        detuning=0.03,
+        lsi=True,
+        channel=2,
+    )
+
+    assert len(stub.calls) == 1
+    call = stub.calls[0]
+    assert call == {
+        "label": "Q16_under_Q17_stark",
+        "frequency": 5.03,
+        "box_id": "B0",
+        "port_number": 2,
+        "channel_number": 3,
+        "qubit_label": "Q16",
+        "update_lsi": True,
+    }
 
 
 def test_make_stark_cr_channel_registers_ctrl_cr_target() -> None:

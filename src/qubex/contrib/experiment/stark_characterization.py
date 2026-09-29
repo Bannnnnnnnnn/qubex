@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections import defaultdict
-from collections.abc import Collection, Mapping
+from collections.abc import Callable, Collection, Mapping
 from datetime import datetime, timezone
 from itertools import product
 from typing import Any, Literal, cast
@@ -15,7 +16,7 @@ from numpy.typing import ArrayLike, NDArray
 from tqdm import tqdm
 
 import qubex.visualization as viz
-from qubex.analysis import FitStatus, fitting
+from qubex.analysis import FitStatus, IQPlotter, fitting
 from qubex.analysis.state_tomography import (
     mle_fit_density_matrix,
     plot_ghz_state_tomography,
@@ -134,6 +135,27 @@ def insitu_target(exp: Experiment, target: str) -> str:
     return f"{qubit_label}_insitu"
 
 
+def spectator_stark_target(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+) -> str:
+    """
+    Return the custom target label for controlling a qubit under another Stark drive.
+
+    For example, controlling ``Q16`` while Stark-driving ``Q17`` uses
+    ``Q16_under_Q17_stark``. This keeps spectator-Stark calibration data
+    separate from both the bare target and the same-qubit in-situ Stark target.
+    """
+    target_label = exp.ctx.resolve_qubit_label(target)
+    stark_label = exp.ctx.resolve_qubit_label(stark_drive_target)
+    if target_label == stark_label:
+        raise ValueError(
+            "`stark_drive_target` must be different from `target` for spectator Stark."
+        )
+    return f"{target_label}_under_{stark_label}_stark"
+
+
 def stark_cr_target(
     exp: Experiment,
     control_qubit: str,
@@ -227,6 +249,35 @@ def make_insitu_channel(
         port_number=_single_port_number(port.number),
         channel_number=source_target.channel.number + channel,
         qubit_label=qubit_label,
+        update_lsi=lsi,
+    )
+
+
+def make_spectator_stark_channel(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    detuning: float = 0.0,
+    lsi: bool = False,
+    channel: int = 0,
+) -> None:
+    """
+    Register a control target for a qubit measured under another qubit's Stark drive.
+
+    The control channel is copied from ``target`` and stored under
+    :func:`spectator_stark_target`, while the Stark tone itself is still emitted
+    on :func:`stark_target` for ``stark_drive_target``.
+    """
+    source_target = _get_source_target(exp, target)
+    target_label = exp.ctx.resolve_qubit_label(target)
+    port = source_target.channel.port
+    exp.register_custom_target(
+        label=spectator_stark_target(exp, target, stark_drive_target),
+        frequency=source_target.frequency + detuning,
+        box_id=port.box_id,
+        port_number=_single_port_number(port.number),
+        channel_number=source_target.channel.number + channel,
+        qubit_label=target_label,
         update_lsi=lsi,
     )
 
@@ -688,6 +739,489 @@ def stark_rabi_experiment(
     )
 
 
+def spectator_stark_rabi_sequence(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    amplitude: float | Mapping[str, float] | None = None,
+    stark_ramptime: float | None = None,
+    duration: float = 100.0,
+    ramptime: float | None = None,
+    plot: bool = True,
+) -> PulseSchedule:
+    """
+    Build one Rabi sequence for ``target`` while another qubit is Stark-driven.
+
+    The Stark tone is applied to ``stark_drive_target``. After the Stark ramp,
+    the control pulse is applied to ``spectator_stark_target(exp, target,
+    stark_drive_target)`` so its calibration remains separate from the bare and
+    same-qubit Stark targets.
+    """
+    if ramptime is None:
+        ramptime = 0.0
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    stark_power = _stark_drive_amplitude(
+        exp,
+        target=stark_drive_target,
+        stark_amplitude=stark_amplitude,
+    )
+    drive_amplitude = _single_target_amplitude(
+        exp,
+        target=target,
+        amplitude=amplitude,
+    )
+    control_pulse = FlatTop(
+        duration=duration + 2 * ramptime,
+        amplitude=drive_amplitude,
+        tau=ramptime,
+        sampling_period=_measurement_sampling_period(exp),
+    )
+    sequence = _stark_wrapped_schedule(
+        stark_label=stark_target(exp, stark_drive_target),
+        insitu_label=control_label,
+        stark_amplitude=stark_power,
+        stark_ramptime=_resolve_stark_ramptime(stark_ramptime),
+        insitu_sequence=control_pulse,
+    )
+    return _plot_sequence_sample(
+        sequence,
+        title=(
+            f"Spectator Stark Rabi sample: {target} under {stark_drive_target} Stark"
+        ),
+        plot=plot,
+    )
+
+
+def _readout_amplitude_override(
+    exp: Experiment,
+    *,
+    target: str,
+    readout_label: str,
+    readout_amplitudes: Mapping[str, float] | None,
+) -> float | None:
+    if readout_amplitudes is None:
+        return None
+    target_label = exp.ctx.resolve_qubit_label(target)
+    for label in (readout_label, target_label, target):
+        if label in readout_amplitudes:
+            return float(readout_amplitudes[label])
+    return None
+
+
+def _measurement_word_duration(exp: Experiment) -> float | None:
+    profile = getattr(exp.ctx.measurement, "constraint_profile", None)
+    if profile is None or not getattr(profile, "enforce_word_alignment", False):
+        return None
+    return cast(float | None, getattr(profile, "word_duration_ns", None))
+
+
+def _duration_to_next_multiple(value: float, quantum: float | None) -> float:
+    if quantum is None or quantum <= 0.0:
+        return 0.0
+    quotient = value / quantum
+    next_multiple = math.ceil(quotient - 1e-12) * quantum
+    return max(0.0, next_multiple - value)
+
+
+def _spectator_stark_rabi_measurement_sequence(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    amplitude: float | Mapping[str, float] | None = None,
+    stark_ramptime: float | None = None,
+    duration: float = 100.0,
+    ramptime: float | None = None,
+    readout_amplitudes: Mapping[str, float] | None = None,
+    readout_duration: float | None = None,
+    readout_pre_margin: float | None = None,
+    readout_post_margin: float | None = None,
+    readout_ramp_time: float | None = None,
+    readout_drag_coeff: float | None = None,
+    readout_ramp_type: RampType | None = None,
+    plot: bool = True,
+) -> PulseSchedule:
+    """
+    Build one spectator-Stark Rabi measurement schedule with readout inside Stark.
+
+    The schedule keeps the Stark tone flat through the control pulse and the
+    readout pulse, then lets the Stark pulse ramp down after readout.
+    """
+    if ramptime is None:
+        ramptime = 0.0
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    readout_label = exp.ctx.resolve_read_label(target)
+    stark_power = _stark_drive_amplitude(
+        exp,
+        target=stark_drive_target,
+        stark_amplitude=stark_amplitude,
+    )
+    drive_amplitude = _single_target_amplitude(
+        exp,
+        target=target,
+        amplitude=amplitude,
+    )
+    resolved_readout_pre_margin = (
+        exp.pulse.readout_pre_margin
+        if readout_pre_margin is None
+        else float(readout_pre_margin)
+    )
+    control_pulse = FlatTop(
+        duration=duration + 2 * ramptime,
+        amplitude=drive_amplitude,
+        tau=ramptime,
+        sampling_period=_measurement_sampling_period(exp),
+    )
+    readout_pulse = exp.pulse.readout(
+        readout_label,
+        duration=readout_duration,
+        amplitude=_readout_amplitude_override(
+            exp,
+            target=target,
+            readout_label=readout_label,
+            readout_amplitudes=readout_amplitudes,
+        ),
+        pre_margin=resolved_readout_pre_margin,
+        post_margin=readout_post_margin,
+        ramp_time=readout_ramp_time,
+        ramp_type=readout_ramp_type,
+        drag_coeff=readout_drag_coeff,
+    )
+    resolved_stark_ramptime = _resolve_stark_ramptime(stark_ramptime)
+    capture_start_time = (
+        resolved_stark_ramptime + control_pulse.duration + resolved_readout_pre_margin
+    )
+    readout_start_padding = _duration_to_next_multiple(
+        capture_start_time,
+        _measurement_word_duration(exp),
+    )
+    with PulseSchedule(
+        [stark_target(exp, stark_drive_target), control_label, readout_label]
+    ) as ps:
+        ps.add(
+            stark_target(exp, stark_drive_target),
+            FlatTop(
+                duration=(
+                    control_pulse.duration
+                    + readout_start_padding
+                    + readout_pulse.duration
+                    + 2 * resolved_stark_ramptime
+                ),
+                amplitude=stark_power,
+                tau=resolved_stark_ramptime,
+            ),
+        )
+        ps.add(control_label, Blank(resolved_stark_ramptime))
+        ps.add(control_label, control_pulse)
+        ps.add(
+            readout_label,
+            Blank(
+                resolved_stark_ramptime + control_pulse.duration + readout_start_padding
+            ),
+        )
+        ps.add(readout_label, readout_pulse)
+    return _plot_sequence_sample(
+        ps,
+        title=(
+            "Spectator Stark Rabi measurement sample: "
+            f"{target} under {stark_drive_target} Stark"
+        ),
+        plot=plot,
+    )
+
+
+def _run_spectator_stark_rabi_sweep(
+    exp: Experiment,
+    *,
+    sequence: Callable[[float], PulseSchedule],
+    sweep_range: NDArray[np.float64],
+    frequencies: dict[str, float] | None,
+    n_shots: int,
+    shot_interval: float,
+    plot: bool,
+    title: str,
+    xlabel: str,
+    ylabel: str,
+) -> ExperimentResult[SweepData]:
+    initial_sequence = sequence(float(sweep_range[0]))
+    ordered_qubits = exp.ctx.ordered_qubit_labels(initial_sequence.labels)
+    signals: dict[str, list[object]] = {qubit: [] for qubit in ordered_qubits}
+    plotter = IQPlotter(
+        {
+            qubit: exp.ctx.state_centers[qubit]
+            for qubit in ordered_qubits
+            if qubit in exp.ctx.state_centers
+        }
+    )
+
+    exp.ctx.reset_awg_and_capunits(qubits=set(ordered_qubits))
+    for value in tqdm(
+        sweep_range,
+        desc="Sweeping parameters",
+        disable=True,
+    ):
+        point_schedule = sequence(float(value))
+        if frequencies is not None:
+            point_schedule.set_frequencies(frequencies)
+        multiple = exp.ctx.measurement.execute(
+            schedule=point_schedule,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            shot_averaging=True,
+            time_integration=False,
+            state_classification=False,
+            frequencies=frequencies,
+            final_measurement=False,
+            plot=False,
+        )
+        for result_target, captures in multiple.data.items():
+            if not captures:
+                continue
+            signals.setdefault(result_target, []).append(captures[0].kerneled)
+        if plot:
+            plotter.update(
+                {
+                    result_target: np.asarray(values)
+                    for result_target, values in signals.items()
+                    if values
+                }
+            )
+
+    if plot:
+        plotter.clear()
+        plotter.to_figure().show()
+
+    measured_targets = [target for target, values in signals.items() if values]
+    rabi_params: dict[str, RabiParam] = {}
+    for measured_target in measured_targets:
+        param = exp.ctx.get_rabi_param(measured_target)
+        if param is not None:
+            rabi_params[measured_target] = param
+    return ExperimentResult(
+        data={
+            measured_target: SweepData(
+                target=measured_target,
+                data=np.array(signals[measured_target]),
+                sweep_range=sweep_range,
+                rabi_param=rabi_params.get(measured_target),
+                state_centers=exp.ctx.state_centers.get(measured_target),
+                title=title,
+                xlabel=xlabel,
+                ylabel=ylabel,
+                xaxis_type="linear",
+                yaxis_type="linear",
+            )
+            for measured_target in measured_targets
+        },
+        rabi_params=rabi_params,
+    )
+
+
+def _rabi_param_with_target(param: RabiParam, target: str) -> RabiParam:
+    return RabiParam(
+        target=target,
+        amplitude=param.amplitude,
+        frequency=param.frequency,
+        phase=param.phase,
+        offset=param.offset,
+        noise=param.noise,
+        angle=param.angle,
+        distance=param.distance,
+        r2=param.r2,
+        reference_phase=param.reference_phase,
+    )
+
+
+def _store_spectator_stark_rabi_param(
+    exp: Experiment,
+    *,
+    rabi_result: ExperimentResult[RabiData],
+    target: str,
+    control_label: str,
+    r2_threshold: float,
+) -> RabiParam:
+    if rabi_result.rabi_params is None or target not in rabi_result.rabi_params:
+        raise ValueError("Spectator Stark Rabi fit did not return parameters.")
+    control_param = _rabi_param_with_target(
+        rabi_result.rabi_params[target],
+        control_label,
+    )
+    if not np.isfinite(control_param.r2) or control_param.r2 < r2_threshold:
+        raise ValueError(
+            f"Spectator Stark Rabi fit for `{control_label}` is below threshold "
+            f"(r2={control_param.r2:.6g}, threshold={r2_threshold:.6g})."
+        )
+    exp.ctx.store_rabi_params({control_label: control_param}, r2_threshold=r2_threshold)
+    return control_param
+
+
+def _apply_spectator_stark_rabi_param(
+    exp: Experiment,
+    *,
+    sweep_result: ExperimentResult[SweepData],
+    target: str,
+    control_label: str,
+) -> None:
+    param = exp.ctx.get_rabi_param(control_label)
+    if param is None:
+        param = exp.ctx.get_rabi_param(target)
+    if param is None:
+        return
+    for measured_target, sweep_data in sweep_result.data.items():
+        sweep_data.rabi_param = _rabi_param_with_target(param, measured_target)
+
+
+def spectator_stark_rabi_experiment(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    amplitude: float | Mapping[str, float] | None = None,
+    stark_ramptime: float | None = None,
+    time_range: ArrayLike | None = None,
+    ramptime: float | None = None,
+    frequencies: dict[str, float] | None = None,
+    detuning: float | None = None,
+    is_damped: bool | None = None,
+    fit_threshold: float | None = None,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    readout_amplitudes: dict[str, float] | None = None,
+    readout_duration: float | None = None,
+    readout_pre_margin: float | None = None,
+    readout_post_margin: float | None = None,
+    readout_ramp_time: float | None = None,
+    readout_drag_coeff: float | None = None,
+    readout_ramp_type: RampType | None = None,
+    plot: bool | None = None,
+    store_params: bool | None = None,
+    **deprecated_options: Any,
+) -> ExperimentResult[RabiData]:
+    """Run Rabi on ``target`` while ``stark_drive_target`` is Stark-dressed."""
+    n_shots, shot_interval = resolve_shot_options(
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        deprecated_options=deprecated_options,
+        function_name="spectator_stark_rabi_experiment",
+    )
+    if n_shots is None:
+        n_shots = DEFAULT_SHOTS
+    if shot_interval is None:
+        shot_interval = DEFAULT_INTERVAL
+    if time_range is None:
+        time_range = DEFAULT_RABI_TIME_RANGE
+    if ramptime is None:
+        ramptime = 0.0
+    if is_damped is None:
+        is_damped = True
+    if fit_threshold is None:
+        fit_threshold = 0.5
+    if plot is None:
+        plot = True
+    if store_params is None:
+        store_params = False
+
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    drive_amplitude = _single_target_amplitude(
+        exp,
+        target=target,
+        amplitude=amplitude,
+    )
+    sweep_range = np.asarray(time_range, dtype=float)
+    effective_time_range = sweep_range + ramptime
+
+    if frequencies is None:
+        frequencies = {control_label: exp.targets[control_label].frequency}
+    if detuning is not None:
+        frequencies = {
+            label: frequency + detuning for label, frequency in frequencies.items()
+        }
+
+    reference_points = exp.measurement_service.obtain_reference_points(
+        [target],
+        n_shots=DEFAULT_SHOTS,
+    )["iq"]
+
+    def sequence(duration: float) -> PulseSchedule:
+        return _spectator_stark_rabi_measurement_sequence(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            amplitude=drive_amplitude,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            duration=duration,
+            ramptime=ramptime,
+            readout_amplitudes=readout_amplitudes,
+            readout_duration=readout_duration,
+            readout_pre_margin=readout_pre_margin,
+            readout_post_margin=readout_post_margin,
+            readout_ramp_time=readout_ramp_time,
+            readout_drag_coeff=readout_drag_coeff,
+            readout_ramp_type=readout_ramp_type,
+            plot=False,
+        )
+
+    sweep_result = _run_spectator_stark_rabi_sweep(
+        exp,
+        sequence=sequence,
+        sweep_range=sweep_range,
+        frequencies=frequencies,
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        plot=plot,
+        title="Spectator Stark Rabi",
+        xlabel="Time (ns)",
+        ylabel="Measured value",
+    )
+
+    rabi_params: dict[str, RabiParam] = {}
+    for qubit, sweep_data in sweep_result.data.items():
+        fit_result = fitting.fit_rabi(
+            target=qubit,
+            times=effective_time_range,
+            data=sweep_data.data,
+            reference_point=reference_points.get(qubit),
+            plot=plot,
+            is_damped=is_damped,
+        )
+        if fit_result.status is FitStatus.ERROR or fit_result["r2"] < fit_threshold:
+            rabi_params[qubit] = RabiParam.nan(target=qubit)
+        else:
+            rabi_params[qubit] = RabiParam(
+                target=qubit,
+                amplitude=fit_result["amplitude"],
+                frequency=fit_result["frequency"],
+                phase=fit_result["phase"],
+                offset=fit_result["offset"],
+                noise=fit_result["noise"],
+                angle=fit_result["angle"],
+                distance=fit_result["distance"],
+                r2=fit_result["r2"],
+                reference_phase=fit_result["reference_phase"],
+            )
+    if store_params:
+        exp.ctx.store_rabi_params(rabi_params)
+
+    return ExperimentResult(
+        data={
+            qubit: RabiData(
+                target=qubit,
+                data=sweep_data.data,
+                time_range=effective_time_range,
+                rabi_param=rabi_params[qubit],
+                state_centers=exp.ctx.state_centers.get(qubit),
+            )
+            for qubit, sweep_data in sweep_result.data.items()
+        },
+        rabi_params=rabi_params,
+    )
+
+
 def stark_repeat_sequence_sample(
     exp: Experiment,
     sequence: TargetMap[Waveform],
@@ -919,6 +1453,183 @@ def stark_chevron_pattern(
             "time_range": time_values,
             "detuning_range": detuning_values,
             "frequencies": frequencies,
+            "chevron_data": chevron_data,
+            "rabi_rates": rabi_rates,
+            "resonant_frequencies": resonant_frequencies,
+        },
+        figure=fig,
+        figures=figures,
+    )
+
+
+def spectator_stark_chevron_pattern(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    detuning_range: ArrayLike | None = None,
+    time_range: ArrayLike | None = None,
+    frequencies: dict[str, float] | None = None,
+    amplitude: float | Mapping[str, float] | None = None,
+    rabi_params: dict[str, RabiParam] | None = None,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    plot: bool = True,
+    save_image: bool = True,
+    **deprecated_options: Any,
+) -> Result:
+    """Measure a chevron for ``target`` while another qubit is Stark-driven."""
+    n_shots, shot_interval = resolve_shot_options(
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        deprecated_options=deprecated_options,
+        function_name="spectator_stark_chevron_pattern",
+    )
+    if n_shots is None:
+        n_shots = DEFAULT_SHOTS
+    if shot_interval is None:
+        shot_interval = DEFAULT_INTERVAL
+    if detuning_range is None:
+        detuning_range = np.linspace(-0.05, 0.05, 51)
+    if time_range is None:
+        time_range = DEFAULT_RABI_TIME_RANGE
+
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    if frequencies is None:
+        frequencies = {control_label: exp.targets[control_label].frequency}
+
+    detuning_values = np.asarray(detuning_range, dtype=float)
+    time_values = np.asarray(time_range, dtype=float)
+    control_frequencies = detuning_values + frequencies[control_label]
+    drive_amplitude = _single_target_amplitude(
+        exp,
+        target=target,
+        amplitude=amplitude,
+    )
+    stark_power = _stark_drive_amplitude(
+        exp,
+        target=stark_drive_target,
+        stark_amplitude=stark_amplitude,
+    )
+
+    if rabi_params is None:
+        print("Obtaining Rabi parameters...")
+        shared_rabi_params = exp.measurement_service.obtain_rabi_params(
+            targets=target,
+            amplitudes={target: drive_amplitude},
+            time_range=time_values,
+            fit_threshold=0.0,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            plot=False,
+            store_params=False,
+        ).rabi_params
+    else:
+        shared_rabi_params = rabi_params
+    if shared_rabi_params is None:
+        raise ValueError("Rabi parameters could not be resolved for chevron fitting.")
+
+    rabi_rates_buffer: dict[str, list[float]] = defaultdict(list)
+    chevron_buffer: dict[str, list[NDArray]] = defaultdict(list)
+    for control_frequency in control_frequencies:
+        point_frequencies = dict(frequencies)
+        point_frequencies[control_label] = float(control_frequency)
+        with (
+            exp.ctx.util.no_output(),
+            exp.modified_frequencies(frequencies=point_frequencies),
+        ):
+            rabi_result = spectator_stark_rabi_experiment(
+                exp,
+                target=target,
+                stark_drive_target=stark_drive_target,
+                amplitude=drive_amplitude,
+                stark_amplitude=stark_amplitude,
+                stark_ramptime=stark_ramptime,
+                time_range=time_values,
+                plot=False,
+                n_shots=n_shots,
+                shot_interval=shot_interval,
+            )
+        if rabi_result.rabi_params is None:
+            raise ValueError("Rabi fit did not return parameters.")
+        rabi_rates_buffer[target].append(rabi_result.rabi_params[target].frequency)
+        rabi_result.data[target].rabi_param = shared_rabi_params[target]
+        chevron_buffer[target].append(rabi_result.data[target].normalized)
+
+    rabi_rates = {target: np.asarray(rabi_rates_buffer[target])}
+    chevron_data = {target: np.asarray(chevron_buffer[target]).T}
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Heatmap(
+            x=control_frequencies,
+            y=time_values,
+            z=chevron_data[target],
+            colorscale="Viridis",
+        )
+    )
+    fig.update_layout(
+        title=dict(
+            text=f"Spectator Stark Chevron pattern : {target}",
+            subtitle=dict(
+                text=(
+                    f"stark_drive_target={stark_drive_target}, "
+                    f"control_amplitude={drive_amplitude:.6g}, "
+                    f"stark_amplitude={stark_power:.6g}"
+                ),
+                font=dict(size=13, family="monospace"),
+            ),
+        ),
+        xaxis_title="Drive frequency (GHz)",
+        yaxis_title="Time (ns)",
+        width=600,
+        height=400,
+        margin=dict(t=80),
+    )
+    if plot:
+        fig.show()
+
+    fit_result = fitting.fit_detuned_rabi(
+        target=target,
+        control_frequencies=control_frequencies,
+        rabi_frequencies=rabi_rates[target],
+        plot=plot,
+    )
+    resonant_frequencies = {target: fit_result["f_resonance"]}
+    detuning = resonant_frequencies[target] - exp.targets[target].frequency
+    print("Detuning frequency under spectator Stark")
+    print(f" {target}: {detuning:.6f}")
+    make_spectator_stark_channel(
+        exp,
+        target=target,
+        stark_drive_target=stark_drive_target,
+        detuning=detuning,
+        lsi=False,
+        channel=0,
+    )
+
+    figures = {"chevron": fig}
+    if save_image:
+        image_suffix = f"{target}_under_{stark_drive_target}_stark"
+        viz.save_figure(fig, name=f"spectator_stark_chevron_pattern_{image_suffix}")
+        fig_fit = fit_result.get_figure()
+        figures["fit"] = fig_fit
+        viz.save_figure(
+            fig_fit,
+            name=f"spectator_stark_chevron_pattern_fit_{image_suffix}",
+        )
+
+    return Result(
+        data={
+            "target": target,
+            "stark_drive_target": stark_drive_target,
+            "control_target": control_label,
+            "time_range": time_values,
+            "detuning_range": detuning_values,
+            "frequencies": frequencies,
+            "control_frequencies": control_frequencies,
             "chevron_data": chevron_data,
             "rabi_rates": rabi_rates,
             "resonant_frequencies": resonant_frequencies,
@@ -3218,40 +3929,39 @@ def stark_cr_tomography_sequence(
         stark_drive_qubit=stark_drive_qubit,
         x90=x90,
     )
-    dressed_x90 = x90_control if dressed_qubit == control_label else x90_target
-    bare_x90 = x90_target if dressed_qubit == control_label else x90_control
-    bare_qubit = target_label if dressed_qubit == control_label else control_label
+    control_pulse_label = (
+        dressed_label if dressed_qubit == control_label else control_label
+    )
+    target_pulse_label = (
+        dressed_label if dressed_qubit == target_label else target_label
+    )
 
-    with PulseSchedule() as dressed_body:
-        if control_state == "1" and dressed_qubit == control_label:
-            dressed_body.add(dressed_label, exp.pulse.x180(dressed_label))
-            dressed_body.barrier()
-        dressed_body.call(cr_sequence)
-        dressed_body.barrier()
-        dressed_basis = _basis_rotation(dressed_x90, basis)
-        if dressed_basis is not None:
-            dressed_body.add(dressed_label, dressed_basis)
+    with PulseSchedule([dressed_label]) as tomography_body:
+        if control_state == "1":
+            tomography_body.add(
+                control_pulse_label,
+                exp.pulse.x180(control_pulse_label),
+            )
+            tomography_body.barrier()
+        tomography_body.call(cr_sequence)
+        tomography_body.barrier()
+        control_basis = _basis_rotation(x90_control, basis)
+        if control_basis is not None:
+            tomography_body.add(control_pulse_label, control_basis)
+        target_basis = _basis_rotation(x90_target, basis)
+        if target_basis is not None:
+            tomography_body.add(target_pulse_label, target_basis)
 
     stark_block = _stark_wrapped_schedule(
         stark_label=stark_target(exp, dressed_qubit),
         insitu_label=dressed_label,
         stark_amplitude=stark_power,
         stark_ramptime=_resolve_stark_ramptime(stark_ramptime),
-        insitu_sequence=dressed_body,
+        insitu_sequence=tomography_body,
     )
 
-    with PulseSchedule() as ps:
-        if control_state == "1" and dressed_qubit != control_label:
-            ps.add(control_label, exp.pulse.x180(control_label))
-            ps.barrier()
-        ps.call(stark_block)
-        ps.barrier()
-        bare_basis = _basis_rotation(bare_x90, basis)
-        if bare_basis is not None:
-            ps.add(bare_qubit, bare_basis)
-
     return _plot_sequence_sample(
-        ps,
+        stark_block,
         title=(
             f"AC Stark CR tomography: {control_label}-{target_label}, "
             f"stark={stark_drive_qubit}, state={control_state}, basis={basis}"
@@ -5454,6 +6164,2571 @@ def stark_interleaved_randomized_benchmarking_2q(
     )
 
 
+def control_spectator_stark_cr_target(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+) -> str:
+    """Return the CR calibration key for control-and-spectator Stark drive."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    if spectator_label in {control_label, target_label}:
+        raise ValueError("`spectator_qubit` must be outside the CR pair.")
+    control_stark_cr = stark_cr_target(
+        exp,
+        control_label,
+        target_label,
+        stark_drive_qubit="control",
+    )
+    return f"{control_stark_cr}_under_{spectator_label}_stark"
+
+
+def control_spectator_stark_cr_tomography_sequence(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    control_stark_amplitude: float,
+    spectator_stark_amplitude: float,
+    basis: Literal["X", "Y", "Z"] = "Z",
+    control_state: Literal["0", "1"] = "0",
+    cr_duration: float = 128.0,
+    ramptime: float | None = None,
+    control_stark_ramptime: float | None = None,
+    spectator_stark_ramptime: float | None = None,
+    cr_amplitude: float = 1.0,
+    cr_phase: float = 0.0,
+    cancel_amplitude: float = 0.0,
+    cancel_phase: float = 0.0,
+    ramp_type: RampType = "RaisedCosine",
+    x90: TargetMap[Waveform] | None = None,
+    plot: bool = True,
+) -> PulseSchedule:
+    """Build control-Stark CR tomography nested inside spectator Stark drive."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    control_spectator_stark_cr_target(
+        exp,
+        control_label,
+        target_label,
+        spectator_label,
+    )
+    control_stark_block = stark_cr_tomography_sequence(
+        exp,
+        control_label,
+        target_label,
+        stark_amplitude=control_stark_amplitude,
+        stark_drive_qubit="control",
+        basis=basis,
+        control_state=control_state,
+        cr_duration=cr_duration,
+        ramptime=ramptime,
+        stark_ramptime=control_stark_ramptime,
+        cr_amplitude=cr_amplitude,
+        cr_phase=cr_phase,
+        cancel_amplitude=cancel_amplitude,
+        cancel_phase=cancel_phase,
+        ramp_type=ramp_type,
+        x90=x90,
+        plot=False,
+    )
+    sequence = _stark_wrapped_schedule(
+        stark_label=stark_target(exp, spectator_label),
+        insitu_label=stark_target(exp, control_label),
+        stark_amplitude=_stark_drive_amplitude(
+            exp,
+            target=spectator_label,
+            stark_amplitude=spectator_stark_amplitude,
+        ),
+        stark_ramptime=_resolve_stark_ramptime(spectator_stark_ramptime),
+        insitu_sequence=control_stark_block,
+    )
+    return _plot_sequence_sample(
+        sequence,
+        title=(
+            f"Control-and-spectator Stark CR tomography: "
+            f"{control_label}-{target_label}, spectator={spectator_label}, "
+            f"state={control_state}, basis={basis}"
+        ),
+        plot=plot,
+    )
+
+
+def _control_spectator_stark_cr_state_tomography(
+    exp: Experiment,
+    *,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    control_stark_amplitude: float,
+    spectator_stark_amplitude: float,
+    control_state: Literal["0", "1"],
+    cr_duration: float,
+    ramptime: float,
+    control_stark_ramptime: float | None,
+    spectator_stark_ramptime: float | None,
+    cr_amplitude: float,
+    cr_phase: float,
+    cancel_amplitude: float,
+    cancel_phase: float,
+    cr_frequency: float,
+    ramp_type: RampType,
+    x90: TargetMap[Waveform] | None,
+    n_shots: int,
+    shot_interval: float,
+    use_zvalues: bool,
+) -> Result:
+    pair = {control_qubit, target_qubit}
+    buffer: dict[str, list[float]] = defaultdict(list)
+    cr_label = stark_cr_target(
+        exp,
+        control_qubit,
+        target_qubit,
+        stark_drive_qubit="control",
+    )
+    for basis in ("X", "Y", "Z"):
+        sequence = control_spectator_stark_cr_tomography_sequence(
+            exp,
+            control_qubit,
+            target_qubit,
+            spectator_qubit,
+            control_stark_amplitude=control_stark_amplitude,
+            spectator_stark_amplitude=spectator_stark_amplitude,
+            basis=basis,
+            control_state=control_state,
+            cr_duration=cr_duration,
+            ramptime=ramptime,
+            control_stark_ramptime=control_stark_ramptime,
+            spectator_stark_ramptime=spectator_stark_ramptime,
+            cr_amplitude=cr_amplitude,
+            cr_phase=cr_phase,
+            cancel_amplitude=cancel_amplitude,
+            cancel_phase=cancel_phase,
+            ramp_type=ramp_type,
+            x90=x90,
+            plot=False,
+        )
+        measure_result = exp.measurement_service.measure(
+            sequence,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            frequencies={cr_label: cr_frequency},
+            reset_awg_and_capunits=False,
+            plot=False,
+        )
+        for qubit, data in measure_result.data.items():
+            if qubit not in pair:
+                continue
+            buffer[qubit].append(
+                _normalized_tomography_value(
+                    exp,
+                    qubit=qubit,
+                    data=data,
+                    use_zvalues=use_zvalues,
+                )
+            )
+    return Result(data={qubit: tuple(values) for qubit, values in buffer.items()})
+
+
+def _control_spectator_stark_measure_cr_dynamics(
+    exp: Experiment,
+    *,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    control_stark_amplitude: float,
+    spectator_stark_amplitude: float,
+    time_range: ArrayLike | None = None,
+    ramptime: float | None = None,
+    control_stark_ramptime: float | None = None,
+    spectator_stark_ramptime: float | None = None,
+    cr_amplitude: float | None = None,
+    cr_phase: float | None = None,
+    cancel_amplitude: float | None = None,
+    cancel_phase: float | None = None,
+    cr_frequency: float | None = None,
+    control_state: Literal["0", "1"] = "0",
+    x90: TargetMap[Waveform] | None = None,
+    ramp_type: RampType = "RaisedCosine",
+    use_zvalues: bool = False,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    reset_awg_and_capunits: bool = True,
+    plot: bool = True,
+) -> Result:
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    control_spectator_stark_cr_target(
+        exp,
+        control_label,
+        target_label,
+        spectator_label,
+    )
+    time_values = np.asarray(
+        DEFAULT_CR_TIME_RANGE if time_range is None else time_range,
+        dtype=float,
+    )
+    ramptime = DEFAULT_CR_RAMPTIME if ramptime is None else ramptime
+    cr_amplitude = 1.0 if cr_amplitude is None else cr_amplitude
+    cr_phase = 0.0 if cr_phase is None else cr_phase
+    cancel_amplitude = 0.0 if cancel_amplitude is None else cancel_amplitude
+    cancel_phase = 0.0 if cancel_phase is None else cancel_phase
+    n_shots = DEFAULT_SHOTS if n_shots is None else n_shots
+    shot_interval = DEFAULT_INTERVAL if shot_interval is None else shot_interval
+    target_frequency = exp.targets[target_label].frequency
+    resolved_cr_frequency = target_frequency if cr_frequency is None else cr_frequency
+    if reset_awg_and_capunits:
+        exp.ctx.reset_awg_and_capunits(
+            qubits=[control_label, target_label, spectator_label]
+        )
+
+    control_states: list[NDArray] = []
+    target_states: list[NDArray] = []
+    for duration in time_values:
+        result = _control_spectator_stark_cr_state_tomography(
+            exp,
+            control_qubit=control_label,
+            target_qubit=target_label,
+            spectator_qubit=spectator_label,
+            control_stark_amplitude=control_stark_amplitude,
+            spectator_stark_amplitude=spectator_stark_amplitude,
+            control_state=control_state,
+            cr_duration=float(duration) + 2 * ramptime,
+            ramptime=ramptime,
+            control_stark_ramptime=control_stark_ramptime,
+            spectator_stark_ramptime=spectator_stark_ramptime,
+            cr_amplitude=cr_amplitude,
+            cr_phase=cr_phase,
+            cancel_amplitude=cancel_amplitude,
+            cancel_phase=cancel_phase,
+            cr_frequency=resolved_cr_frequency,
+            ramp_type=ramp_type,
+            x90=x90,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            use_zvalues=use_zvalues,
+        )
+        control_states.append(np.asarray(result[control_label]))
+        target_states.append(np.asarray(result[target_label]))
+
+    control_states_array = np.asarray(control_states)
+    target_states_array = np.asarray(target_states)
+    effective_drive_range = time_values + ramptime
+    fit_result = fitting.fit_rotation(
+        effective_drive_range,
+        target_states_array,
+        plot=False,
+        title=(
+            f"Control-and-spectator Stark CR target dynamics of "
+            f"{control_label}-{target_label}: |{control_state}>"
+        ),
+        xlabel="Drive time (ns)",
+        ylabel=f"Target qubit : {target_label}",
+    )
+    if plot:
+        viz.plot_bloch_vectors(
+            effective_drive_range,
+            control_states_array,
+            title=(
+                f"Control-and-spectator Stark CR control dynamics of "
+                f"{control_label}-{target_label}: |{control_state}>"
+            ),
+            xlabel="Drive time (ns)",
+            ylabel=f"Control qubit : {control_label}",
+        )
+        fit_result.get_figure().show()
+        fit_result.get_figure("fig3d").show()
+    return Result(
+        data={
+            "time_range": time_values,
+            "effective_drive_range": effective_drive_range,
+            "control_states": control_states_array,
+            "target_states": target_states_array,
+            "fit_result": fit_result,
+            "cr_amplitude": cr_amplitude,
+            "ramptime": ramptime,
+            "cr_frequency": resolved_cr_frequency,
+        }
+    )
+
+
+def control_spectator_stark_cr_hamiltonian_tomography(
+    exp: Experiment,
+    *,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    control_stark_amplitude: float,
+    spectator_stark_amplitude: float,
+    time_range: ArrayLike | None = None,
+    ramptime: float | None = None,
+    control_stark_ramptime: float | None = None,
+    spectator_stark_ramptime: float | None = None,
+    cr_amplitude: float | None = None,
+    cr_phase: float | None = None,
+    cancel_amplitude: float | None = None,
+    cancel_phase: float | None = None,
+    cr_frequency: float | None = None,
+    x90: TargetMap[Waveform] | None = None,
+    use_zvalues: bool = False,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    reset_awg_and_capunits: bool = True,
+    plot: bool = True,
+) -> Result:
+    """Run CR Hamiltonian tomography under nested spectator and control Stark."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    cr_label = stark_cr_target(
+        exp,
+        control_label,
+        target_label,
+        stark_drive_qubit="control",
+    )
+    cr_param_label = control_spectator_stark_cr_target(
+        exp,
+        control_label,
+        target_label,
+        spectator_label,
+    )
+    ramptime = DEFAULT_CR_RAMPTIME if ramptime is None else ramptime
+    cr_amplitude = 1.0 if cr_amplitude is None else cr_amplitude
+    cr_phase = 0.0 if cr_phase is None else cr_phase
+    cancel_amplitude = 0.0 if cancel_amplitude is None else cancel_amplitude
+    cancel_phase = 0.0 if cancel_phase is None else cancel_phase
+    n_shots = CALIBRATION_SHOTS if n_shots is None else n_shots
+    shot_interval = DEFAULT_INTERVAL if shot_interval is None else shot_interval
+    control_frequency = exp.targets[insitu_target(exp, control_label)].frequency
+    target_frequency = exp.targets[target_label].frequency
+    resolved_cr_frequency = target_frequency if cr_frequency is None else cr_frequency
+    if reset_awg_and_capunits:
+        exp.ctx.reset_awg_and_capunits(
+            qubits=[control_label, target_label, spectator_label]
+        )
+
+    def measure(control_state: Literal["0", "1"]) -> Result:
+        return _control_spectator_stark_measure_cr_dynamics(
+            exp,
+            control_qubit=control_label,
+            target_qubit=target_label,
+            spectator_qubit=spectator_label,
+            control_stark_amplitude=control_stark_amplitude,
+            spectator_stark_amplitude=spectator_stark_amplitude,
+            time_range=time_range,
+            ramptime=ramptime,
+            control_stark_ramptime=control_stark_ramptime,
+            spectator_stark_ramptime=spectator_stark_ramptime,
+            cr_amplitude=cr_amplitude,
+            cr_phase=cr_phase,
+            cancel_amplitude=cancel_amplitude,
+            cancel_phase=cancel_phase,
+            cr_frequency=resolved_cr_frequency,
+            control_state=control_state,
+            x90=x90,
+            use_zvalues=use_zvalues,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            reset_awg_and_capunits=False,
+            plot=False,
+        )
+
+    result_0 = measure("0")
+    result_1 = measure("1")
+    omega_0 = result_0["fit_result"]["Omega"]
+    omega_1 = result_1["fit_result"]["Omega"]
+    omega = np.concatenate([0.5 * (omega_0 + omega_1), 0.5 * (omega_0 - omega_1)])
+    coeffs = dict(
+        zip(
+            ["IX", "IY", "IZ", "ZX", "ZY", "ZZ"],
+            omega / (2 * np.pi),
+            strict=True,
+        )
+    )
+    xt_rotation = coeffs["IX"] + 1j * coeffs["IY"]
+    cr_rotation = coeffs["ZX"] + 1j * coeffs["ZY"]
+    xt_rotation_amplitude = np.abs(xt_rotation)
+    cr_rotation_amplitude = np.abs(cr_rotation)
+    xt_rotation_amplitude_hw = _bare_control_amplitude(
+        exp,
+        target=target_label,
+        rabi_rate=xt_rotation_amplitude,
+    )
+    cr_rotation_amplitude_hw = _bare_control_amplitude(
+        exp,
+        target=target_label,
+        rabi_rate=cr_rotation_amplitude,
+    )
+    zx90_duration = 1 / (4 * cr_rotation_amplitude)
+    cr_rabi_rate = _bare_rabi_rate(
+        exp,
+        target=control_label,
+        control_amplitude=cr_amplitude,
+    )
+    f_delta = control_frequency - target_frequency
+
+    fig_c = viz.make_figure()
+    fig_c.set_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1)
+    for row, result in enumerate((result_0, result_1), start=1):
+        source = viz.make_bloch_vectors_figure(
+            result["effective_drive_range"],
+            result["control_states"],
+        )
+        for trace in source.data:
+            data = cast(go.Scatter, trace)
+            fig_c.add_trace(
+                go.Scatter(
+                    x=data.x,
+                    y=data.y,
+                    mode=data.mode,
+                    line=data.line,
+                    marker=data.marker,
+                    name=data.name,
+                    showlegend=row == 1,
+                ),
+                row=row,
+                col=1,
+            )
+    fig_c.update_xaxes(title_text="Drive time (ns)", row=2, col=1)
+    fig_c.update_yaxes(title_text="Control : |0〉", range=[-1.1, 1.1], row=1, col=1)
+    fig_c.update_yaxes(title_text="Control : |1〉", range=[-1.1, 1.1], row=2, col=1)
+    fig_c.update_layout(
+        title=dict(
+            text=f"Control qubit dynamics : {cr_param_label}",
+            subtitle=dict(
+                text=(
+                    f"Δ = {f_delta * 1e3:.0f} MHz , "
+                    f"Ω = {cr_rabi_rate * 1e3:.1f} MHz , "
+                    f"τ = {ramptime:.0f} ns"
+                )
+            ),
+        ),
+        height=400,
+        width=600,
+        showlegend=True,
+        margin=dict(t=90),
+    )
+
+    fig_t = viz.make_figure()
+    fig_t.set_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1)
+    for row, result in enumerate((result_0, result_1), start=1):
+        source = result["fit_result"].get_figure()
+        for trace in source.data:
+            data = cast(go.Scatter, trace)
+            fig_t.add_trace(
+                go.Scatter(
+                    x=data.x,
+                    y=data.y,
+                    mode=data.mode,
+                    line=data.line,
+                    marker=data.marker,
+                    name=data.name,
+                    showlegend=row == 1,
+                ),
+                row=row,
+                col=1,
+            )
+    fig_t.update_xaxes(title_text="Drive time (ns)", row=2, col=1)
+    fig_t.update_yaxes(title_text="Control : |0〉", range=[-1.1, 1.1], row=1, col=1)
+    fig_t.update_yaxes(title_text="Control : |1〉", range=[-1.1, 1.1], row=2, col=1)
+    fig_t.update_layout(
+        title=dict(
+            text=f"Target qubit dynamics : {cr_param_label}",
+            subtitle=dict(
+                text=(
+                    f"Δ = {f_delta * 1e3:.0f} MHz , "
+                    f"Ω = {cr_rabi_rate * 1e3:.1f} MHz , "
+                    f"τ = {ramptime:.0f} ns"
+                )
+            ),
+        ),
+        height=400,
+        width=600,
+        showlegend=True,
+        margin=dict(t=90),
+    )
+    if plot:
+        fig_c.show()
+        fig_t.show()
+        fig_t_3d = viz.make_figure()
+        fig_t_3d.set_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=["Control : |0〉", "Control : |1〉"],
+            specs=[[{"type": "scatter3d"}, {"type": "scatter3d"}]],
+            horizontal_spacing=0.01,
+        )
+        for col, result in enumerate((result_0, result_1), start=1):
+            source = result["fit_result"].get_figure("fig3d")
+            for trace in source.data:
+                fig_t_3d.add_trace(trace, row=1, col=col)
+        fig_t_3d.update_annotations(dict(font=dict(size=13), yshift=-20))
+        fig_t_3d.update_layout(
+            title=dict(
+                text=f"Target qubit dynamics : {cr_param_label}",
+                subtitle=dict(
+                    text=(
+                        f"Δ = {f_delta * 1e3:.0f} MHz , "
+                        f"Ω = {cr_rabi_rate * 1e3:.1f} MHz , "
+                        f"τ = {ramptime:.0f} ns"
+                    )
+                ),
+            ),
+            height=400,
+            width=600,
+            showlegend=False,
+            margin=dict(t=90, b=10, l=10, r=10),
+        )
+        fig_t_3d.show()
+        print("Dressed qubit frequencies:")
+        print(f"  ω_c ({control_label}) : {control_frequency * 1e3:.3f} MHz")
+        print(f"  ω_t ({target_label}) : {target_frequency * 1e3:.3f} MHz")
+        print(f"  Δ ({cr_label}) : {f_delta * 1e3:.3f} MHz")
+        print("Rotation rates:")
+        for key, value in coeffs.items():
+            print(f"  {key} : {value * 1e3:+.4f} MHz")
+        print(f"Estimated ZX90 gate length : {zx90_duration:.1f} ns")
+    return Result(
+        data={
+            "cr_label": cr_label,
+            "cr_param_label": cr_param_label,
+            "spectator_qubit": spectator_label,
+            "cr_frequency": resolved_cr_frequency,
+            "control_frequency": control_frequency,
+            "target_frequency": target_frequency,
+            "Omega": omega,
+            "coeffs": coeffs,
+            "cr_rotation_amplitude": cr_rotation_amplitude,
+            "cr_rotation_amplitude_hw": cr_rotation_amplitude_hw,
+            "cr_rotation_phase": np.angle(cr_rotation),
+            "xt_rotation_amplitude": xt_rotation_amplitude,
+            "xt_rotation_amplitude_hw": xt_rotation_amplitude_hw,
+            "xt_rotation_phase": np.angle(xt_rotation),
+            "cr_drive_amplitude": cr_rabi_rate,
+            "cr_drive_amplitude_hw": cr_amplitude,
+            "zx90_duration": zx90_duration,
+            "result_0": result_0,
+            "result_1": result_1,
+            "fig_c": fig_c,
+            "fig_t": fig_t,
+        },
+        figures={"control": fig_c, "target": fig_t},
+    )
+
+
+def _control_spectator_stark_update_cr_params(
+    exp: Experiment,
+    *,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    control_stark_amplitude: float,
+    spectator_stark_amplitude: float,
+    time_range: ArrayLike | None = None,
+    ramptime: float | None = None,
+    control_stark_ramptime: float | None = None,
+    spectator_stark_ramptime: float | None = None,
+    cr_amplitude: float = 1.0,
+    cr_phase: float = 0.0,
+    cancel_amplitude: float = 0.0,
+    cancel_phase: float = 0.0,
+    cr_frequency: float | None = None,
+    update_cr_phase: bool = True,
+    update_cancel_pulse: bool = True,
+    store_params: bool = True,
+    x90: TargetMap[Waveform] | None = None,
+    use_zvalues: bool = False,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    reset_awg_and_capunits: bool = True,
+    plot: bool = True,
+) -> Result:
+    """Update contextual CR parameters under control-and-spectator Stark drive."""
+    ramptime = DEFAULT_CR_RAMPTIME if ramptime is None else ramptime
+    result = control_spectator_stark_cr_hamiltonian_tomography(
+        exp,
+        control_qubit=control_qubit,
+        target_qubit=target_qubit,
+        spectator_qubit=spectator_qubit,
+        control_stark_amplitude=control_stark_amplitude,
+        spectator_stark_amplitude=spectator_stark_amplitude,
+        time_range=time_range,
+        ramptime=ramptime,
+        control_stark_ramptime=control_stark_ramptime,
+        spectator_stark_ramptime=spectator_stark_ramptime,
+        cr_amplitude=cr_amplitude,
+        cr_phase=cr_phase,
+        cancel_amplitude=cancel_amplitude,
+        cancel_phase=cancel_phase,
+        cr_frequency=cr_frequency,
+        x90=x90,
+        use_zvalues=use_zvalues,
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        reset_awg_and_capunits=reset_awg_and_capunits,
+        plot=plot,
+    )
+    current_cr = cr_amplitude * np.exp(1j * cr_phase)
+    current_cancel = cancel_amplitude * np.exp(1j * cancel_phase)
+    shift = -result["cr_rotation_phase"]
+    cancellation = -result["xt_rotation_amplitude_hw"] * np.exp(
+        1j * result["xt_rotation_phase"]
+    )
+    new_cr = current_cr * np.exp(1j * shift) if update_cr_phase else current_cr
+    new_cancel = (
+        (current_cancel + cancellation) * np.exp(1j * shift)
+        if update_cancel_pulse
+        else current_cancel
+    )
+    cr_param_label = str(result["cr_param_label"])
+    cr_param: CrossResonanceParam = {
+        "target": cr_param_label,
+        "duration": 0.0,
+        "ramptime": ramptime,
+        "cr_amplitude": float(np.abs(new_cr)),
+        "cr_phase": float(np.angle(new_cr)),
+        "cr_beta": 0.0,
+        "cancel_amplitude": float(np.abs(new_cancel)),
+        "cancel_phase": float(np.angle(new_cancel)),
+        "cancel_beta": 0.0,
+        "rotary_amplitude": 0.0,
+        "zx_rotation_rate": float(result["coeffs"]["ZX"] / cr_amplitude),
+    }
+    if store_params:
+        exp.ctx.calib_note.update_cr_param(cr_param_label, cr_param)
+    return Result(data={**result, "cr_param": cr_param})
+
+
+def obtain_cr_params_under_control_and_spectator_stark(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    control_stark_amplitude: float,
+    spectator_stark_amplitude: float,
+    control_stark_ramptime: float | None = None,
+    spectator_stark_ramptime: float | None = None,
+    cr_frequency: float | None = None,
+    time_range: ArrayLike | None = None,
+    ramptime: float | None = None,
+    cr_amplitude: float | None = None,
+    n_iterations: int = 4,
+    n_cycles: int = 2,
+    n_points_per_cycle: int = 6,
+    use_stored_params: bool = False,
+    tolerance: float = 0.005e-3,
+    adiabatic_safe_factor: float = 0.75,
+    max_amplitude: float = 1.0,
+    max_time_range: float = 4096.0,
+    x90: TargetMap[Waveform] | None = None,
+    use_zvalues: bool = False,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    reset_awg_and_capunits: bool = True,
+    auto_register_cr_channel: bool = True,
+    update_lsi: bool = False,
+    plot: bool = True,
+) -> Result:
+    """Obtain CR parameters under nested spectator and control Stark drive."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    cr_param_label = control_spectator_stark_cr_target(
+        exp,
+        control_label,
+        target_label,
+        spectator_label,
+    )
+    control_frequency = exp.targets[insitu_target(exp, control_label)].frequency
+    target_frequency = exp.targets[target_label].frequency
+    resolved_cr_frequency = target_frequency if cr_frequency is None else cr_frequency
+    if auto_register_cr_channel:
+        _ensure_stark_cr_channel(
+            exp,
+            control_qubit=control_label,
+            target_qubit=target_label,
+            stark_drive_qubit="control",
+            cr_frequency=resolved_cr_frequency,
+            update_lsi=update_lsi,
+        )
+    ramptime = DEFAULT_CR_RAMPTIME if ramptime is None else ramptime
+    n_shots = CALIBRATION_SHOTS if n_shots is None else n_shots
+    shot_interval = DEFAULT_INTERVAL if shot_interval is None else shot_interval
+    sampling_period = _measurement_sampling_period(exp)
+
+    def create_time_range(zx90_duration: float) -> NDArray:
+        period = 4 * zx90_duration
+        dt = (period / n_points_per_cycle) // sampling_period * sampling_period
+        duration = min(period * n_cycles, max_time_range)
+        return np.arange(0, duration + 1, dt)
+
+    max_cr_rabi = adiabatic_safe_factor * abs(target_frequency - control_frequency)
+    max_cr_amplitude = float(
+        np.clip(
+            _bare_control_amplitude(
+                exp,
+                target=control_label,
+                rabi_rate=max_cr_rabi,
+            ),
+            0.0,
+            max_amplitude,
+        )
+    )
+    current = exp.ctx.calib_note.get_cr_param(cr_param_label)
+    if use_stored_params and current is not None:
+        cr_amplitude = current["cr_amplitude"]
+        cr_phase = current["cr_phase"]
+        cancel_amplitude = current["cancel_amplitude"]
+        cancel_phase = current["cancel_phase"]
+        time_values = create_time_range(
+            1 / (4 * cr_amplitude * current["zx_rotation_rate"])
+        )
+    else:
+        cr_amplitude = max_cr_amplitude if cr_amplitude is None else cr_amplitude
+        cr_phase = 0.0
+        cancel_amplitude = 0.0
+        cancel_phase = 0.0
+        time_values = np.asarray(
+            DEFAULT_CR_TIME_RANGE if time_range is None else time_range,
+            dtype=float,
+        )
+
+    params_history: list[dict[str, Any]] = [
+        {
+            "time_range": time_values,
+            "cr_phase": cr_phase,
+            "cancel_amplitude": cancel_amplitude,
+            "cancel_phase": cancel_phase,
+        }
+    ]
+    coeffs_history: dict[str, list[float]] = defaultdict(list)
+    figs_history: list[dict[str, Any]] = []
+    for _ in range(n_iterations):
+        result = _control_spectator_stark_update_cr_params(
+            exp,
+            control_qubit=control_label,
+            target_qubit=target_label,
+            spectator_qubit=spectator_label,
+            control_stark_amplitude=control_stark_amplitude,
+            spectator_stark_amplitude=spectator_stark_amplitude,
+            time_range=time_values,
+            ramptime=ramptime,
+            control_stark_ramptime=control_stark_ramptime,
+            spectator_stark_ramptime=spectator_stark_ramptime,
+            cr_amplitude=cr_amplitude,
+            cr_phase=cr_phase,
+            cancel_amplitude=cancel_amplitude,
+            cancel_phase=cancel_phase,
+            cr_frequency=resolved_cr_frequency,
+            x90=x90,
+            use_zvalues=use_zvalues,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            reset_awg_and_capunits=reset_awg_and_capunits,
+            plot=plot,
+        )
+        cr_phase = result["cr_param"]["cr_phase"]
+        cancel_amplitude = result["cr_param"]["cancel_amplitude"]
+        cancel_phase = result["cr_param"]["cancel_phase"]
+        time_values = create_time_range(result["zx90_duration"])
+        params_history.append(
+            {
+                "time_range": time_values,
+                "cr_phase": cr_phase,
+                "cancel_amplitude": cancel_amplitude,
+                "cancel_phase": cancel_phase,
+            }
+        )
+        figs_history.append({"fig_c": result["fig_c"], "fig_t": result["fig_t"]})
+        for key, value in result["coeffs"].items():
+            coeffs_history[key].append(value)
+        if len(coeffs_history["IX"]) > 1:
+            ix, iy = coeffs_history["IX"][-1], coeffs_history["IY"][-1]
+            ix_diff = coeffs_history["IX"][-2] - ix
+            iy_diff = coeffs_history["IY"][-2] - iy
+            if (abs(ix) < tolerance and abs(iy) < tolerance) or (
+                abs(ix_diff) < tolerance and abs(iy_diff) < tolerance
+            ):
+                break
+    hamiltonian_coeffs = {
+        key: np.asarray(values) for key, values in coeffs_history.items()
+    }
+    fig = viz.make_figure()
+    for key, values in hamiltonian_coeffs.items():
+        fig.add_trace(
+            go.Scatter(
+                x=np.arange(1, len(values) + 1),
+                y=values * 1e3,
+                mode="lines+markers",
+                name=f"{key}/2",
+            )
+        )
+    fig.update_layout(
+        title=f"CR Hamiltonian coefficients : {cr_param_label}",
+        xaxis_title="Number of steps",
+        yaxis_title="Coefficient (MHz)",
+        xaxis=dict(
+            tickmode="array",
+            tickvals=np.arange(
+                max(
+                    (len(values) for values in hamiltonian_coeffs.values()),
+                    default=0,
+                )
+            ),
+        ),
+    )
+    if plot:
+        fig.show()
+    return Result(
+        data={
+            "params_history": params_history,
+            "coeffs_history": hamiltonian_coeffs,
+            "figs_history": figs_history,
+        }
+    )
+
+
+def spectator_stark_cr_target(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+) -> str:
+    """
+    Return the CR calibration key used under a spectator Stark tone.
+
+    The returned label is a calibration-note key. Pulses still use the bare
+    `control-target` CR hardware target because neither member of the CR pair
+    is directly Stark-driven.
+    """
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    if spectator_label in {control_label, target_label}:
+        raise ValueError("`spectator_qubit` must be outside the CR pair.")
+    return f"{control_label}-{target_label}_under_{spectator_label}_stark"
+
+
+def _spectator_stark_wrapped_schedule(
+    exp: Experiment,
+    *,
+    control_qubit: str,
+    spectator_qubit: str,
+    stark_amplitude: float,
+    stark_ramptime: float | None,
+    body: PulseSchedule,
+) -> PulseSchedule:
+    return _stark_wrapped_schedule(
+        stark_label=stark_target(exp, spectator_qubit),
+        insitu_label=control_qubit,
+        stark_amplitude=_stark_drive_amplitude(
+            exp,
+            target=spectator_qubit,
+            stark_amplitude=stark_amplitude,
+        ),
+        stark_ramptime=_resolve_stark_ramptime(stark_ramptime),
+        insitu_sequence=body,
+    )
+
+
+def spectator_stark_cr_tomography_sequence(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    stark_amplitude: float,
+    basis: Literal["X", "Y", "Z"] = "Z",
+    control_state: Literal["0", "1"] = "0",
+    cr_duration: float = 128.0,
+    ramptime: float | None = None,
+    stark_ramptime: float | None = None,
+    cr_amplitude: float = 1.0,
+    cr_phase: float = 0.0,
+    cancel_amplitude: float = 0.0,
+    cancel_phase: float = 0.0,
+    ramp_type: RampType = "RaisedCosine",
+    x90: TargetMap[Waveform] | None = None,
+    plot: bool = True,
+) -> PulseSchedule:
+    """Build bare-pair CR tomography while a spectator is Stark-driven."""
+    if control_state not in ("0", "1"):
+        raise ValueError("`control_state` must be '0' or '1'.")
+    if ramptime is None:
+        ramptime = DEFAULT_CR_RAMPTIME
+
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    spectator_stark_cr_target(
+        exp,
+        control_label,
+        target_label,
+        spectator_label,
+    )
+    control_x90 = x90.get(control_label) if x90 is not None else None
+    target_x90 = x90.get(target_label) if x90 is not None else None
+    control_x90 = control_x90 or exp.pulse.x90(control_label)
+    target_x90 = target_x90 or exp.pulse.x90(target_label)
+    cr_sequence = CrossResonance(
+        control_qubit=control_label,
+        target_qubit=target_label,
+        cr_amplitude=cr_amplitude,
+        cr_duration=cr_duration,
+        cr_ramptime=ramptime,
+        cr_phase=cr_phase,
+        cancel_amplitude=cancel_amplitude,
+        cancel_phase=cancel_phase,
+        echo=False,
+        ramp_type=ramp_type,
+    )
+
+    with PulseSchedule([control_label]) as body:
+        if control_state == "1":
+            body.add(control_label, exp.pulse.x180(control_label))
+            body.barrier()
+        body.call(cr_sequence)
+        body.barrier()
+        control_rotation = _basis_rotation(control_x90, basis)
+        target_rotation = _basis_rotation(target_x90, basis)
+        if control_rotation is not None:
+            body.add(control_label, control_rotation)
+        if target_rotation is not None:
+            body.add(target_label, target_rotation)
+
+    schedule = _spectator_stark_wrapped_schedule(
+        exp,
+        control_qubit=control_label,
+        spectator_qubit=spectator_label,
+        stark_amplitude=stark_amplitude,
+        stark_ramptime=stark_ramptime,
+        body=body,
+    )
+    return _plot_sequence_sample(
+        schedule,
+        title=(
+            f"Spectator Stark CR tomography: {control_label}-{target_label}, "
+            f"spectator={spectator_label}, state={control_state}, basis={basis}"
+        ),
+        plot=plot,
+    )
+
+
+def _spectator_stark_cr_state_tomography(
+    exp: Experiment,
+    *,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    stark_amplitude: float,
+    control_state: Literal["0", "1"],
+    cr_duration: float,
+    ramptime: float,
+    stark_ramptime: float | None,
+    cr_amplitude: float,
+    cr_phase: float,
+    cancel_amplitude: float,
+    cancel_phase: float,
+    cr_frequency: float,
+    x90: TargetMap[Waveform] | None,
+    n_shots: int,
+    shot_interval: float,
+    use_zvalues: bool,
+) -> Result:
+    pair = {control_qubit, target_qubit}
+    buffer: dict[str, list[float]] = defaultdict(list)
+    for basis in ("X", "Y", "Z"):
+        sequence = spectator_stark_cr_tomography_sequence(
+            exp,
+            control_qubit,
+            target_qubit,
+            spectator_qubit,
+            stark_amplitude=stark_amplitude,
+            basis=basis,
+            control_state=control_state,
+            cr_duration=cr_duration,
+            ramptime=ramptime,
+            stark_ramptime=stark_ramptime,
+            cr_amplitude=cr_amplitude,
+            cr_phase=cr_phase,
+            cancel_amplitude=cancel_amplitude,
+            cancel_phase=cancel_phase,
+            x90=x90,
+            plot=False,
+        )
+        measure_result = exp.measurement_service.measure(
+            sequence,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            frequencies={f"{control_qubit}-{target_qubit}": cr_frequency},
+            reset_awg_and_capunits=False,
+            plot=False,
+        )
+        for qubit, data in measure_result.data.items():
+            if qubit not in pair:
+                continue
+            buffer[qubit].append(
+                _normalized_tomography_value(
+                    exp,
+                    qubit=qubit,
+                    data=data,
+                    use_zvalues=use_zvalues,
+                )
+            )
+    return Result(data={qubit: tuple(values) for qubit, values in buffer.items()})
+
+
+def spectator_stark_measure_cr_dynamics(
+    exp: Experiment,
+    *,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    stark_amplitude: float,
+    time_range: ArrayLike | None = None,
+    ramptime: float | None = None,
+    stark_ramptime: float | None = None,
+    cr_amplitude: float | None = None,
+    cr_phase: float | None = None,
+    cancel_amplitude: float | None = None,
+    cancel_phase: float | None = None,
+    cr_frequency: float | None = None,
+    control_state: Literal["0", "1"] = "0",
+    x90: TargetMap[Waveform] | None = None,
+    use_zvalues: bool = False,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    reset_awg_and_capunits: bool = True,
+    plot: bool = True,
+) -> Result:
+    """Measure bare-pair CR dynamics under a spectator Stark tone."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    spectator_stark_cr_target(exp, control_label, target_label, spectator_label)
+    time_values = np.asarray(
+        DEFAULT_CR_TIME_RANGE if time_range is None else time_range,
+        dtype=float,
+    )
+    ramptime = DEFAULT_CR_RAMPTIME if ramptime is None else ramptime
+    cr_amplitude = 1.0 if cr_amplitude is None else cr_amplitude
+    cr_phase = 0.0 if cr_phase is None else cr_phase
+    cancel_amplitude = 0.0 if cancel_amplitude is None else cancel_amplitude
+    cancel_phase = 0.0 if cancel_phase is None else cancel_phase
+    n_shots = DEFAULT_SHOTS if n_shots is None else n_shots
+    shot_interval = DEFAULT_INTERVAL if shot_interval is None else shot_interval
+    resolved_cr_frequency = (
+        exp.targets[target_label].frequency if cr_frequency is None else cr_frequency
+    )
+    if reset_awg_and_capunits:
+        exp.ctx.reset_awg_and_capunits(
+            qubits=[control_label, target_label, spectator_label]
+        )
+
+    control_states: list[NDArray] = []
+    target_states: list[NDArray] = []
+    for duration in time_values:
+        result = _spectator_stark_cr_state_tomography(
+            exp,
+            control_qubit=control_label,
+            target_qubit=target_label,
+            spectator_qubit=spectator_label,
+            stark_amplitude=stark_amplitude,
+            control_state=control_state,
+            cr_duration=float(duration) + 2 * ramptime,
+            ramptime=ramptime,
+            stark_ramptime=stark_ramptime,
+            cr_amplitude=cr_amplitude,
+            cr_phase=cr_phase,
+            cancel_amplitude=cancel_amplitude,
+            cancel_phase=cancel_phase,
+            cr_frequency=resolved_cr_frequency,
+            x90=x90,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            use_zvalues=use_zvalues,
+        )
+        control_states.append(np.asarray(result[control_label]))
+        target_states.append(np.asarray(result[target_label]))
+
+    control_states_array = np.asarray(control_states)
+    target_states_array = np.asarray(target_states)
+    effective_drive_range = time_values + ramptime
+    fit_result = fitting.fit_rotation(
+        effective_drive_range,
+        target_states_array,
+        plot=False,
+        title=(
+            f"Spectator Stark CR target dynamics of "
+            f"{control_label}-{target_label}: |{control_state}>"
+        ),
+        xlabel="Drive time (ns)",
+        ylabel=f"Target qubit : {target_label}",
+    )
+    if plot:
+        viz.plot_bloch_vectors(
+            effective_drive_range,
+            control_states_array,
+            title=(
+                f"Spectator Stark CR control dynamics of "
+                f"{control_label}-{target_label}: |{control_state}>"
+            ),
+            xlabel="Drive time (ns)",
+            ylabel=f"Control qubit : {control_label}",
+        )
+        fit_result.get_figure().show()
+        fit_result.get_figure("fig3d").show()
+    return Result(
+        data={
+            "time_range": time_values,
+            "effective_drive_range": effective_drive_range,
+            "control_states": control_states_array,
+            "target_states": target_states_array,
+            "fit_result": fit_result,
+            "cr_amplitude": cr_amplitude,
+            "ramptime": ramptime,
+            "cr_frequency": resolved_cr_frequency,
+        }
+    )
+
+
+def spectator_stark_cr_hamiltonian_tomography(
+    exp: Experiment,
+    *,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    stark_amplitude: float,
+    time_range: ArrayLike | None = None,
+    ramptime: float | None = None,
+    stark_ramptime: float | None = None,
+    cr_amplitude: float | None = None,
+    cr_phase: float | None = None,
+    cancel_amplitude: float | None = None,
+    cancel_phase: float | None = None,
+    cr_frequency: float | None = None,
+    x90: TargetMap[Waveform] | None = None,
+    use_zvalues: bool = False,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    reset_awg_and_capunits: bool = True,
+    plot: bool = True,
+) -> Result:
+    """Run bare-pair CR Hamiltonian tomography under spectator Stark."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    cr_param_label = spectator_stark_cr_target(
+        exp,
+        control_label,
+        target_label,
+        spectator_label,
+    )
+    ramptime = DEFAULT_CR_RAMPTIME if ramptime is None else ramptime
+    cr_amplitude = 1.0 if cr_amplitude is None else cr_amplitude
+    cr_phase = 0.0 if cr_phase is None else cr_phase
+    cancel_amplitude = 0.0 if cancel_amplitude is None else cancel_amplitude
+    cancel_phase = 0.0 if cancel_phase is None else cancel_phase
+    n_shots = CALIBRATION_SHOTS if n_shots is None else n_shots
+    shot_interval = DEFAULT_INTERVAL if shot_interval is None else shot_interval
+    resolved_cr_frequency = (
+        exp.targets[target_label].frequency if cr_frequency is None else cr_frequency
+    )
+    if reset_awg_and_capunits:
+        exp.ctx.reset_awg_and_capunits(
+            qubits=[control_label, target_label, spectator_label]
+        )
+
+    def measure(control_state: Literal["0", "1"]) -> Result:
+        return spectator_stark_measure_cr_dynamics(
+            exp,
+            control_qubit=control_label,
+            target_qubit=target_label,
+            spectator_qubit=spectator_label,
+            stark_amplitude=stark_amplitude,
+            time_range=time_range,
+            ramptime=ramptime,
+            stark_ramptime=stark_ramptime,
+            cr_amplitude=cr_amplitude,
+            cr_phase=cr_phase,
+            cancel_amplitude=cancel_amplitude,
+            cancel_phase=cancel_phase,
+            cr_frequency=resolved_cr_frequency,
+            control_state=control_state,
+            x90=x90,
+            use_zvalues=use_zvalues,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            reset_awg_and_capunits=False,
+            plot=False,
+        )
+
+    result_0 = measure("0")
+    result_1 = measure("1")
+    omega_0 = result_0["fit_result"]["Omega"]
+    omega_1 = result_1["fit_result"]["Omega"]
+    omega = np.concatenate([0.5 * (omega_0 + omega_1), 0.5 * (omega_0 - omega_1)])
+    coeffs = dict(
+        zip(
+            ["IX", "IY", "IZ", "ZX", "ZY", "ZZ"],
+            omega / (2 * np.pi),
+            strict=True,
+        )
+    )
+    xt_rotation = coeffs["IX"] + 1j * coeffs["IY"]
+    cr_rotation = coeffs["ZX"] + 1j * coeffs["ZY"]
+    xt_rotation_amplitude = np.abs(xt_rotation)
+    cr_rotation_amplitude = np.abs(cr_rotation)
+    xt_rotation_amplitude_hw = _bare_control_amplitude(
+        exp,
+        target=target_label,
+        rabi_rate=xt_rotation_amplitude,
+    )
+    cr_rotation_amplitude_hw = _bare_control_amplitude(
+        exp,
+        target=target_label,
+        rabi_rate=cr_rotation_amplitude,
+    )
+    zx90_duration = 1 / (4 * cr_rotation_amplitude)
+    cr_rabi_rate = _bare_rabi_rate(
+        exp,
+        target=control_label,
+        control_amplitude=cr_amplitude,
+    )
+    fig_c = viz.make_figure()
+    fig_c.set_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.1,
+    )
+    for row, result in enumerate((result_0, result_1), start=1):
+        state_figure = viz.make_bloch_vectors_figure(
+            result["effective_drive_range"],
+            result["control_states"],
+        )
+        for trace in state_figure.data:
+            data = cast(go.Scatter, trace)
+            fig_c.add_trace(
+                go.Scatter(
+                    x=data.x,
+                    y=data.y,
+                    mode=data.mode,
+                    line=data.line,
+                    marker=data.marker,
+                    name=data.name,
+                    showlegend=row == 1,
+                ),
+                row=row,
+                col=1,
+            )
+    fig_c.update_xaxes(title_text="Drive time (ns)", row=2, col=1)
+    fig_c.update_yaxes(title_text="Control : |0〉", range=[-1.1, 1.1], row=1, col=1)
+    fig_c.update_yaxes(title_text="Control : |1〉", range=[-1.1, 1.1], row=2, col=1)
+    fig_c.update_layout(
+        title=f"Control qubit dynamics : {control_label}-{target_label}",
+        height=400,
+        width=600,
+        showlegend=True,
+    )
+
+    fig_t = viz.make_figure()
+    fig_t.set_subplots(
+        rows=2,
+        cols=1,
+        shared_xaxes=True,
+        vertical_spacing=0.1,
+    )
+    for row, result in enumerate((result_0, result_1), start=1):
+        state_figure = result["fit_result"].get_figure()
+        for trace in state_figure.data:
+            data = cast(go.Scatter, trace)
+            fig_t.add_trace(
+                go.Scatter(
+                    x=data.x,
+                    y=data.y,
+                    mode=data.mode,
+                    line=data.line,
+                    marker=data.marker,
+                    name=data.name,
+                    showlegend=row == 1,
+                ),
+                row=row,
+                col=1,
+            )
+    fig_t.update_xaxes(title_text="Drive time (ns)", row=2, col=1)
+    fig_t.update_yaxes(title_text="Control : |0〉", range=[-1.1, 1.1], row=1, col=1)
+    fig_t.update_yaxes(title_text="Control : |1〉", range=[-1.1, 1.1], row=2, col=1)
+    fig_t.update_layout(
+        title=f"Target qubit dynamics : {control_label}-{target_label}",
+        height=400,
+        width=600,
+        showlegend=True,
+    )
+    if plot:
+        fig_c.show()
+        fig_t.show()
+        fig_t_3d = viz.make_figure()
+        fig_t_3d.set_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=["Control : |0〉", "Control : |1〉"],
+            specs=[[{"type": "scatter3d"}, {"type": "scatter3d"}]],
+            horizontal_spacing=0.01,
+        )
+        for col, result in enumerate((result_0, result_1), start=1):
+            state_figure = result["fit_result"].get_figure("fig3d")
+            for trace in state_figure.data:
+                fig_t_3d.add_trace(trace, row=1, col=col)
+        fig_t_3d.update_layout(
+            title=f"Target qubit dynamics : {control_label}-{target_label}",
+            height=400,
+            width=600,
+            showlegend=False,
+        )
+        fig_t_3d.show()
+    return Result(
+        data={
+            "cr_label": f"{control_label}-{target_label}",
+            "cr_param_label": cr_param_label,
+            "spectator_qubit": spectator_label,
+            "cr_frequency": resolved_cr_frequency,
+            "control_frequency": exp.targets[control_label].frequency,
+            "target_frequency": exp.targets[target_label].frequency,
+            "Omega": omega,
+            "coeffs": coeffs,
+            "cr_rotation_amplitude": cr_rotation_amplitude,
+            "cr_rotation_amplitude_hw": cr_rotation_amplitude_hw,
+            "cr_rotation_phase": np.angle(cr_rotation),
+            "xt_rotation_amplitude": xt_rotation_amplitude,
+            "xt_rotation_amplitude_hw": xt_rotation_amplitude_hw,
+            "xt_rotation_phase": np.angle(xt_rotation),
+            "cr_drive_amplitude": cr_rabi_rate,
+            "cr_drive_amplitude_hw": cr_amplitude,
+            "zx90_duration": zx90_duration,
+            "result_0": result_0,
+            "result_1": result_1,
+            "fig_c": fig_c,
+            "fig_t": fig_t,
+        },
+        figures={"control": fig_c, "target": fig_t},
+    )
+
+
+def spectator_stark_update_cr_params(
+    exp: Experiment,
+    *,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    stark_amplitude: float,
+    time_range: ArrayLike | None = None,
+    ramptime: float | None = None,
+    stark_ramptime: float | None = None,
+    cr_amplitude: float = 1.0,
+    cr_phase: float = 0.0,
+    cancel_amplitude: float = 0.0,
+    cancel_phase: float = 0.0,
+    cr_frequency: float | None = None,
+    update_cr_phase: bool = True,
+    update_cancel_pulse: bool = True,
+    store_params: bool = True,
+    x90: TargetMap[Waveform] | None = None,
+    use_zvalues: bool = False,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    reset_awg_and_capunits: bool = True,
+    plot: bool = True,
+) -> Result:
+    """Update environment-specific CR parameters under spectator Stark."""
+    ramptime = DEFAULT_CR_RAMPTIME if ramptime is None else ramptime
+    result = spectator_stark_cr_hamiltonian_tomography(
+        exp,
+        control_qubit=control_qubit,
+        target_qubit=target_qubit,
+        spectator_qubit=spectator_qubit,
+        stark_amplitude=stark_amplitude,
+        time_range=time_range,
+        ramptime=ramptime,
+        stark_ramptime=stark_ramptime,
+        cr_amplitude=cr_amplitude,
+        cr_phase=cr_phase,
+        cancel_amplitude=cancel_amplitude,
+        cancel_phase=cancel_phase,
+        cr_frequency=cr_frequency,
+        x90=x90,
+        use_zvalues=use_zvalues,
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        reset_awg_and_capunits=reset_awg_and_capunits,
+        plot=plot,
+    )
+    current_cr = cr_amplitude * np.exp(1j * cr_phase)
+    current_cancel = cancel_amplitude * np.exp(1j * cancel_phase)
+    shift = -result["cr_rotation_phase"]
+    cancellation = -result["xt_rotation_amplitude_hw"] * np.exp(
+        1j * result["xt_rotation_phase"]
+    )
+    new_cr = current_cr * np.exp(1j * shift) if update_cr_phase else current_cr
+    new_cancel = (
+        (current_cancel + cancellation) * np.exp(1j * shift)
+        if update_cancel_pulse
+        else current_cancel
+    )
+    cr_param_label = str(result["cr_param_label"])
+    cr_param: CrossResonanceParam = {
+        "target": cr_param_label,
+        "duration": 0.0,
+        "ramptime": ramptime,
+        "cr_amplitude": float(np.abs(new_cr)),
+        "cr_phase": float(np.angle(new_cr)),
+        "cr_beta": 0.0,
+        "cancel_amplitude": float(np.abs(new_cancel)),
+        "cancel_phase": float(np.angle(new_cancel)),
+        "cancel_beta": 0.0,
+        "rotary_amplitude": 0.0,
+        "zx_rotation_rate": float(result["coeffs"]["ZX"] / cr_amplitude),
+    }
+    if store_params:
+        exp.ctx.calib_note.update_cr_param(cr_param_label, cr_param)
+    return Result(data={**result, "cr_param": cr_param})
+
+
+def obtain_cr_params_under_spectator_stark(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    cr_frequency: float | None = None,
+    time_range: ArrayLike | None = None,
+    ramptime: float | None = None,
+    cr_amplitude: float | None = None,
+    n_iterations: int = 4,
+    n_cycles: int = 2,
+    n_points_per_cycle: int = 6,
+    use_stored_params: bool = False,
+    tolerance: float = 0.005e-3,
+    adiabatic_safe_factor: float = 0.75,
+    max_amplitude: float = 1.0,
+    max_time_range: float = 4096.0,
+    x90: TargetMap[Waveform] | None = None,
+    use_zvalues: bool = False,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    reset_awg_and_capunits: bool = True,
+    plot: bool = True,
+) -> Result:
+    """Obtain bare-pair CR parameters under a spectator Stark tone."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    cr_param_label = spectator_stark_cr_target(
+        exp,
+        control_label,
+        target_label,
+        spectator_label,
+    )
+    ramptime = DEFAULT_CR_RAMPTIME if ramptime is None else ramptime
+    n_shots = CALIBRATION_SHOTS if n_shots is None else n_shots
+    shot_interval = DEFAULT_INTERVAL if shot_interval is None else shot_interval
+    sampling_period = _measurement_sampling_period(exp)
+    control_frequency = exp.targets[control_label].frequency
+    target_frequency = exp.targets[target_label].frequency
+    resolved_cr_frequency = target_frequency if cr_frequency is None else cr_frequency
+
+    def create_time_range(zx90_duration: float) -> NDArray:
+        period = 4 * zx90_duration
+        dt = (period / n_points_per_cycle) // sampling_period * sampling_period
+        duration = min(period * n_cycles, max_time_range)
+        return np.arange(0, duration + 1, dt)
+
+    max_cr_rabi = adiabatic_safe_factor * abs(target_frequency - control_frequency)
+    max_cr_amplitude = float(
+        np.clip(
+            _bare_control_amplitude(
+                exp,
+                target=control_label,
+                rabi_rate=max_cr_rabi,
+            ),
+            0.0,
+            max_amplitude,
+        )
+    )
+    current = exp.ctx.calib_note.get_cr_param(cr_param_label)
+    if use_stored_params and current is not None:
+        cr_amplitude = current["cr_amplitude"]
+        cr_phase = current["cr_phase"]
+        cancel_amplitude = current["cancel_amplitude"]
+        cancel_phase = current["cancel_phase"]
+        time_values = create_time_range(
+            1 / (4 * cr_amplitude * current["zx_rotation_rate"])
+        )
+    else:
+        cr_amplitude = max_cr_amplitude if cr_amplitude is None else cr_amplitude
+        cr_phase = 0.0
+        cancel_amplitude = 0.0
+        cancel_phase = 0.0
+        time_values = np.asarray(
+            DEFAULT_CR_TIME_RANGE if time_range is None else time_range,
+            dtype=float,
+        )
+
+    params_history: list[dict[str, Any]] = [
+        {
+            "time_range": time_values,
+            "cr_phase": cr_phase,
+            "cancel_amplitude": cancel_amplitude,
+            "cancel_phase": cancel_phase,
+        }
+    ]
+    coeffs_history: dict[str, list[float]] = defaultdict(list)
+    figs_history: list[dict[str, Any]] = []
+    for _ in range(n_iterations):
+        result = spectator_stark_update_cr_params(
+            exp,
+            control_qubit=control_label,
+            target_qubit=target_label,
+            spectator_qubit=spectator_label,
+            stark_amplitude=stark_amplitude,
+            time_range=time_values,
+            ramptime=ramptime,
+            stark_ramptime=stark_ramptime,
+            cr_amplitude=cr_amplitude,
+            cr_phase=cr_phase,
+            cancel_amplitude=cancel_amplitude,
+            cancel_phase=cancel_phase,
+            cr_frequency=resolved_cr_frequency,
+            x90=x90,
+            use_zvalues=use_zvalues,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            reset_awg_and_capunits=reset_awg_and_capunits,
+            plot=plot,
+        )
+        cr_phase = result["cr_param"]["cr_phase"]
+        cancel_amplitude = result["cr_param"]["cancel_amplitude"]
+        cancel_phase = result["cr_param"]["cancel_phase"]
+        time_values = create_time_range(result["zx90_duration"])
+        params_history.append(
+            {
+                "time_range": time_values,
+                "cr_phase": cr_phase,
+                "cancel_amplitude": cancel_amplitude,
+                "cancel_phase": cancel_phase,
+            }
+        )
+        figs_history.append({"fig_c": result["fig_c"], "fig_t": result["fig_t"]})
+        for key, value in result["coeffs"].items():
+            coeffs_history[key].append(value)
+        if len(coeffs_history["IX"]) > 1:
+            ix, iy = coeffs_history["IX"][-1], coeffs_history["IY"][-1]
+            ix_diff = coeffs_history["IX"][-2] - ix
+            iy_diff = coeffs_history["IY"][-2] - iy
+            if (abs(ix) < tolerance and abs(iy) < tolerance) or (
+                abs(ix_diff) < tolerance and abs(iy_diff) < tolerance
+            ):
+                break
+    hamiltonian_coeffs = {
+        key: np.asarray(values) for key, values in coeffs_history.items()
+    }
+    fig = viz.make_figure()
+    for key, values in hamiltonian_coeffs.items():
+        fig.add_trace(
+            go.Scatter(
+                x=np.arange(1, len(values) + 1),
+                y=values * 1e3,
+                mode="lines+markers",
+                name=f"{key}/2",
+            )
+        )
+    if plot:
+        fig.show()
+    return Result(
+        data={
+            "params_history": params_history,
+            "coeffs_history": hamiltonian_coeffs,
+            "figs_history": figs_history,
+        }
+    )
+
+
+def _spectator_stark_zx90_body(
+    exp: Experiment,
+    *,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    cr_duration: float | None = None,
+    cr_ramptime: float | None = None,
+    cr_amplitude: float | None = None,
+    cr_phase: float | None = None,
+    cr_beta: float | None = None,
+    cancel_amplitude: float | None = None,
+    cancel_phase: float | None = None,
+    cancel_beta: float | None = None,
+    rotary_amplitude: float | None = None,
+    echo: bool = True,
+    x180: TargetMap[Waveform] | Waveform | None = None,
+    x180_margin: float | None = None,
+) -> PulseSchedule:
+    cr_param_label = spectator_stark_cr_target(
+        exp,
+        control_qubit,
+        target_qubit,
+        spectator_qubit,
+    )
+    cr_param = exp.ctx.calib_note.get_cr_param(
+        cr_param_label,
+        valid_days=exp.ctx.calibration_valid_days,
+    )
+    if cr_param is None:
+        raise ValueError(f"CR parameters for {cr_param_label} are not stored.")
+    if x180_margin is None:
+        x180_margin = 0.0
+    if x180 is None:
+        pi_pulse = exp.pulse.x180(control_qubit)
+    elif isinstance(x180, Waveform):
+        pi_pulse = x180
+    else:
+        pi_pulse = x180.get(control_qubit)
+    if pi_pulse is None:
+        raise ValueError("Could not resolve the echo pi pulse.")
+
+    cr_duration = cr_param["duration"] if cr_duration is None else cr_duration
+    cr_ramptime = cr_param["ramptime"] if cr_ramptime is None else cr_ramptime
+    cr_amplitude = cr_param["cr_amplitude"] if cr_amplitude is None else cr_amplitude
+    cr_phase = cr_param["cr_phase"] if cr_phase is None else cr_phase
+    cr_beta = cr_param["cr_beta"] if cr_beta is None else cr_beta
+    cancel_amplitude = (
+        cr_param["cancel_amplitude"] if cancel_amplitude is None else cancel_amplitude
+    )
+    cancel_phase = cr_param["cancel_phase"] if cancel_phase is None else cancel_phase
+    cancel_beta = cr_param["cancel_beta"] if cancel_beta is None else cancel_beta
+    rotary_amplitude = (
+        cr_param["rotary_amplitude"] if rotary_amplitude is None else rotary_amplitude
+    )
+    cancel_pulse = cancel_amplitude * np.exp(1j * cancel_phase) + rotary_amplitude
+    return CrossResonance(
+        control_qubit=control_qubit,
+        target_qubit=target_qubit,
+        cr_amplitude=cr_amplitude,
+        cr_duration=cr_duration,
+        cr_ramptime=cr_ramptime,
+        cr_phase=cr_phase,
+        cr_beta=cr_beta,
+        cancel_amplitude=np.abs(cancel_pulse),
+        cancel_phase=np.angle(cancel_pulse),
+        cancel_beta=cancel_beta,
+        echo=echo,
+        pi_pulse=pi_pulse,
+        pi_margin=x180_margin,
+    )
+
+
+def spectator_stark_zx90(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    cr_duration: float | None = None,
+    cr_ramptime: float | None = None,
+    cr_amplitude: float | None = None,
+    cr_phase: float | None = None,
+    cr_beta: float | None = None,
+    cancel_amplitude: float | None = None,
+    cancel_phase: float | None = None,
+    cancel_beta: float | None = None,
+    rotary_amplitude: float | None = None,
+    echo: bool = True,
+    x180: TargetMap[Waveform] | Waveform | None = None,
+    x180_margin: float | None = None,
+    plot: bool = False,
+) -> PulseSchedule:
+    """Build a bare-pair ZX90 gate under a spectator Stark tone."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    body = _spectator_stark_zx90_body(
+        exp,
+        control_qubit=control_label,
+        target_qubit=target_label,
+        spectator_qubit=spectator_label,
+        cr_duration=cr_duration,
+        cr_ramptime=cr_ramptime,
+        cr_amplitude=cr_amplitude,
+        cr_phase=cr_phase,
+        cr_beta=cr_beta,
+        cancel_amplitude=cancel_amplitude,
+        cancel_phase=cancel_phase,
+        cancel_beta=cancel_beta,
+        rotary_amplitude=rotary_amplitude,
+        echo=echo,
+        x180=x180,
+        x180_margin=x180_margin,
+    )
+    schedule = _spectator_stark_wrapped_schedule(
+        exp,
+        control_qubit=control_label,
+        spectator_qubit=spectator_label,
+        stark_amplitude=stark_amplitude,
+        stark_ramptime=stark_ramptime,
+        body=body,
+    )
+    return _plot_sequence_sample(
+        schedule,
+        title=(
+            f"Spectator Stark ZX90: {control_label}-{target_label}, "
+            f"spectator={spectator_label}"
+        ),
+        plot=plot,
+    )
+
+
+def _spectator_stark_cnot_body(
+    exp: Experiment,
+    *,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    zx90: PulseSchedule | None = None,
+    x90: TargetMap[Waveform] | None = None,
+) -> PulseSchedule:
+    target_x90 = x90.get(target_qubit) if x90 is not None else None
+    target_x90 = target_x90 or exp.pulse.x90(target_qubit)
+    zx90 = zx90 or _spectator_stark_zx90_body(
+        exp,
+        control_qubit=control_qubit,
+        target_qubit=target_qubit,
+        spectator_qubit=spectator_qubit,
+    )
+    with PulseSchedule(
+        [control_qubit, f"{control_qubit}-{target_qubit}", target_qubit]
+    ) as body:
+        body.call(zx90)
+        body.add(control_qubit, VirtualZ(-np.pi / 2))
+        body.add(target_qubit, target_x90.scaled(-1))
+    return body
+
+
+def spectator_stark_cnot(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    zx90: PulseSchedule | None = None,
+    x90: TargetMap[Waveform] | None = None,
+    plot: bool = False,
+) -> PulseSchedule:
+    """Build a bare-pair CNOT gate under a spectator Stark tone."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    body = _spectator_stark_cnot_body(
+        exp,
+        control_qubit=control_label,
+        target_qubit=target_label,
+        spectator_qubit=spectator_label,
+        zx90=zx90,
+        x90=x90,
+    )
+    schedule = _spectator_stark_wrapped_schedule(
+        exp,
+        control_qubit=control_label,
+        spectator_qubit=spectator_label,
+        stark_amplitude=stark_amplitude,
+        stark_ramptime=stark_ramptime,
+        body=body,
+    )
+    return _plot_sequence_sample(
+        schedule,
+        title=(
+            f"Spectator Stark CNOT: {control_label}-{target_label}, "
+            f"spectator={spectator_label}"
+        ),
+        plot=plot,
+    )
+
+
+def spectator_stark_bell_state_sequence(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    control_basis: Literal["X", "Y", "Z"] = "Z",
+    target_basis: Literal["X", "Y", "Z"] = "Z",
+    zx90: PulseSchedule | None = None,
+    x90: TargetMap[Waveform] | None = None,
+    plot: bool = False,
+) -> PulseSchedule:
+    """Build bare-pair Bell preparation and rotations under spectator Stark."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    control_x90 = x90.get(control_label) if x90 is not None else None
+    target_x90 = x90.get(target_label) if x90 is not None else None
+    control_x90 = control_x90 or exp.pulse.x90(control_label)
+    target_x90 = target_x90 or exp.pulse.x90(target_label)
+    with PulseSchedule([control_label]) as body:
+        body.add(control_label, control_x90.shifted(np.pi / 2))
+        body.call(
+            _spectator_stark_cnot_body(
+                exp,
+                control_qubit=control_label,
+                target_qubit=target_label,
+                spectator_qubit=spectator_label,
+                zx90=zx90,
+                x90=x90,
+            )
+        )
+        control_rotation = _basis_rotation(control_x90, control_basis)
+        target_rotation = _basis_rotation(target_x90, target_basis)
+        if control_rotation is not None:
+            body.add(control_label, control_rotation)
+        if target_rotation is not None:
+            body.add(target_label, target_rotation)
+    schedule = _spectator_stark_wrapped_schedule(
+        exp,
+        control_qubit=control_label,
+        spectator_qubit=spectator_label,
+        stark_amplitude=stark_amplitude,
+        stark_ramptime=stark_ramptime,
+        body=body,
+    )
+    return _plot_sequence_sample(
+        schedule,
+        title=(
+            f"Spectator Stark Bell sequence: {control_label}-{target_label}, "
+            f"spectator={spectator_label}, basis={control_basis}{target_basis}"
+        ),
+        plot=plot,
+    )
+
+
+def spectator_stark_rb_sequence_2q(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    n: int = 8,
+    seed: int | None = None,
+    x90: TargetMap[Waveform] | None = None,
+    zx90: PulseSchedule | None = None,
+    interleaved_clifford: str | Clifford | None = None,
+    interleaved_waveform: PulseSchedule | None = None,
+    plot: bool = True,
+) -> PulseSchedule:
+    """Build a bare-pair 2Q RB schedule under a spectator Stark tone."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    cr_label = f"{control_label}-{target_label}"
+    xi90 = x90.get(control_label) if x90 is not None else None
+    ix90 = x90.get(target_label) if x90 is not None else None
+    xi90 = xi90 or exp.pulse.x90(control_label)
+    ix90 = ix90 or exp.pulse.x90(target_label)
+    z90 = VirtualZ(np.pi / 2)
+    zx90 = zx90 or _spectator_stark_zx90_body(
+        exp,
+        control_qubit=control_label,
+        target_qubit=target_label,
+        spectator_qubit=spectator_label,
+    )
+    resolved_clifford = (
+        None
+        if interleaved_clifford is None
+        else _resolve_clifford(exp, interleaved_clifford)
+    )
+    if resolved_clifford is None:
+        cliffords, inverse = (
+            exp.benchmarking_service.clifford_generator.create_rb_sequences(
+                n=n,
+                type="2Q",
+                seed=seed,
+            )
+        )
+    else:
+        if interleaved_waveform is None:
+            if resolved_clifford.name == "ZX90":
+                interleaved_waveform = zx90
+            else:
+                raise ValueError("interleaved_waveform must be provided.")
+        cliffords, inverse = (
+            exp.benchmarking_service.clifford_generator.create_irb_sequences(
+                n=n,
+                interleave=resolved_clifford,
+                type="2Q",
+                seed=seed,
+            )
+        )
+
+    with PulseSchedule([control_label, cr_label, target_label]) as body:
+
+        def add_gate(gate: str) -> None:
+            if gate == "XI90":
+                body.add(control_label, xi90)
+            elif gate == "IX90":
+                body.add(target_label, ix90)
+            elif gate == "ZI90":
+                body.add(control_label, z90)
+            elif gate == "IZ90":
+                body.add(target_label, z90)
+                body.add(cr_label, z90)
+            elif gate == "ZX90":
+                body.barrier()
+                body.call(zx90)
+                body.barrier()
+            else:
+                raise ValueError("Invalid gate.")
+
+        for clifford in cliffords:
+            for gate in clifford:
+                add_gate(gate)
+            if interleaved_waveform is not None:
+                body.barrier()
+                body.call(interleaved_waveform)
+                body.barrier()
+        for gate in inverse:
+            add_gate(gate)
+
+    schedule = _spectator_stark_wrapped_schedule(
+        exp,
+        control_qubit=control_label,
+        spectator_qubit=spectator_label,
+        stark_amplitude=stark_amplitude,
+        stark_ramptime=stark_ramptime,
+        body=body,
+    )
+    return _plot_sequence_sample(
+        schedule,
+        title=(
+            f"Spectator Stark 2Q RB: {control_label}-{target_label}, "
+            f"spectator={spectator_label}, n={n}"
+        ),
+        plot=plot,
+    )
+
+
+def calibrate_spectator_stark_zx90(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    ramptime: float | None = None,
+    duration: float | None = None,
+    amplitude_range: ArrayLike | None = None,
+    initial_state: str = "0",
+    degree: int = 3,
+    adiabatic_safe_factor: float = 0.75,
+    max_amplitude: float = 1.0,
+    rotary_multiple: float = 9.0,
+    use_drag: bool = True,
+    duration_unit: float = 16.0,
+    duration_buffer: float = 1.05,
+    n_repetitions: int = 1,
+    x180: TargetMap[Waveform] | Waveform | None = None,
+    x180_margin: float = 0.0,
+    use_zvalues: bool = False,
+    store_params: bool = True,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    plot: bool = True,
+) -> Result:
+    """Calibrate a bare-pair ZX90 gate under a spectator Stark tone."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    cr_param_label = spectator_stark_cr_target(
+        exp,
+        control_label,
+        target_label,
+        spectator_label,
+    )
+    cr_param = exp.ctx.calib_note.get_cr_param(cr_param_label)
+    if cr_param is None:
+        raise ValueError(f"CR parameters for {cr_param_label} are not stored.")
+    ramptime = DEFAULT_CR_RAMPTIME if ramptime is None else ramptime
+    n_shots = CALIBRATION_SHOTS if n_shots is None else n_shots
+    shot_interval = DEFAULT_INTERVAL if shot_interval is None else shot_interval
+    cr_amplitude = cr_param["cr_amplitude"]
+    cr_phase = cr_param["cr_phase"]
+    cancel_amplitude = cr_param["cancel_amplitude"]
+    cancel_phase = cr_param["cancel_phase"]
+    zx_rotation_rate = cr_param["zx_rotation_rate"]
+    zx_frequency = zx_rotation_rate * cr_amplitude
+    rotary_amplitude = _bare_control_amplitude(
+        exp,
+        target=target_label,
+        rabi_rate=zx_frequency * rotary_multiple,
+    )
+    cancel_pulse = cancel_amplitude * np.exp(1j * cancel_phase) + rotary_amplitude
+    control_frequency = exp.targets[control_label].frequency
+    target_frequency = exp.targets[target_label].frequency
+    max_cr_rabi = adiabatic_safe_factor * abs(target_frequency - control_frequency)
+    max_cr_amplitude = float(
+        np.clip(
+            _bare_control_amplitude(
+                exp,
+                target=control_label,
+                rabi_rate=max_cr_rabi,
+            ),
+            0.0,
+            max_amplitude,
+        )
+    )
+    if duration is None:
+        duration = cr_param["duration"]
+        if duration == 0.0:
+            duration = duration_buffer / (8 * zx_frequency) + ramptime
+            duration = (duration // duration_unit + 1) * duration_unit
+
+    def sequence(
+        amplitude: float,
+        repetitions: int,
+    ) -> PulseSchedule:
+        scaled_cancel = amplitude / cr_amplitude * cancel_pulse
+        ecr = _spectator_stark_zx90_body(
+            exp,
+            control_qubit=control_label,
+            target_qubit=target_label,
+            spectator_qubit=spectator_label,
+            cr_duration=duration,
+            cr_ramptime=ramptime,
+            cr_amplitude=amplitude,
+            cr_phase=cr_phase,
+            cancel_amplitude=np.abs(scaled_cancel),
+            cancel_phase=np.angle(scaled_cancel),
+            rotary_amplitude=0.0,
+            echo=True,
+            x180=x180,
+            x180_margin=x180_margin,
+        ).repeated(repetitions)
+        with PulseSchedule([control_label]) as body:
+            if initial_state != "0":
+                body.add(
+                    control_label,
+                    exp.pulse.get_pulse_for_state(control_label, initial_state),
+                )
+                body.barrier()
+            body.call(ecr)
+        return _spectator_stark_wrapped_schedule(
+            exp,
+            control_qubit=control_label,
+            spectator_qubit=spectator_label,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            body=body,
+        )
+
+    def calibrate(values: ArrayLike, repetitions: int) -> dict[str, Any]:
+        values_array = np.asarray(values, dtype=float)
+        swept = np.linspace(
+            np.clip(values_array[0], 0.0, max_cr_amplitude),
+            np.clip(values_array[-1], 0.0, max_cr_amplitude),
+            len(values_array),
+        )
+        sweep_result = exp.measurement_service.sweep_parameter(
+            lambda amplitude: sequence(float(amplitude), repetitions),
+            sweep_range=swept,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            plot=False,
+        )
+        sweep_data = sweep_result.data[target_label]
+        signal = sweep_data.zvalues if use_zvalues else sweep_data.normalized
+        fit_result = fitting.fit_polynomial(
+            target=cr_param_label,
+            x=swept,
+            y=signal,
+            degree=degree,
+            title=f"Spectator Stark ZX90 calibration (n = {repetitions})",
+            xlabel="Amplitude (arb. units)",
+            ylabel="Signal",
+        )
+        return {"amplitude_range": swept, "signal": signal, "fit": fit_result}
+
+    rough_n1 = None
+    rough_n3 = None
+    if amplitude_range is None:
+        rough_n1 = calibrate(
+            np.linspace(0.0, cr_amplitude * 2, 20),
+            n_repetitions,
+        )
+        rough_n3 = calibrate(
+            np.linspace(0.0, cr_amplitude * 2, 20),
+            n_repetitions + 2,
+        )
+        roots = [
+            float(result["fit"]["root"])
+            for result in (rough_n1, rough_n3)
+            if np.isfinite(result["fit"]["root"])
+        ]
+        if not roots:
+            raise ValueError("Could not find a root for the CR amplitude calibration.")
+        amplitude_range = np.linspace(min(roots) * 0.8, max(roots) * 1.2, 50)
+
+    result_n1 = calibrate(amplitude_range, n_repetitions)
+    result_n3 = calibrate(amplitude_range, n_repetitions + 2)
+    amplitudes = np.asarray(result_n1["amplitude_range"])
+    signal = result_n1["signal"] - result_n3["signal"]
+    fit_result = fitting.fit_polynomial(
+        target=cr_param_label,
+        x=amplitudes,
+        y=signal,
+        degree=degree,
+        title="Spectator Stark ZX90 calibration",
+        xlabel="Amplitude (arb. units)",
+        ylabel="Signal",
+    )
+    calibrated_cr_amplitude = float(fit_result["root"])
+    if not np.isfinite(calibrated_cr_amplitude):
+        raise ValueError("Could not find a root for the CR amplitude calibration.")
+    scale = calibrated_cr_amplitude / cr_amplitude
+    calibrated_cancel_amplitude = scale * cancel_amplitude
+    calibrated_rotary_amplitude = scale * rotary_amplitude
+    if use_drag:
+        cr_beta = -1 / (2 * np.pi * (control_frequency - target_frequency))
+    else:
+        cr_beta = 0.0
+    calibrated_param: CrossResonanceParam = {
+        "target": cr_param_label,
+        "duration": duration,
+        "ramptime": ramptime,
+        "cr_amplitude": calibrated_cr_amplitude,
+        "cr_phase": cr_phase,
+        "cr_beta": cr_beta,
+        "cancel_amplitude": calibrated_cancel_amplitude,
+        "cancel_phase": cancel_phase,
+        "cancel_beta": 0.0,
+        "rotary_amplitude": calibrated_rotary_amplitude,
+        "zx_rotation_rate": zx_rotation_rate,
+    }
+    if store_params:
+        exp.ctx.calib_note.update_cr_param(cr_param_label, calibrated_param)
+    if plot:
+        spectator_stark_zx90(
+            exp,
+            control_label,
+            target_label,
+            spectator_label,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            plot=True,
+        )
+    try:
+        coherence_limit = exp.calibration_service.calc_zx90_coherence_limit(
+            control_label,
+            target_label,
+        )
+    except KeyError:
+        coherence_limit = {}
+    return Result(
+        data={
+            "amplitude_range": amplitudes,
+            "signal": signal,
+            **fit_result,
+            "n1": {"signal": result_n1["signal"], **result_n1["fit"]},
+            "n3": {"signal": result_n3["signal"], **result_n3["fit"]},
+            "coherence_limit": coherence_limit,
+        }
+    )
+
+
+def spectator_stark_measure_bell_state(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    control_basis: Literal["X", "Y", "Z"] = "Z",
+    target_basis: Literal["X", "Y", "Z"] = "Z",
+    zx90: PulseSchedule | None = None,
+    x90: TargetMap[Waveform] | None = None,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    plot: bool = True,
+    save_image: bool = True,
+    reset_awg_and_capunits: bool = True,
+) -> Result:
+    """Measure a Bell state prepared under a spectator Stark tone."""
+    n_shots = DEFAULT_SHOTS if n_shots is None else n_shots
+    shot_interval = DEFAULT_INTERVAL if shot_interval is None else shot_interval
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    pair = [control_label, target_label]
+    sequence = spectator_stark_bell_state_sequence(
+        exp,
+        control_label,
+        target_label,
+        spectator_label,
+        stark_amplitude=stark_amplitude,
+        stark_ramptime=stark_ramptime,
+        control_basis=control_basis,
+        target_basis=target_basis,
+        zx90=zx90,
+        x90=x90,
+        plot=False,
+    )
+    result = exp.measurement_service.measure(
+        sequence,
+        mode="single",
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        reset_awg_and_capunits=reset_awg_and_capunits,
+    )
+    basis_labels = result.get_basis_labels(pair)
+    raw = result.get_probabilities(pair)
+    raw_array = np.asarray([raw.get(label, 0) for label in basis_labels])
+    mitigated = result.get_mitigated_probabilities(pair)
+    mitigated_array = np.asarray([mitigated.get(label, 0) for label in basis_labels])
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=[f"|{label}>" for label in basis_labels], y=raw_array))
+    if plot:
+        fig.show()
+    if save_image:
+        viz.save_figure(
+            fig,
+            f"spectator_stark_bell_{control_label}-{target_label}_under_{spectator_label}",
+        )
+    return Result(
+        data={"raw": raw_array, "mitigated": mitigated_array, "result": result},
+        figure=fig,
+    )
+
+
+def spectator_stark_bell_state_tomography(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    readout_mitigation: bool = True,
+    zx90: PulseSchedule | None = None,
+    x90: TargetMap[Waveform] | None = None,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    plot: bool = True,
+    save_image: bool = True,
+    mle_fit: bool = True,
+) -> Result:
+    """Run Bell-state tomography under a spectator Stark tone."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    probabilities: dict[str, NDArray] = {}
+    for control_basis, target_basis in product(("X", "Y", "Z"), repeat=2):
+        result = spectator_stark_measure_bell_state(
+            exp,
+            control_label,
+            target_label,
+            spectator_label,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            control_basis=cast(Literal["X", "Y", "Z"], control_basis),
+            target_basis=cast(Literal["X", "Y", "Z"], target_basis),
+            zx90=zx90,
+            x90=x90,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            plot=False,
+            save_image=False,
+        )
+        probabilities[f"{control_basis}{target_basis}"] = result[
+            "mitigated" if readout_mitigation else "raw"
+        ]
+    paulis = {
+        "I": np.eye(2),
+        "X": np.array([[0, 1], [1, 0]]),
+        "Y": np.array([[0, -1j], [1j, 0]]),
+        "Z": np.array([[1, 0], [0, -1]]),
+    }
+    expected_values: dict[str, float] = {}
+    rho = np.zeros((4, 4), dtype=np.complex128)
+    for control_basis, control_pauli in paulis.items():
+        for target_basis, target_pauli in paulis.items():
+            basis = f"{control_basis}{target_basis}"
+            if basis == "II":
+                p = probabilities["ZZ"]
+                value = float(np.sum(p))
+            elif control_basis == "I":
+                p = probabilities[f"Z{target_basis}"]
+                value = float(p[0] - p[1] + p[2] - p[3])
+            elif target_basis == "I":
+                p = probabilities[f"{control_basis}Z"]
+                value = float(p[0] + p[1] - p[2] - p[3])
+            else:
+                p = probabilities[basis]
+                value = float(p[0] - p[1] - p[2] + p[3])
+            expected_values[basis] = value
+            rho += value * np.kron(control_pauli, target_pauli)
+    rho = mle_fit_density_matrix(expected_values) if mle_fit else rho / 4
+    bell = np.array([[1], [0], [0], [1]], dtype=np.complex128) / np.sqrt(2)
+    fidelity = float(np.real(bell.T.conj() @ rho @ bell).item())
+    fig = plot_ghz_state_tomography(
+        rho=rho,
+        qubits=[control_label, target_label],
+        fidelity=fidelity,
+        plot=plot,
+        save_image=save_image,
+        width=600,
+        height=366,
+        file_name=(
+            f"spectator_stark_bell_tomography_{control_label}-{target_label}"
+            f"_under_{spectator_label}"
+        ),
+    )["figure"]
+    return Result(
+        data={
+            "probabilities": probabilities,
+            "expected_values": expected_values,
+            "density_matrix": rho,
+            "fidelity": fidelity,
+            # TODO: Remove this legacy payload key after callers migrate to .figure.
+            "figure": fig,
+        },
+        figure=fig,
+    )
+
+
+def spectator_stark_rb_experiment_2q(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    n_cliffords_range: ArrayLike | None = None,
+    n_trials: int | None = None,
+    seeds: ArrayLike | None = None,
+    max_n_cliffords: int | None = None,
+    x90: TargetMap[Waveform] | None = None,
+    zx90: PulseSchedule | None = None,
+    interleaved_clifford: str | Clifford | None = None,
+    interleaved_waveform: PulseSchedule | None = None,
+    mitigate_readout: bool = True,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    plot: bool = True,
+    save_image: bool = True,
+    reset_awg_and_capunits: bool = True,
+) -> Result:
+    """Run bare-pair 2Q RB under a spectator Stark tone."""
+    control_label = exp.ctx.resolve_qubit_label(control_qubit)
+    target_label = exp.ctx.resolve_qubit_label(target_qubit)
+    spectator_label = exp.ctx.resolve_qubit_label(spectator_qubit)
+    result_target = spectator_stark_cr_target(
+        exp,
+        control_label,
+        target_label,
+        spectator_label,
+    )
+    n_trials = DEFAULT_RB_N_TRIALS if n_trials is None else n_trials
+    max_n_cliffords = (
+        DEFAULT_MAX_N_CLIFFORDS_2Q if max_n_cliffords is None else max_n_cliffords
+    )
+    n_shots = DEFAULT_SHOTS if n_shots is None else n_shots
+    shot_interval = DEFAULT_INTERVAL if shot_interval is None else shot_interval
+    seed_values = (
+        np.random.default_rng().integers(0, 2**32, n_trials)
+        if seeds is None
+        else np.asarray(seeds, dtype=int)
+    )
+    if len(seed_values) != n_trials:
+        raise ValueError("The number of seeds must equal `n_trials`.")
+    sweep_range = _clifford_sweep_range(
+        n_cliffords_range=n_cliffords_range,
+        max_n_cliffords=max_n_cliffords,
+    )
+    if reset_awg_and_capunits:
+        exp.ctx.reset_awg_and_capunits(
+            qubits=[control_label, target_label, spectator_label]
+        )
+    means: list[float] = []
+    stds: list[float] = []
+    actual: list[int] = []
+    for n_clifford in sweep_range:
+        trials: list[float] = []
+        for seed in seed_values:
+            sequence = spectator_stark_rb_sequence_2q(
+                exp,
+                control_label,
+                target_label,
+                spectator_label,
+                stark_amplitude=stark_amplitude,
+                stark_ramptime=stark_ramptime,
+                n=int(n_clifford),
+                seed=int(seed),
+                x90=x90,
+                zx90=zx90,
+                interleaved_clifford=interleaved_clifford,
+                interleaved_waveform=interleaved_waveform,
+                plot=False,
+            )
+            measured = exp.measurement_service.measure(
+                sequence,
+                mode="single",
+                n_shots=n_shots,
+                shot_interval=shot_interval,
+                reset_awg_and_capunits=False,
+                plot=False,
+            )
+            probabilities = (
+                measured.get_mitigated_probabilities([control_label, target_label])
+                if mitigate_readout
+                else measured.get_probabilities([control_label, target_label])
+            )
+            trials.append(probabilities["00"])
+        means.append(float(np.mean(trials)))
+        stds.append(float(np.std(trials)))
+        actual.append(int(n_clifford))
+    actual_array = np.asarray(actual, dtype=int)
+    mean_array = np.asarray(means)
+    std_array = np.asarray(stds) if n_trials > 1 else None
+    fit_result = fitting.fit_rb(
+        target=result_target,
+        x=actual_array,
+        y=mean_array,
+        error_y=std_array,
+        dimension=4,
+        title="Spectator Stark two-qubit randomized benchmarking",
+        xlabel="Number of Cliffords",
+        ylabel="Normalized signal",
+        xaxis_type="linear",
+        yaxis_type="linear",
+        plot=plot,
+    )
+    fig = fit_result.get_figure()
+    if save_image:
+        viz.save_figure(fig, name=f"spectator_stark_rb_2q_{result_target}")
+    return Result(
+        data={
+            result_target: {
+                "n_cliffords": actual_array,
+                "mean": mean_array,
+                "std": std_array,
+                **fit_result,
+            }
+        },
+        figures={result_target: fig},
+    )
+
+
+def spectator_stark_interleaved_randomized_benchmarking_2q(
+    exp: Experiment,
+    control_qubit: str,
+    target_qubit: str,
+    spectator_qubit: str,
+    *,
+    stark_amplitude: float,
+    interleaved_clifford: str | Clifford,
+    stark_ramptime: float | None = None,
+    interleaved_waveform: PulseSchedule | None = None,
+    n_cliffords_range: ArrayLike | None = None,
+    n_trials: int | None = None,
+    seeds: ArrayLike | None = None,
+    max_n_cliffords: int | None = None,
+    x90: TargetMap[Waveform] | None = None,
+    zx90: PulseSchedule | None = None,
+    mitigate_readout: bool = True,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    plot: bool = True,
+    save_image: bool = True,
+) -> Result:
+    """Run bare-pair 2Q IRB under a spectator Stark tone."""
+    clifford = _resolve_clifford(exp, interleaved_clifford)
+    resolved_n_trials = DEFAULT_RB_N_TRIALS if n_trials is None else n_trials
+    resolved_seeds = (
+        np.random.default_rng().integers(0, 2**32, resolved_n_trials)
+        if seeds is None
+        else np.asarray(seeds, dtype=int)
+    )
+    if len(resolved_seeds) != resolved_n_trials:
+        raise ValueError("The number of seeds must equal `n_trials`.")
+    target = spectator_stark_cr_target(
+        exp,
+        control_qubit,
+        target_qubit,
+        spectator_qubit,
+    )
+
+    def run(
+        *,
+        interleaved: Clifford | None = None,
+        waveform: PulseSchedule | None = None,
+    ) -> Result:
+        return spectator_stark_rb_experiment_2q(
+            exp=exp,
+            control_qubit=control_qubit,
+            target_qubit=target_qubit,
+            spectator_qubit=spectator_qubit,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            n_cliffords_range=n_cliffords_range,
+            n_trials=resolved_n_trials,
+            seeds=resolved_seeds,
+            max_n_cliffords=max_n_cliffords,
+            x90=x90,
+            zx90=zx90,
+            interleaved_clifford=interleaved,
+            interleaved_waveform=waveform,
+            mitigate_readout=mitigate_readout,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            plot=False,
+            save_image=False,
+        )
+
+    rb_result = run()
+    irb_result = run(interleaved=clifford, waveform=interleaved_waveform)
+    result = _interleaved_fit_result(
+        target=target,
+        reference_result=rb_result,
+        interleaved_result=irb_result,
+        clifford=clifford,
+        plot=plot,
+        save_image=save_image,
+        image_name=f"spectator_stark_irb_2q_{target}",
+        title_prefix="Spectator Stark 2Q interleaved randomized benchmarking",
+        dimension=4,
+    )
+    target_result = dict(cast(Mapping[str, Any], result.data[target]))
+    target_result["fig"] = result.figures[target] if result.figures else result.figure
+    return Result(
+        data={target: target_result},
+        figures=result.figures,
+    )
+
+
 def calibrate_stark_default_pulse(
     exp: Experiment,
     target: str,
@@ -5655,11 +8930,220 @@ def calibrate_stark_pi_pulse(
     )
 
 
+def calibrate_spectator_stark_default_pulse(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    pulse_type: Literal["pi", "hpi"],
+    stark_ramptime: float | None = None,
+    duration: float | None = None,
+    ramptime: float | None = None,
+    n_points: int = 20,
+    n_rotations: int = 1,
+    amplitude_range: ArrayLike | None = None,
+    r2_threshold: float = 0.5,
+    update_params: bool = True,
+    plot: bool = True,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    **deprecated_options: Any,
+) -> ExperimentResult[AmplCalibData]:
+    """
+    Calibrate ``target`` pulses while ``stark_drive_target`` is Stark-dressed.
+
+    Calibrated pi/half-pi parameters are stored under
+    :func:`spectator_stark_target` so they do not overwrite bare or same-qubit
+    Stark calibrations.
+    """
+    n_shots, shot_interval = resolve_shot_options(
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        deprecated_options=deprecated_options,
+        function_name="calibrate_spectator_stark_default_pulse",
+    )
+    if n_shots is None:
+        n_shots = CALIBRATION_SHOTS
+    if shot_interval is None:
+        shot_interval = DEFAULT_INTERVAL
+
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    exp.pulse.validate_rabi_params([control_label])
+    stark_ramptime = _resolve_stark_ramptime(stark_ramptime)
+    stark_power = _stark_drive_amplitude(
+        exp,
+        target=stark_drive_target,
+        stark_amplitude=stark_amplitude,
+    )
+    sampling_period = _measurement_sampling_period(exp)
+
+    if pulse_type == "hpi":
+        pulse = FlatTop(
+            duration=duration if duration is not None else HPI_DURATION,
+            amplitude=1,
+            tau=ramptime if ramptime is not None else HPI_RAMPTIME,
+        )
+        rabi_rate = 0.25 / _pulse_area(pulse, sampling_period)
+    elif pulse_type == "pi":
+        pulse = FlatTop(
+            duration=duration if duration is not None else PI_DURATION,
+            amplitude=1,
+            tau=ramptime if ramptime is not None else PI_RAMPTIME,
+        )
+        rabi_rate = 0.5 / _pulse_area(pulse, sampling_period)
+    else:
+        raise ValueError("`pulse_type` must be 'pi' or 'hpi'.")
+
+    n_per_rotation = 2 if pulse_type == "pi" else 4
+    estimated_amplitude = exp.pulse.calc_control_amplitude(control_label, rabi_rate)
+    sweep_range = _amplitude_sweep(
+        center=estimated_amplitude,
+        n_points=n_points,
+        n_rotations=n_rotations,
+        amplitude_range=amplitude_range,
+    )
+
+    def sequence(amplitude: float) -> PulseSchedule:
+        control_sequence = pulse.scaled(amplitude).repeated(
+            n_per_rotation * n_rotations
+        )
+        return _stark_wrapped_schedule(
+            stark_label=stark_target(exp, stark_drive_target),
+            insitu_label=control_label,
+            stark_amplitude=stark_power,
+            stark_ramptime=stark_ramptime,
+            insitu_sequence=control_sequence,
+        )
+
+    sweep_data = exp.measurement_service.sweep_parameter(
+        sequence=sequence,
+        sweep_range=sweep_range,
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        plot=False,
+    ).data[target]
+
+    fit_result = fitting.fit_ampl_calib_data(
+        target=control_label,
+        amplitude_range=sweep_range,
+        data=sweep_data.normalized,
+        plot=plot,
+        title=f"Spectator Stark {pulse_type} pulse calibration",
+        ylabel="Normalized signal",
+    )
+
+    r2 = fit_result["r2"]
+    if r2 > r2_threshold and update_params:
+        params = FlatTopParam(
+            target=control_label,
+            duration=pulse.duration,
+            amplitude=fit_result["amplitude"],
+            tau=pulse.tau,
+        )
+        if pulse_type == "hpi":
+            exp.ctx.calib_note.update_hpi_param(control_label, params)
+        else:
+            exp.ctx.calib_note.update_pi_param(control_label, params)
+    elif r2 <= r2_threshold:
+        print(f"Error: R² value is too low ({r2:.3f})")
+        print(f"Calibration data not stored for {control_label}.")
+
+    return ExperimentResult(
+        data={
+            target: AmplCalibData.new(
+                sweep_data=sweep_data,
+                calib_value=fit_result["amplitude"],
+                r2=r2,
+            )
+        }
+    )
+
+
+def calibrate_spectator_stark_hpi_pulse(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    duration: float | None = None,
+    ramptime: float | None = None,
+    amplitude_range: ArrayLike | None = None,
+    n_points: int = 20,
+    n_rotations: int = 1,
+    r2_threshold: float = 0.5,
+    plot: bool = True,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    **deprecated_options: Any,
+) -> ExperimentResult[AmplCalibData]:
+    """Calibrate a half-pi pulse under another qubit's Stark drive."""
+    return calibrate_spectator_stark_default_pulse(
+        exp,
+        target=target,
+        stark_drive_target=stark_drive_target,
+        pulse_type="hpi",
+        stark_amplitude=stark_amplitude,
+        stark_ramptime=stark_ramptime,
+        duration=duration,
+        ramptime=ramptime,
+        amplitude_range=amplitude_range,
+        n_points=n_points,
+        n_rotations=n_rotations,
+        r2_threshold=r2_threshold,
+        plot=plot,
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        **deprecated_options,
+    )
+
+
+def calibrate_spectator_stark_pi_pulse(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    duration: float | None = None,
+    ramptime: float | None = None,
+    amplitude_range: ArrayLike | None = None,
+    n_points: int = 20,
+    n_rotations: int = 1,
+    r2_threshold: float = 0.5,
+    plot: bool = True,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    **deprecated_options: Any,
+) -> ExperimentResult[AmplCalibData]:
+    """Calibrate a pi pulse under another qubit's Stark drive."""
+    return calibrate_spectator_stark_default_pulse(
+        exp,
+        target=target,
+        stark_drive_target=stark_drive_target,
+        pulse_type="pi",
+        stark_amplitude=stark_amplitude,
+        stark_ramptime=stark_ramptime,
+        duration=duration,
+        ramptime=ramptime,
+        amplitude_range=amplitude_range,
+        n_points=n_points,
+        n_rotations=n_rotations,
+        r2_threshold=r2_threshold,
+        plot=plot,
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        **deprecated_options,
+    )
+
+
 def _build_drag_pulse_for_calibration(
     exp: Experiment,
     *,
     target: str,
     insitu_label: str,
+    rabi_target: str | None = None,
     pulse_type: Literal["pi", "hpi"],
     duration: float | None,
     drag_coeff: float,
@@ -5695,7 +9179,7 @@ def _build_drag_pulse_for_calibration(
     if stored is not None and use_stored_amplitude:
         amplitude = float(stored["amplitude"])
     else:
-        amplitude = exp.pulse.calc_control_amplitude(target, rabi_rate)
+        amplitude = exp.pulse.calc_control_amplitude(rabi_target or target, rabi_rate)
     return pulse, amplitude
 
 
@@ -6045,6 +9529,1022 @@ def calibrate_stark_drag_pi_pulse(
         else:
             beta = {target: -drag_coeff / exp.ctx.qubits[target].alpha}
     return Result(data={"amplitude": amplitude, "beta": beta})
+
+
+def calibrate_spectator_stark_drag_amplitude(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    pulse_type: Literal["pi", "hpi"],
+    stark_ramptime: float | None = None,
+    duration: float | None = None,
+    n_points: int = 20,
+    n_rotations: int = 4,
+    amplitude_range: ArrayLike | None = None,
+    r2_threshold: float = 0.5,
+    drag_coeff: float = DRAG_COEFF,
+    use_stored_amplitude: bool = False,
+    use_stored_beta: bool = False,
+    plot: bool = True,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    **deprecated_options: Any,
+) -> Result:
+    """Calibrate DRAG amplitude under another qubit's Stark drive."""
+    n_shots, shot_interval = resolve_shot_options(
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        deprecated_options=deprecated_options,
+        function_name="calibrate_spectator_stark_drag_amplitude",
+    )
+    if n_shots is None:
+        n_shots = CALIBRATION_SHOTS
+    if shot_interval is None:
+        shot_interval = DEFAULT_INTERVAL
+
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    exp.pulse.validate_rabi_params([control_label])
+    stark_ramptime = _resolve_stark_ramptime(stark_ramptime)
+    stark_power = _stark_drive_amplitude(
+        exp,
+        target=stark_drive_target,
+        stark_amplitude=stark_amplitude,
+    )
+    pulse, estimated_amplitude = _build_drag_pulse_for_calibration(
+        exp,
+        target=target,
+        insitu_label=control_label,
+        rabi_target=control_label,
+        pulse_type=pulse_type,
+        duration=duration,
+        drag_coeff=drag_coeff,
+        use_stored_amplitude=use_stored_amplitude,
+        use_stored_beta=use_stored_beta,
+    )
+    sweep_range = _amplitude_sweep(
+        center=estimated_amplitude,
+        n_points=n_points,
+        n_rotations=n_rotations,
+        amplitude_range=amplitude_range,
+    )
+    n_per_rotation = 2 if pulse_type == "pi" else 4
+
+    def sequence(amplitude: float) -> PulseSchedule:
+        control_sequence = pulse.scaled(amplitude).repeated(
+            n_per_rotation * n_rotations
+        )
+        return _stark_wrapped_schedule(
+            stark_label=stark_target(exp, stark_drive_target),
+            insitu_label=control_label,
+            stark_amplitude=stark_power,
+            stark_ramptime=stark_ramptime,
+            insitu_sequence=control_sequence,
+        )
+
+    sweep_data = exp.measurement_service.sweep_parameter(
+        sequence=sequence,
+        sweep_range=sweep_range,
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        plot=False,
+    ).data[target]
+
+    fit_result = fitting.fit_ampl_calib_data(
+        target=control_label,
+        amplitude_range=sweep_range,
+        data=sweep_data.normalized,
+        plot=plot,
+        title=f"Spectator Stark DRAG {pulse_type} amplitude calibration",
+        ylabel="Normalized signal",
+    )
+
+    r2 = fit_result["r2"]
+    if r2 > r2_threshold:
+        params = DragParam(
+            target=control_label,
+            duration=pulse.duration,
+            amplitude=fit_result["amplitude"],
+            beta=pulse.beta,
+        )
+        if pulse_type == "hpi":
+            exp.ctx.calib_note.update_drag_hpi_param(control_label, params)
+        else:
+            exp.ctx.calib_note.update_drag_pi_param(control_label, params)
+    else:
+        print(f"Error: R² value is too low ({r2:.3f})")
+        print(f"Calibration data not stored for {control_label}.")
+
+    return Result(data={target: fit_result})
+
+
+def calibrate_spectator_stark_drag_beta(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    pulse_type: Literal["pi", "hpi"] = "hpi",
+    stark_ramptime: float | None = None,
+    beta_range: ArrayLike | None = None,
+    duration: float | None = None,
+    n_turns: int = 1,
+    degree: int = 3,
+    plot: bool = True,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    **deprecated_options: Any,
+) -> Result:
+    """Calibrate DRAG beta under another qubit's Stark drive."""
+    n_shots, shot_interval = resolve_shot_options(
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        deprecated_options=deprecated_options,
+        function_name="calibrate_spectator_stark_drag_beta",
+    )
+    if n_shots is None:
+        n_shots = CALIBRATION_SHOTS
+    if shot_interval is None:
+        shot_interval = DEFAULT_INTERVAL
+    if beta_range is None:
+        beta_range = np.linspace(-2.0, 2.0, 20)
+
+    exp.pulse.validate_rabi_params([target])
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    stark_ramptime = _resolve_stark_ramptime(stark_ramptime)
+    stark_power = _stark_drive_amplitude(
+        exp,
+        target=stark_drive_target,
+        stark_amplitude=stark_amplitude,
+    )
+
+    if pulse_type == "hpi":
+        param = exp.ctx.calib_note.get_drag_hpi_param(control_label)
+    elif pulse_type == "pi":
+        param = exp.ctx.calib_note.get_drag_pi_param(control_label)
+    else:
+        raise ValueError("`pulse_type` must be 'pi' or 'hpi'.")
+    if param is None:
+        raise ValueError(f"DRAG parameters are not stored for `{control_label}`.")
+
+    drag_duration = duration if duration is not None else param["duration"]
+    drag_amplitude = param["amplitude"]
+    sweep_range = np.asarray(beta_range, dtype=float) + param["beta"]
+
+    def drag_sequence(beta: float) -> PulseArray:
+        if pulse_type == "hpi":
+            x90p = Drag(duration=drag_duration, amplitude=drag_amplitude, beta=beta)
+            x90m = x90p.scaled(-1)
+            y90m = exp.pulse.get_hpi_pulse(control_label).shifted(-np.pi / 2)
+            return PulseArray([x90p, PulseArray([x90m, x90p] * n_turns), y90m])
+        x180p = Drag(duration=drag_duration, amplitude=drag_amplitude, beta=beta)
+        x180m = x180p.scaled(-1)
+        y90m = exp.pulse.get_hpi_pulse(control_label).shifted(-np.pi / 2)
+        return PulseArray([PulseArray([x180p, x180m] * n_turns), y90m])
+
+    def sequence(beta: float) -> PulseSchedule:
+        return _stark_wrapped_schedule(
+            stark_label=stark_target(exp, stark_drive_target),
+            insitu_label=control_label,
+            stark_amplitude=stark_power,
+            stark_ramptime=stark_ramptime,
+            insitu_sequence=drag_sequence(beta),
+        )
+
+    sweep_data = exp.measurement_service.sweep_parameter(
+        sequence=sequence,
+        sweep_range=sweep_range,
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        plot=False,
+    ).data[target]
+
+    fit_result = fitting.fit_polynomial(
+        target=control_label,
+        x=sweep_range,
+        y=sweep_data.normalized,
+        degree=degree,
+        plot=plot,
+        title=f"Spectator Stark DRAG {pulse_type} beta calibration",
+        xlabel="Beta",
+        ylabel="Normalized signal",
+    )
+    beta = fit_result["root"]
+    if np.isnan(beta):
+        beta = 0.0
+
+    params = DragParam(
+        target=control_label,
+        duration=drag_duration,
+        amplitude=drag_amplitude,
+        beta=beta,
+    )
+    if pulse_type == "hpi":
+        exp.ctx.calib_note.update_drag_hpi_param(control_label, params)
+    else:
+        exp.ctx.calib_note.update_drag_pi_param(control_label, params)
+
+    return Result(data={target: beta})
+
+
+def calibrate_spectator_stark_drag_hpi_pulse(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    n_points: int = 20,
+    n_rotations: int = 4,
+    n_turns: int = 1,
+    n_iterations: int = 2,
+    amplitude_range: ArrayLike | None = None,
+    degree: int = 3,
+    r2_threshold: float = 0.5,
+    calibrate_beta: bool = True,
+    beta_range: ArrayLike | None = None,
+    duration: float | None = None,
+    drag_coeff: float = DRAG_COEFF,
+    plot: bool = True,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    **deprecated_options: Any,
+) -> Result:
+    """Run iterative DRAG half-pi calibration under spectator Stark drive."""
+    amplitude: Result | None = None
+    beta: Result | dict[str, float] | None = None
+    for index in range(n_iterations):
+        print(f"\nIteration {index + 1}/{n_iterations}")
+        amplitude = calibrate_spectator_stark_drag_amplitude(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            pulse_type="hpi",
+            n_points=n_points,
+            n_rotations=1 if index == 0 else n_rotations,
+            amplitude_range=None if index == 0 else amplitude_range,
+            r2_threshold=r2_threshold,
+            duration=duration,
+            drag_coeff=drag_coeff,
+            use_stored_amplitude=index > 0,
+            use_stored_beta=index > 0,
+            plot=plot,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            **deprecated_options,
+        )
+        if calibrate_beta:
+            beta = calibrate_spectator_stark_drag_beta(
+                exp,
+                target=target,
+                stark_drive_target=stark_drive_target,
+                stark_amplitude=stark_amplitude,
+                stark_ramptime=stark_ramptime,
+                pulse_type="hpi",
+                beta_range=beta_range,
+                n_turns=n_turns,
+                duration=duration,
+                degree=degree,
+                plot=plot,
+                n_shots=n_shots,
+                shot_interval=shot_interval,
+                **deprecated_options,
+            )
+        else:
+            beta = {target: -drag_coeff / exp.ctx.qubits[target].alpha}
+    return Result(data={"amplitude": amplitude, "beta": beta})
+
+
+def calibrate_spectator_stark_drag_pi_pulse(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    n_points: int = 20,
+    n_rotations: int = 4,
+    n_turns: int = 1,
+    n_iterations: int = 2,
+    amplitude_range: ArrayLike | None = None,
+    degree: int = 3,
+    r2_threshold: float = 0.5,
+    calibrate_beta: bool = True,
+    beta_range: ArrayLike | None = None,
+    duration: float | None = None,
+    drag_coeff: float = DRAG_COEFF,
+    plot: bool = True,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    **deprecated_options: Any,
+) -> Result:
+    """Run iterative DRAG pi calibration under spectator Stark drive."""
+    amplitude: Result | None = None
+    beta: Result | dict[str, float] | None = None
+    for index in range(n_iterations):
+        print(f"\nIteration {index + 1}/{n_iterations}")
+        amplitude = calibrate_spectator_stark_drag_amplitude(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            pulse_type="pi",
+            n_points=n_points,
+            n_rotations=1 if index == 0 else n_rotations,
+            amplitude_range=amplitude_range,
+            r2_threshold=r2_threshold,
+            duration=duration,
+            drag_coeff=drag_coeff,
+            use_stored_amplitude=index > 0,
+            use_stored_beta=index > 0,
+            plot=plot,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            **deprecated_options,
+        )
+        if calibrate_beta:
+            beta = calibrate_spectator_stark_drag_beta(
+                exp,
+                target=target,
+                stark_drive_target=stark_drive_target,
+                stark_amplitude=stark_amplitude,
+                stark_ramptime=stark_ramptime,
+                pulse_type="pi",
+                beta_range=beta_range,
+                n_turns=n_turns,
+                duration=duration,
+                degree=degree,
+                plot=plot,
+                n_shots=n_shots,
+                shot_interval=shot_interval,
+                **deprecated_options,
+            )
+        else:
+            beta = {target: -drag_coeff / exp.ctx.qubits[target].alpha}
+    return Result(data={"amplitude": amplitude, "beta": beta})
+
+
+def _spectator_stark_control_measurement_sequence(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    control_sequence: Waveform | PulseArray,
+    stark_ramptime: float | None = None,
+    readout_amplitudes: Mapping[str, float] | None = None,
+    readout_duration: float | None = None,
+    readout_pre_margin: float | None = None,
+    readout_post_margin: float | None = None,
+    readout_ramp_time: float | None = None,
+    readout_drag_coeff: float | None = None,
+    readout_ramp_type: RampType | None = None,
+    title: str,
+    plot: bool,
+) -> PulseSchedule:
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    readout_label = exp.ctx.resolve_read_label(target)
+    stark_power = _stark_drive_amplitude(
+        exp,
+        target=stark_drive_target,
+        stark_amplitude=stark_amplitude,
+    )
+    resolved_stark_ramptime = _resolve_stark_ramptime(stark_ramptime)
+    resolved_readout_pre_margin = (
+        exp.pulse.readout_pre_margin
+        if readout_pre_margin is None
+        else float(readout_pre_margin)
+    )
+    readout_pulse = exp.pulse.readout(
+        readout_label,
+        duration=readout_duration,
+        amplitude=_readout_amplitude_override(
+            exp,
+            target=target,
+            readout_label=readout_label,
+            readout_amplitudes=readout_amplitudes,
+        ),
+        pre_margin=resolved_readout_pre_margin,
+        post_margin=readout_post_margin,
+        ramp_time=readout_ramp_time,
+        ramp_type=readout_ramp_type,
+        drag_coeff=readout_drag_coeff,
+    )
+    capture_start_time = (
+        resolved_stark_ramptime
+        + control_sequence.duration
+        + resolved_readout_pre_margin
+    )
+    readout_start_padding = _duration_to_next_multiple(
+        capture_start_time,
+        _measurement_word_duration(exp),
+    )
+    with PulseSchedule(
+        [stark_target(exp, stark_drive_target), control_label, readout_label]
+    ) as ps:
+        ps.add(
+            stark_target(exp, stark_drive_target),
+            FlatTop(
+                duration=(
+                    control_sequence.duration
+                    + readout_start_padding
+                    + readout_pulse.duration
+                    + 2 * resolved_stark_ramptime
+                ),
+                amplitude=stark_power,
+                tau=resolved_stark_ramptime,
+            ),
+        )
+        ps.add(control_label, Blank(resolved_stark_ramptime))
+        ps.add(control_label, control_sequence)
+        ps.add(
+            readout_label,
+            Blank(
+                resolved_stark_ramptime
+                + control_sequence.duration
+                + readout_start_padding
+            ),
+        )
+        ps.add(readout_label, readout_pulse)
+    return _plot_sequence_sample(ps, title=title, plot=plot)
+
+
+def spectator_stark_t1_sequence(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    wait_time: int = 1000,
+    stark_ramptime: float | None = None,
+    plot: bool = True,
+) -> PulseSchedule:
+    """Build one T1 sequence for target while another qubit is Stark-driven."""
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    x180 = exp.pulse.get_hpi_pulse(control_label).repeated(2)
+    return _spectator_stark_control_measurement_sequence(
+        exp,
+        target=target,
+        stark_drive_target=stark_drive_target,
+        stark_amplitude=stark_amplitude,
+        stark_ramptime=stark_ramptime,
+        control_sequence=PulseArray([x180, Blank(wait_time)]),
+        title=(
+            "Spectator Stark T1 sample: "
+            f"{target} under {stark_drive_target} Stark, wait={wait_time} ns"
+        ),
+        plot=plot,
+    )
+
+
+def spectator_stark_t2_sequence(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    wait_time: int = 1000,
+    stark_ramptime: float | None = None,
+    plot: bool = True,
+) -> PulseSchedule:
+    """Build one echo T2 sequence for target while another qubit is Stark-driven."""
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    x90 = exp.pulse.get_hpi_pulse(control_label)
+    x180 = x90.shifted(np.pi / 2).repeated(2)
+    half_wait = wait_time // 2
+    return _spectator_stark_control_measurement_sequence(
+        exp,
+        target=target,
+        stark_drive_target=stark_drive_target,
+        stark_amplitude=stark_amplitude,
+        stark_ramptime=stark_ramptime,
+        control_sequence=PulseArray(
+            [x90, Blank(half_wait), x180, Blank(half_wait), x90.scaled(-1)]
+        ),
+        title=(
+            "Spectator Stark T2 echo sample: "
+            f"{target} under {stark_drive_target} Stark, wait={wait_time} ns"
+        ),
+        plot=plot,
+    )
+
+
+def spectator_stark_ramsey_sequence(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    wait_time: int = 1000,
+    stark_ramptime: float | None = None,
+    second_rotation_axis: Literal["X", "Y"] = "Y",
+    plot: bool = True,
+) -> PulseSchedule:
+    """Build one Ramsey sequence for target while another qubit is Stark-driven."""
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    x90 = exp.pulse.get_hpi_pulse(control_label)
+    second_pulse = (
+        x90.shifted(np.pi) if second_rotation_axis == "X" else x90.shifted(-np.pi / 2)
+    )
+    return _spectator_stark_control_measurement_sequence(
+        exp,
+        target=target,
+        stark_drive_target=stark_drive_target,
+        stark_amplitude=stark_amplitude,
+        stark_ramptime=stark_ramptime,
+        control_sequence=PulseArray([x90, Blank(wait_time), second_pulse]),
+        title=(
+            "Spectator Stark Ramsey sample: "
+            f"{target} under {stark_drive_target} Stark, "
+            f"wait={wait_time} ns, axis={second_rotation_axis}"
+        ),
+        plot=plot,
+    )
+
+
+def spectator_stark_t1_experiment(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    time_range: ArrayLike | None = None,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    plot: bool = True,
+    save_image: bool = False,
+    xaxis_type: Literal["linear", "log"] = "log",
+    **deprecated_options: Any,
+) -> ExperimentResult[T1Data]:
+    """Measure T1 of target while another qubit is Stark-driven."""
+    n_shots, shot_interval = resolve_shot_options(
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        deprecated_options=deprecated_options,
+        function_name="spectator_stark_t1_experiment",
+    )
+    if n_shots is None:
+        n_shots = DEFAULT_SHOTS
+    if shot_interval is None:
+        shot_interval = DEFAULT_INTERVAL
+    if time_range is None:
+        time_range = np.logspace(np.log10(100), np.log10(200 * 1000), 51)
+    sweep_range = exp.ctx.util.discretize_time_range(np.asarray(time_range))
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+
+    def sequence(wait_time: float) -> PulseSchedule:
+        return spectator_stark_t1_sequence(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            stark_amplitude=stark_amplitude,
+            wait_time=int(wait_time),
+            stark_ramptime=stark_ramptime,
+            plot=False,
+        )
+
+    sweep_result = _run_spectator_stark_rabi_sweep(
+        exp,
+        sequence=sequence,
+        sweep_range=sweep_range,
+        frequencies=None,
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        plot=plot,
+        title="Spectator Stark T1",
+        xlabel="Time (ns)",
+        ylabel="Measured value",
+    )
+    _apply_spectator_stark_rabi_param(
+        exp,
+        sweep_result=sweep_result,
+        target=target,
+        control_label=control_label,
+    )
+
+    data: dict[str, T1Data] = {}
+    for qubit, sweep_data in sweep_result.data.items():
+        fit_result = fitting.fit_exp_decay(
+            target=qubit,
+            x=sweep_data.sweep_range,
+            y=0.5 * (1 - sweep_data.normalized),
+            plot=plot,
+            title="Spectator Stark T1",
+            xlabel="Time (ns)",
+            ylabel="Normalized signal",
+            xaxis_type=xaxis_type,
+            yaxis_type="linear",
+        )
+        if fit_result.status is not FitStatus.SUCCESS:
+            continue
+        data[qubit] = T1Data.new(
+            sweep_data,
+            t1=fit_result["tau"],
+            t1_err=fit_result["tau_err"],
+            r2=fit_result["r2"],
+        )
+        if save_image:
+            viz.save_figure(
+                fit_result.get_figure(),
+                name=f"spectator_stark_t1_{qubit}_under_{stark_drive_target}",
+            )
+    return ExperimentResult(data=data)
+
+
+def spectator_stark_t2_experiment(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    time_range: ArrayLike | None = None,
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    xaxis_type: Literal["linear", "log"] = "log",
+    plot: bool = True,
+    save_image: bool = False,
+    **deprecated_options: Any,
+) -> ExperimentResult[T2Data]:
+    """Measure echo T2 of target while another qubit is Stark-driven."""
+    n_shots, shot_interval = resolve_shot_options(
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        deprecated_options=deprecated_options,
+        function_name="spectator_stark_t2_experiment",
+    )
+    if n_shots is None:
+        n_shots = DEFAULT_SHOTS
+    if shot_interval is None:
+        shot_interval = DEFAULT_INTERVAL
+    if time_range is None:
+        time_range = np.logspace(np.log10(300), np.log10(200 * 1000), 51)
+    sweep_range = exp.ctx.util.discretize_time_range(
+        np.asarray(time_range),
+        sampling_period=2 * _measurement_sampling_period(exp),
+    )
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+
+    def sequence(wait_time: float) -> PulseSchedule:
+        return spectator_stark_t2_sequence(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            stark_amplitude=stark_amplitude,
+            wait_time=int(wait_time),
+            stark_ramptime=stark_ramptime,
+            plot=False,
+        )
+
+    sweep_result = _run_spectator_stark_rabi_sweep(
+        exp,
+        sequence=sequence,
+        sweep_range=sweep_range,
+        frequencies=None,
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        plot=plot,
+        title="Spectator Stark T2 echo",
+        xlabel="Time (ns)",
+        ylabel="Measured value",
+    )
+    _apply_spectator_stark_rabi_param(
+        exp,
+        sweep_result=sweep_result,
+        target=target,
+        control_label=control_label,
+    )
+
+    data: dict[str, T2Data] = {}
+    for qubit, sweep_data in sweep_result.data.items():
+        fit_result = fitting.fit_exp_decay(
+            target=qubit,
+            x=sweep_data.sweep_range,
+            y=0.5 * (1 + sweep_data.normalized),
+            plot=plot,
+            title="Spectator Stark T2 echo",
+            xlabel="Time (ns)",
+            ylabel="Normalized signal",
+            xaxis_type=xaxis_type,
+            yaxis_type="linear",
+        )
+        if fit_result.status is not FitStatus.SUCCESS:
+            continue
+        data[qubit] = T2Data.new(
+            sweep_data,
+            t2=fit_result["tau"],
+            t2_err=fit_result["tau_err"],
+            r2=fit_result["r2"],
+        )
+        if save_image:
+            viz.save_figure(
+                fit_result.get_figure(),
+                name=f"spectator_stark_t2_{qubit}_under_{stark_drive_target}",
+            )
+    return ExperimentResult(data=data)
+
+
+def spectator_stark_ramsey_experiment(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    time_range: ArrayLike | None = None,
+    detuning: float | None = None,
+    second_rotation_axis: Literal["X", "Y"] = "Y",
+    n_shots: int | None = None,
+    shot_interval: float | None = None,
+    plot: bool = True,
+    save_image: bool = False,
+    **deprecated_options: Any,
+) -> ExperimentResult[RamseyData]:
+    """Measure Ramsey of target while another qubit is Stark-driven."""
+    n_shots, shot_interval = resolve_shot_options(
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        deprecated_options=deprecated_options,
+        function_name="spectator_stark_ramsey_experiment",
+    )
+    if n_shots is None:
+        n_shots = CALIBRATION_SHOTS
+    if shot_interval is None:
+        shot_interval = DEFAULT_INTERVAL
+    if detuning is None:
+        detuning = 0.001
+    if time_range is None:
+        sweep_range = np.arange(0, 10001, 100)
+    else:
+        sweep_range = exp.ctx.util.discretize_time_range(np.asarray(time_range))
+
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    dressed_frequency = exp.targets[control_label].frequency
+
+    def sequence(wait_time: float) -> PulseSchedule:
+        return spectator_stark_ramsey_sequence(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            stark_amplitude=stark_amplitude,
+            wait_time=int(wait_time),
+            stark_ramptime=stark_ramptime,
+            second_rotation_axis=second_rotation_axis,
+            plot=False,
+        )
+
+    with exp.modified_frequencies(
+        frequencies={control_label: dressed_frequency + detuning}
+    ):
+        sweep_result = _run_spectator_stark_rabi_sweep(
+            exp,
+            sequence=sequence,
+            sweep_range=sweep_range,
+            frequencies=None,
+            n_shots=n_shots,
+            shot_interval=shot_interval,
+            plot=plot,
+            title="Spectator Stark Ramsey",
+            xlabel="Time (ns)",
+            ylabel="Measured value",
+        )
+    _apply_spectator_stark_rabi_param(
+        exp,
+        sweep_result=sweep_result,
+        target=target,
+        control_label=control_label,
+    )
+
+    data: dict[str, RamseyData] = {}
+    for qubit, sweep_data in sweep_result.data.items():
+        fit_result = fitting.fit_ramsey(
+            target=qubit,
+            times=sweep_data.sweep_range,
+            data=sweep_data.normalized,
+            amplitude_est=1.0,
+            offset_est=0.0,
+            plot=plot,
+        )
+        if fit_result.status is not FitStatus.SUCCESS:
+            continue
+        ramsey_freq = fit_result["f"]
+        phase = fit_result["phi"]
+        if second_rotation_axis == "Y":
+            bare_freq = (
+                dressed_frequency + detuning + ramsey_freq
+                if phase > 0
+                else dressed_frequency + detuning - ramsey_freq
+            )
+        else:
+            bare_freq = dressed_frequency + detuning - ramsey_freq
+        data[qubit] = RamseyData.new(
+            sweep_data=sweep_data,
+            t2=fit_result["tau"],
+            ramsey_freq=ramsey_freq,
+            bare_freq=bare_freq,
+            r2=fit_result["r2"],
+        )
+        print("Control frequency under spectator Stark:")
+        print(f"  {qubit}: {bare_freq:.6f}")
+        print("")
+        print("Detuning frequency from spectator Stark target")
+        print(f"  {qubit}: {bare_freq - dressed_frequency:.6f}")
+        print("")
+        print("Detuning frequency from bare target")
+        print(f"  {qubit}: {bare_freq - exp.targets[target].frequency:.6f}")
+        print("")
+        if save_image:
+            viz.save_figure(
+                fit_result.get_figure(),
+                name=f"spectator_stark_ramsey_{qubit}_under_{stark_drive_target}",
+            )
+    return ExperimentResult(data=data)
+
+
+def spectator_stark_gate_characterization(
+    exp: Experiment,
+    target: str,
+    stark_drive_target: str,
+    *,
+    stark_amplitude: float,
+    stark_ramptime: float | None = None,
+    rabi_time_range: ArrayLike | None = None,
+    t1_time_range: ArrayLike | None = None,
+    t2_time_range: ArrayLike | None = None,
+    ramsey_time_range: ArrayLike | None = None,
+    ramsey_detuning: float | None = None,
+    calibrate_flat_top: bool = True,
+    calibrate_drag: bool = True,
+    calibrate_beta: bool = True,
+    measure_t1: bool = True,
+    measure_t2: bool = True,
+    measure_ramsey: bool = True,
+    rabi_fit_threshold: float = 0.5,
+    gate_r2_threshold: float = 0.5,
+    n_shots: int | None = None,
+    rabi_n_shots: int | None = None,
+    gate_n_shots: int | None = None,
+    coherence_n_shots: int | None = None,
+    shot_interval: float | None = None,
+    plot: bool = True,
+    save_image: bool = False,
+    **deprecated_options: Any,
+) -> Result:
+    """
+    Run the spectator-Stark single-qubit workflow through coherence checks.
+
+    The workflow assumes ``spectator_stark_target(exp, target,
+    stark_drive_target)`` has already been registered, typically by
+    :func:`spectator_stark_chevron_pattern` or
+    :func:`make_spectator_stark_channel`.
+    """
+    n_shots, shot_interval = resolve_shot_options(
+        n_shots=n_shots,
+        shot_interval=shot_interval,
+        deprecated_options=deprecated_options,
+        function_name="spectator_stark_gate_characterization",
+    )
+    control_label = spectator_stark_target(exp, target, stark_drive_target)
+    if control_label not in exp.targets:
+        raise ValueError(
+            f"`{control_label}` is not registered. Run "
+            "`spectator_stark_chevron_pattern` or `make_spectator_stark_channel` "
+            "before spectator Stark gate characterization."
+        )
+
+    rabi_shots = n_shots if rabi_n_shots is None else rabi_n_shots
+    gate_shots = n_shots if gate_n_shots is None else gate_n_shots
+    coherence_shots = n_shots if coherence_n_shots is None else coherence_n_shots
+
+    rabi_result = spectator_stark_rabi_experiment(
+        exp,
+        target=target,
+        stark_drive_target=stark_drive_target,
+        stark_amplitude=stark_amplitude,
+        stark_ramptime=stark_ramptime,
+        time_range=rabi_time_range,
+        fit_threshold=rabi_fit_threshold,
+        n_shots=rabi_shots,
+        shot_interval=shot_interval,
+        plot=plot,
+        store_params=False,
+    )
+    control_rabi_param = _store_spectator_stark_rabi_param(
+        exp,
+        rabi_result=rabi_result,
+        target=target,
+        control_label=control_label,
+        r2_threshold=rabi_fit_threshold,
+    )
+
+    gate_calibrations: dict[str, object] = {}
+    if calibrate_flat_top:
+        gate_calibrations["hpi"] = calibrate_spectator_stark_hpi_pulse(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            r2_threshold=gate_r2_threshold,
+            n_shots=gate_shots,
+            shot_interval=shot_interval,
+            plot=plot,
+        )
+        gate_calibrations["pi"] = calibrate_spectator_stark_pi_pulse(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            r2_threshold=gate_r2_threshold,
+            n_shots=gate_shots,
+            shot_interval=shot_interval,
+            plot=plot,
+        )
+    if calibrate_drag:
+        gate_calibrations["drag_hpi"] = calibrate_spectator_stark_drag_hpi_pulse(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            r2_threshold=gate_r2_threshold,
+            calibrate_beta=calibrate_beta,
+            n_shots=gate_shots,
+            shot_interval=shot_interval,
+            plot=plot,
+        )
+        gate_calibrations["drag_pi"] = calibrate_spectator_stark_drag_pi_pulse(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            r2_threshold=gate_r2_threshold,
+            calibrate_beta=calibrate_beta,
+            n_shots=gate_shots,
+            shot_interval=shot_interval,
+            plot=plot,
+        )
+
+    coherence: dict[str, object] = {}
+    if measure_t1:
+        coherence["t1"] = spectator_stark_t1_experiment(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            time_range=t1_time_range,
+            n_shots=coherence_shots,
+            shot_interval=shot_interval,
+            plot=plot,
+            save_image=save_image,
+        )
+    if measure_t2:
+        coherence["t2"] = spectator_stark_t2_experiment(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            time_range=t2_time_range,
+            n_shots=coherence_shots,
+            shot_interval=shot_interval,
+            plot=plot,
+            save_image=save_image,
+        )
+    if measure_ramsey:
+        coherence["ramsey"] = spectator_stark_ramsey_experiment(
+            exp,
+            target=target,
+            stark_drive_target=stark_drive_target,
+            stark_amplitude=stark_amplitude,
+            stark_ramptime=stark_ramptime,
+            time_range=ramsey_time_range,
+            detuning=ramsey_detuning,
+            n_shots=coherence_shots,
+            shot_interval=shot_interval,
+            plot=plot,
+            save_image=save_image,
+        )
+
+    return Result(
+        data={
+            "target": target,
+            "stark_drive_target": stark_drive_target,
+            "control_target": control_label,
+            "rabi": rabi_result,
+            "rabi_param": control_rabi_param,
+            "gate_calibrations": gate_calibrations,
+            "coherence": coherence,
+        }
+    )
 
 
 def stark_t1_sequence_under_stark(
